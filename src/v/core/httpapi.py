@@ -1,0 +1,1027 @@
+"""httpapi — the phone's transport, and the first one that isn't someone else's.
+
+`telegram.py` proved the seam: an update comes in, `engine.handle()` runs, a
+`Response` goes back out, and nothing in `core/` had to learn what Telegram
+was. This is the same shim against a different wire — and one different
+premise. Telegram works, but every word of it, every voice note and every
+photograph of a book page, travels through a company's servers and sits in
+their storage. For a surface whose whole content is a personal journal, a
+finance ledger and a CRM, that is the wrong shape. Here, nothing leaves the
+machine but the answer, and it goes to exactly one phone.
+
+```
+phone ──TLS(mutual)──►  _Handler  ──►  _Bridge  ──►  Engine.handle  ──►  vault
+  ▲                        ▲                              │
+  │                        │                              ▼
+  └── SSE /v1/events ◄── Broadcast ◄──── Scheduler (reminders, brief, nudges)
+```
+
+**Access control is the handshake, not a check behind it.** `pki.py` issues one
+certificate per device from a private CA; this server sets `CERT_REQUIRED`
+against that CA alone, so an unenrolled client never completes TLS and never
+reaches a request handler at all. There is deliberately no bearer token on top:
+the token would have to ship inside the same APK as the client key, so it would
+be guarded by exactly the thing it was meant to back up, and a second gate that
+falls whenever the first one does is decoration. What *is* worth adding is
+narrowing where the socket listens — see `resolve_bind()`.
+
+The one thing the handshake cannot do is *un*-authorise: with no CRL, a revoked
+certificate still chains to the CA and still completes TLS, so cutting off a
+lost phone happens in the handler instead — against the enrolled set read live
+off disk, never a copy memorised at boot. See `Enrolment`.
+
+**Two things are refused rather than made to work.** There is no unauthenticated
+health endpoint: an endpoint that answers before the handshake is an endpoint
+that tells a scanner this is here, and the design's own note about not replying
+to strangers applies to ports as much as to chats. And there is no HTTP
+fallback — no redirect from 80, no `--insecure` flag — because a flag that
+turns off the only access control in the system is a flag that eventually gets
+left on.
+
+Everything else mirrors `telegram.py` on purpose: one `Engine` owned by one
+thread (a sqlite3 connection belongs to whichever thread opened it), one shared
+`Transcriber` and one shared synthesizer behind locks, the scheduler on
+its own thread with its own engine, and replies carrying both text and speech.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import queue
+import re
+import ssl
+import tempfile
+import threading
+import time
+import traceback
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+from . import pki
+from .config import Settings, settings as default_settings
+from . import persona as persona_mod
+from .engine import Engine
+
+API_VERSION = 1
+
+# How long a request may occupy a worker before the client is told to stop
+# waiting. Generous because an escalation to the model genuinely takes ~20s and
+# the phone showing a spinner is the correct behaviour for that; not unbounded,
+# because a wedged shell would otherwise hold the connection until the app is
+# force-stopped.
+CALL_TIMEOUT = 300.0
+
+# A voice reply is capped for the same reason `telegram._for_speech` caps one:
+# the full answer is already on screen, and a four-minute synthesis of it is a
+# thing nobody asked for and everybody waits through.
+SPEAK_LIMIT = 2000
+
+
+class ApiError(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _scrub(exc: object) -> str:
+    """Never let a certificate path or a token fragment into a log line."""
+    return re.sub(r"(?i)(token|secret|key|password)[=:\s]+\S+", r"\1=***",
+                  str(exc))[:400]
+
+
+# ---- who is allowed in ----------------------------------------------------
+class Enrolment:
+    """The set of enrolled device CNs, re-read from disk as it changes.
+
+    Reading it once at start-up was a bug with a sharp edge. There is no CRL —
+    `pki.revoke()` deletes a certificate and the directory listing *is* the
+    revocation list — so the 403 in `_dispatch` is the entire revocation
+    mechanism, and against a set memorised at boot it was checking a snapshot.
+    `cli phone revoke pixel` reported success, deleted the certificate, and the
+    lost phone went on being served until somebody restarted the service. The
+    one moment revocation has to work is the one moment you are least likely to
+    be sitting at the machine.
+
+    Re-reading on every request is the right semantics and the wrong cost:
+    `pki.enrolled()` spawns openssl once per certificate to read its subject.
+    So the check is two-stage — stat the certificate directory, and only pay
+    for openssl when its mtime has moved. Enrolling writes new files and
+    revoking unlinks them; both bump the directory's mtime, and those are the
+    only two events that can change the answer.
+
+    A directory that cannot be stat'd is treated as empty rather than as an
+    error. The certificates being gone *is* everything being revoked, and
+    failing open here would be worse than the outage.
+    """
+
+    def __init__(self, s: Settings):
+        self.s = s
+        self._lock = threading.Lock()
+        self._names: frozenset[str] = frozenset()
+        self._stamp: tuple[int, int] | None = None
+        self.reload()
+
+    def _stat(self) -> tuple[int, int] | None:
+        try:
+            st = pki.pki_dir(self.s).stat()
+        except OSError:
+            return None
+        # The inode too, because the whole directory being replaced (a restore,
+        # a symlink repointed) can leave the mtime looking untouched.
+        return (st.st_mtime_ns, st.st_ino)
+
+    def reload(self) -> frozenset[str]:
+        """Re-read unconditionally, whatever the directory looks like."""
+        stamp = self._stat()
+        names = (frozenset(pki.enrolled(self.s)) if stamp is not None
+                 else frozenset())
+        with self._lock:
+            self._names, self._stamp = names, stamp
+        return names
+
+    @property
+    def names(self) -> frozenset[str]:
+        stamp = self._stat()
+        with self._lock:
+            if stamp == self._stamp:
+                return self._names
+        # Deliberately outside the lock: `reload()` shells out to openssl, and
+        # holding a mutex across a subprocess would queue every request in
+        # flight behind the slowest one.
+        return self.reload()
+
+    def allows(self, cn: str) -> bool:
+        return cn in self.names
+
+
+# ---- proactive: one bus, many listeners ----------------------------------
+class Broadcast:
+    """Reminders, the brief and nudges, fanned out to whoever is connected.
+
+    The backlog is the point. A phone is asleep, out of signal, or simply not
+    running the app for most of the day, and a reminder delivered into a socket
+    that nobody was holding is a reminder that silently never fired — the exact
+    failure `Scheduler`'s catch-up-on-boot exists to prevent, reintroduced one
+    layer higher. So every event gets a sequence number, the last `keep` are
+    held, and a client reconnects with `?since=` and is handed everything it
+    missed before the stream goes live. Bounded, because this is a delivery
+    buffer and not a log: what is durable is already a note.
+    """
+
+    def __init__(self, keep: int = 100):
+        self._lock = threading.Lock()
+        self._subs: set[queue.Queue] = set()
+        self._backlog: deque[dict] = deque(maxlen=keep)
+        self._seq = 0
+
+    def publish(self, kind: str, text: str, data: dict | None = None) -> dict:
+        with self._lock:
+            self._seq += 1
+            event = {
+                "seq": self._seq,
+                "kind": kind,
+                "text": text,
+                "at": dt.datetime.now().isoformat(timespec="seconds"),
+                "data": data or {},
+            }
+            self._backlog.append(event)
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(event)
+            except queue.Full:      # a stalled client must not stall the rest
+                pass
+        return event
+
+    def subscribe(self, since: int = 0) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=256)
+        with self._lock:
+            for event in self._backlog:
+                if event["seq"] > since:
+                    q.put_nowait(event)
+            self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            self._subs.discard(q)
+
+    @property
+    def seq(self) -> int:
+        return self._seq
+
+    @property
+    def listeners(self) -> int:
+        with self._lock:
+            return len(self._subs)
+
+
+def build_sink(bus: Broadcast):
+    """A `Scheduler(..., sink=...)` that publishes instead of printing.
+
+    Same contract `telegram.build_sink` implements against the same jobs — the
+    scheduler hands over something with a `.render()` (a `Response`) or a plain
+    string, and no job has to know which surface is listening.
+    """
+    def sink(source: str, item) -> None:
+        name, payload = item if isinstance(item, tuple) else (source, item)
+        items = payload if isinstance(payload, list) else [payload]
+        for p in items:
+            if p is None:
+                continue
+            text = getattr(p, "render", lambda: str(p))()
+            if not text or not text.strip():
+                continue
+            bus.publish(str(name), text, {
+                "buttons": _buttons(getattr(p, "buttons", None)),
+                "route": getattr(p, "route", ""),
+            })
+    return sink
+
+
+# ---- the engine, on the one thread allowed to touch it -------------------
+class _Bridge:
+    """Serialises every engine call onto a single thread, and blocks the
+    caller until it returns.
+
+    An HTTP server is a thread pool by construction, and `Engine` is not
+    thread-safe by construction — it holds a sqlite3 connection, which may only
+    be used from the thread that opened it. `mcp/server.py` solves the same
+    problem by giving every worker thread its own engine; that is wrong here,
+    because an engine is also a *conversation* (`start_session`, the Hermes
+    thread, `_last_capture`), and one conversation split across four sockets is
+    four strangers again — the failure sessions were built to fix.
+
+    So: one engine, one thread, a queue in front of it. Requests are answered in
+    the order they arrive, which for one user with one phone is also the order
+    they were asked in.
+    """
+
+    def __init__(self, s: Settings):
+        self.s = s
+        self._in: queue.Queue = queue.Queue()
+        self._ready = threading.Event()
+        self._boot_error: BaseException | None = None
+        self._stt = None
+        self._stt_lock = threading.Lock()
+        self._tts = None
+        self._tts_lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="v-http-engine")
+        self._thread.start()
+
+    # ---- the owning thread -------------------------------------------
+    def _run(self) -> None:
+        import atexit
+        try:
+            engine = Engine(self.s, surface=persona_mod.PHONE)
+            engine.start_session()
+        except BaseException as exc:        # noqa: BLE001 — reported to callers
+            self._boot_error = exc
+            self._ready.set()
+            return
+        atexit.register(self._safe_end, engine)
+        self._engine = engine
+        self._ready.set()
+        try:
+            while True:
+                fn, box, done = self._in.get()
+                if fn is None:
+                    break
+                try:
+                    box["val"] = fn(engine)
+                except BaseException as exc:    # noqa: BLE001 — travels to caller
+                    box["err"] = exc
+                finally:
+                    done.set()
+        finally:
+            self._safe_end(engine)
+            engine.close()
+
+    @staticmethod
+    def _safe_end(engine: Engine) -> None:
+        try:
+            engine.end_session("interrupted")
+        except Exception:
+            pass
+
+    # ---- callers ------------------------------------------------------
+    def call(self, fn, timeout: float = CALL_TIMEOUT):
+        self._ready.wait(120)
+        if self._boot_error is not None:
+            raise ApiError(503, f"engine failed to start: "
+                                f"{_scrub(self._boot_error)}")
+        box: dict = {}
+        done = threading.Event()
+        self._in.put((fn, box, done))
+        if not done.wait(timeout):
+            raise ApiError(504, "V is still working on the previous message")
+        if "err" in box:
+            err = box["err"]
+            if isinstance(err, ApiError):
+                raise err
+            raise ApiError(500, f"{type(err).__name__}: {_scrub(err)}")
+        return box["val"]
+
+    def stop(self) -> None:
+        self._in.put((None, {}, threading.Event()))
+
+    # ---- speech, shared and serialised (see telegram.py for why) ------
+    def transcriber(self):
+        with self._stt_lock:
+            if self._stt is None:
+                from . import stt
+                t = stt.Transcriber(self.s)
+                t.load()
+                self._stt = t
+            return self._stt
+
+    def transcribe(self, data: bytes, suffix: str = ".ogg") -> str:
+        from . import stt
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / f"voice{suffix}"
+            src.write_bytes(data)
+            # An explicit destination, never the derived one: the phone posts
+            # WAV, so letting `convert_to_wav` swap the suffix would hand
+            # ffmpeg its own input file.
+            wav = stt.convert_to_wav(src, Path(td) / "voice-16k.wav")
+            t = self.transcriber()
+            with self._stt_lock:
+                return t.transcribe(wav).text.strip()
+
+    def synth(self):
+        with self._tts_lock:
+            if self._tts is None:
+                from . import tts
+                m = tts.synthesizer(
+                    self.s,
+                    on_fallback=lambda why: print(
+                        f"phone: hosted voice unavailable, using piper — {why}"))
+                m.load()
+                self._tts = m
+            return self._tts
+
+    def speak(self, text: str) -> bytes:
+        """OGG/Opus, because that is what a phone plays without transcoding."""
+        from . import tts
+        m = self.synth()
+        with self._tts_lock:
+            audio = m.synthesize(text)   # MP3 if hosted, WAV if Piper
+        return tts.to_ogg_opus(audio)
+
+
+# ---- shaping a Response for the wire -------------------------------------
+def _buttons(buttons) -> list[dict]:
+    out = []
+    for b in buttons or []:
+        out.append({"label": b.label, "action": b.action,
+                    "payload": b.payload or {}})
+    return out
+
+
+def voice_state(resp) -> str:
+    """Which of the four colours the app paints ✦, decided here rather than on
+    the phone.
+
+    Copied in shape from `cli._voice_state` deliberately: the rule is a product
+    rule ("a refusal is never an error", "a degraded answer looks degraded
+    whichever path produced it"), and a second implementation of it in Kotlin
+    is a second implementation that drifts. The phone renders what it is told.
+    """
+    if resp.data.get("refused"):
+        return "refused"
+    if resp.data.get("degraded") or resp.route.endswith(":fallback"):
+        return "degraded"
+    conf = resp.data.get("confidence")
+    if conf is not None and conf < 0.55:
+        return "unsure"
+    return "speaking"
+
+
+def for_speech(text: str) -> str:
+    """Same cut `telegram._for_speech` makes: drop the citation line, cap it."""
+    text = re.split(r"\n\nSources: ", text)[0].strip()
+    return text[:SPEAK_LIMIT]
+
+
+def payload(resp) -> dict:
+    """The JSON the app renders a turn from.
+
+    Every field the design's cost line needs is here and none of it is
+    optional — `◈ route · ⟡ notes · seconds · $cost · ◉ confidence` is
+    specified as "dim, never hidden, never behind a flag", so the transport
+    that could omit it is the wrong place to make it optional.
+    """
+    data = resp.data or {}
+    return {
+        "text": resp.text,
+        "spoken": for_speech(resp.text),
+        "intent": resp.intent,
+        "route": resp.route,
+        "decision": resp.decision,
+        "citations": list(resp.citations or [])[:12],
+        "buttons": _buttons(resp.buttons),
+        "state": voice_state(resp),
+        "cost": float(resp.cost or 0.0),
+        # On a subscription nothing is billed per run, so `cost` stays 0.0 and
+        # the allowance consumed travels separately — the app renders it as
+        # `≈$0.0507 allowance`, which is the honest form. Calling it spend
+        # would be a lie in exactly the place the design says not to tell one.
+        "allowance": float(data.get("list_cost_usd") or 0.0),
+        "ms": float(resp.ms or 0.0),
+        "notes": len(resp.citations or []),
+        "confidence": data.get("confidence"),
+        "model": data.get("model") or data.get("shell") or "",
+        "local": not bool(data.get("list_cost_usd") or resp.cost),
+        "refused": bool(data.get("refused")),
+        "degraded": bool(data.get("degraded")),
+    }
+
+
+# ---- the request handler --------------------------------------------------
+class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "V"
+    sys_version = ""            # don't advertise the Python version
+
+    # ---- plumbing -----------------------------------------------------
+    @property
+    def app(self) -> "VServer":
+        return self.server.app          # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args) -> None:
+        if self.app.verbose:
+            print(f"  {self.address_string()} {fmt % args}")
+
+    def _peer_cn(self) -> str:
+        """The CN of the certificate that completed this handshake.
+
+        Reached only if the handshake succeeded against our CA, so this is not
+        the access check — it is which enrolled device is calling, which is
+        worth knowing in a log and worth echoing back so a phone can notice it
+        is holding a certificate the server has since revoked.
+        """
+        try:
+            cert = self.connection.getpeercert() or {}
+        except (AttributeError, ValueError):
+            return ""
+        for rdn in cert.get("subject", ()):
+            for key, value in rdn:
+                if key == "commonName":
+                    return value
+        return ""
+
+    def _body(self, limit: int = 32 * 1024 * 1024) -> bytes:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ApiError(400, "bad Content-Length")
+        if n > limit:
+            raise ApiError(413, "too large")
+        return self.rfile.read(n) if n else b""
+
+    def _json_body(self) -> dict:
+        raw = self._body(limit=1024 * 1024)
+        if not raw:
+            return {}
+        try:
+            out = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ApiError(400, "body is not JSON")
+        if not isinstance(out, dict):
+            raise ApiError(400, "body must be a JSON object")
+        return out
+
+    def _send(self, status: int, body: bytes, content_type: str,
+              extra: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-V-Device", self._peer_cn())
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj: dict, status: int = 200) -> None:
+        self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    # ---- routing ------------------------------------------------------
+    def do_GET(self) -> None:       # noqa: N802 — BaseHTTPRequestHandler's name
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:      # noqa: N802
+        self._dispatch("POST")
+
+    def _dispatch(self, method: str) -> None:
+        url = urlparse(self.path)
+        route = (method, url.path.rstrip("/") or "/")
+        query = parse_qs(url.query)
+        try:
+            cn = self._peer_cn()
+            if cn and not self.app.enrolment.allows(cn):
+                # Enrolled once, revoked since: the certificate still chains to
+                # the CA (there is no CRL, by design) so the handshake succeeds
+                # and the check has to be here — against the live set on disk,
+                # so a revoke takes effect on the next request rather than on
+                # the next restart. Told plainly, because unlike a stranger on
+                # Telegram this is a device Parsa owns and needs to know has
+                # been cut off.
+                raise ApiError(403, "this device is no longer enrolled")
+            handler = _ROUTES.get(route)
+            if handler is None:
+                raise ApiError(404, f"no route for {method} {url.path}")
+            handler(self, query)
+        except ApiError as exc:
+            self._fail(exc.status, exc.message)
+        except (BrokenPipeError, ConnectionResetError):
+            pass                    # the phone hung up; not worth a line
+        except Exception as exc:    # noqa: BLE001 — never leak a traceback
+            if self.app.verbose:
+                traceback.print_exc()
+            self._fail(500, f"{type(exc).__name__}: {_scrub(exc)}")
+
+    def _fail(self, status: int, message: str) -> None:
+        try:
+            self._json({"error": message, "status": status}, status=status)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    # ---- endpoints ----------------------------------------------------
+    def h_hello(self, query: dict) -> None:
+        """Everything the app needs to draw its chrome before a word is said."""
+        app = self.app
+
+        def _work(engine: Engine) -> dict:
+            row = engine.conn.execute("SELECT COUNT(*) FROM notes").fetchone()
+            return {"notes": int(row[0]) if row else 0}
+        try:
+            stats = app.bridge.call(_work, timeout=60)
+        except ApiError:
+            # The boot line ("412 notes indexed") is chrome, not the product —
+            # an engine still cold must not stop the app from opening.
+            stats = {}
+        self._json({
+            "name": "V",
+            "api": API_VERSION,
+            "device": self._peer_cn(),
+            "now": dt.datetime.now().isoformat(timespec="seconds"),
+            "timezone": app.s.timezone,
+            "tts": app.tts_ready,
+            "stt": app.stt_ready,
+            "seq": app.bus.seq,
+            "listeners": app.bus.listeners,
+            **stats,
+        })
+
+    def h_chat(self, query: dict) -> None:
+        body = self._json_body()
+        text = (body.get("text") or "").strip()
+        if not text:
+            raise ApiError(400, "text is required")
+        mtype = body.get("message_type") or "text"
+        extra = body.get("extra") if isinstance(body.get("extra"), dict) else {}
+        resp = self.app.bridge.call(
+            lambda e: e.handle(text, message_type=mtype,
+                               has_location=bool(body.get("has_location")),
+                               has_file=bool(body.get("has_file")),
+                               extra=extra))
+        self._json(payload(resp))
+
+    def h_voice(self, query: dict) -> None:
+        """Audio in, an answer out. The transcript travels with it.
+
+        The transcript is returned rather than kept server-side because the
+        design makes a wrong transcript a *state*, not an error — the phone
+        cannot show "this is what I heard, correct me" if it was never told
+        what V heard.
+        """
+        data = self._body()
+        if not data:
+            raise ApiError(400, "empty audio body")
+        suffix = _suffix(self.headers.get("Content-Type", ""))
+        try:
+            transcript = self.app.bridge.transcribe(data, suffix)
+        except ImportError as exc:
+            raise ApiError(503, f"no speech engine installed: {_scrub(exc)}")
+        except Exception as exc:    # noqa: BLE001
+            # Distinguished from the line above because they need different
+            # things done about them, and collapsing both into "no speech
+            # engine available" is how a one-line ffmpeg bug spent an evening
+            # looking like a missing Whisper install. Anything reaching here
+            # is a fault in a component that *is* present.
+            from . import stt
+            if isinstance(exc, stt.Unavailable):
+                raise ApiError(503, f"no speech engine available: {_scrub(exc)}")
+            detail = getattr(exc, "stderr", b"") or b""
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            raise ApiError(500, f"transcription failed: {_scrub(exc)}"
+                                f"{' — ' + detail.strip()[:200] if detail else ''}")
+        if not transcript:
+            # Not an error: a held button with nothing said into it is an
+            # ordinary thing to do, and an error dialog for it trains you to
+            # dismiss dialogs.
+            self._json({"transcript": "", "text": "", "spoken": "",
+                        "state": "unsure", "empty": True,
+                        "buttons": [], "citations": []})
+            return
+        resp = self.app.bridge.call(
+            lambda e: e.handle(transcript, message_type="voice"))
+        out = payload(resp)
+        out["transcript"] = transcript
+        self._json(out)
+
+    def h_speak(self, query: dict) -> None:
+        body = self._json_body()
+        text = for_speech(body.get("text") or "")
+        if not text:
+            raise ApiError(400, "text is required")
+        try:
+            ogg = self.app.bridge.speak(text)
+        except Exception as exc:    # noqa: BLE001
+            # Degrade rather than fail the turn, the same posture `_send_voice`
+            # takes on Telegram: the words are already on screen.
+            raise ApiError(503, f"no voice available: {_scrub(exc)}")
+        self._send(200, ogg, "audio/ogg")
+
+    def h_act(self, query: dict) -> None:
+        body = self._json_body()
+        action = (body.get("action") or "").strip()
+        if not action:
+            raise ApiError(400, "action is required")
+        pay = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        resp = self.app.bridge.call(lambda e: e.act(action, pay))
+        self._json(payload(resp))
+
+    def h_session_new(self, query: dict) -> None:
+        def _work(engine: Engine) -> dict:
+            engine.end_session("new")
+            engine.start_session()
+            return {"ok": True}
+        self._json(self.app.bridge.call(_work, timeout=120))
+
+    def h_wake(self, query: dict) -> None:
+        """The wake word matched: is anything worth saying before he speaks?
+
+        Deliberately cheap and deliberately quiet. It runs no model and asks no
+        question — it answers the design's WAKE HEARD state ("Yes?") and adds
+        one line only when there is something time-bound to add. A wake that
+        always recites the day would make saying "Friday" something you learn
+        to talk over, which is the same failure the briefing's thin-signal
+        guard exists to prevent.
+
+        `agent` names who was summoned. The phone's gate is trained on one
+        wake word and that word is a *name*, so which name was heard decides
+        who answers — this is the seam where "Friday" stops being a trigger
+        token and becomes the persona with her own memory scope. The switch
+        goes through `Engine.switch_agent` rather than assigning `persona`
+        directly, because that is what rebuilds the memory store on the new
+        scope and clears the previous agent's shell thread; setting the field
+        would give Friday V's beliefs and V's transcript.
+
+        An unreachable or unknown agent is not an error. `switch_agent`
+        already refuses and says why, and a wake that fails because a config
+        names something odd would be a wake that silently stops working.
+        """
+        wanted = (query.get("agent") or [""])[0].strip()
+
+        def _work(engine: Engine) -> dict:
+            if wanted:
+                try:
+                    engine.switch_agent(wanted)
+                except Exception:
+                    pass    # V answers, which is the documented fallback
+            now = dt.datetime.now()
+            bits: list[str] = []
+            try:
+                nxt = engine.agenda.next_event(now)
+                if nxt is not None:
+                    bits.append(nxt.render())
+            except Exception:
+                pass
+            try:
+                due = engine.reminders.due_now(now)
+                for r in due[:2]:
+                    bits.append(r.describe())
+            except Exception:
+                pass
+            return {"lines": bits, "agent": engine.persona.key}
+
+        out = self.app.bridge.call(_work, timeout=90)
+        lines = out.get("lines") or []
+        text = "Yes?" if not lines else "Yes? " + " ".join(lines)
+        self._json({
+            "text": text,
+            "spoken": text,
+            "state": "speaking",
+            "lines": lines,
+            "agent": out.get("agent", "v"),
+            "source": (query.get("source") or ["unknown"])[0],
+            "cost": 0.0, "allowance": 0.0, "local": True,
+            "buttons": [], "citations": [],
+        })
+
+    def h_events(self, query: dict) -> None:
+        """Server-sent events: the proactive channel, held open by the phone.
+
+        SSE rather than a websocket or a push service. A websocket is a second
+        framing protocol for a stream that only ever flows one way, and a push
+        service (FCM) would route a reminder about a dentist appointment
+        through Google to arrive on a phone that is already holding an
+        authenticated socket to the machine that generated it — the exact
+        third party this transport exists to remove.
+        """
+        try:
+            since = int((query.get("since") or ["0"])[0])
+        except ValueError:
+            since = 0
+        bus = self.app.bus
+        cn = self._peer_cn()
+        q = bus.subscribe(since)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-V-Device", cn)
+        # No Content-Length is possible on a stream, so the connection cannot
+        # be reused afterwards and must be closed rather than left half-parsed.
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        try:
+            self.wfile.write(b": open\n\n")
+            self.wfile.flush()
+            while not self.app.stopping:
+                try:
+                    event = q.get(timeout=20)
+                except queue.Empty:
+                    event = None
+                # Revocation has to reach a connection that is already open.
+                # Every other endpoint is checked on the way in and answers in
+                # seconds; this one is held open for hours by design, so a
+                # phone revoked at 11am would otherwise go on being read every
+                # reminder and every nudge until it lost signal. Checked here,
+                # after the wait and before the write, so the revoked device
+                # does not get one last event through the gap — and so an idle
+                # stream still closes within a keepalive of the revoke rather
+                # than waiting for news that may never come. Costs one stat
+                # per event or per 20s — see `Enrolment`.
+                if cn and not self.app.enrolment.allows(cn):
+                    break
+                if event is None:
+                    # A comment line, not an event. Android drops an idle TCP
+                    # connection well before any server would, and a stream
+                    # that only speaks when there is news is a stream that is
+                    # dead by the time there is.
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                frame = (f"id: {event['seq']}\n"
+                         f"event: {event['kind']}\n"
+                         f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
+                self.wfile.write(frame.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, ssl.SSLError):
+            pass
+        finally:
+            bus.unsubscribe(q)
+
+
+def _suffix(content_type: str) -> str:
+    """faster-whisper reads what ffmpeg can convert, and ffmpeg goes by the
+    extension when the container is ambiguous. Android records `audio/mp4`
+    (AAC) by default and OGG/Opus when asked; both are handled."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    return {
+        "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/webm": ".webm",
+        "audio/mp4": ".m4a", "audio/aac": ".aac", "audio/mpeg": ".mp3",
+        "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/3gpp": ".3gp",
+    }.get(ct, ".ogg")
+
+
+_ROUTES = {
+    ("GET", "/v1/hello"): _Handler.h_hello,
+    ("POST", "/v1/chat"): _Handler.h_chat,
+    ("POST", "/v1/voice"): _Handler.h_voice,
+    ("POST", "/v1/speak"): _Handler.h_speak,
+    ("POST", "/v1/act"): _Handler.h_act,
+    ("POST", "/v1/session/new"): _Handler.h_session_new,
+    ("POST", "/v1/wake"): _Handler.h_wake,
+    ("GET", "/v1/events"): _Handler.h_events,
+}
+
+
+# ---- the listener ---------------------------------------------------------
+class _TLSServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def get_request(self):
+        """Wrap each accepted socket, and let a failed handshake vanish.
+
+        `socketserver` catches `OSError` from here and simply moves on, and
+        `ssl.SSLError` is one — which is exactly the behaviour wanted: a client
+        with no certificate, or one signed by anything but our CA, gets a
+        closed connection and no message. Telling it *why* it was rejected
+        would confirm to a scanner that something worth scanning is here.
+
+        The timeout is on the handshake alone. Without it a client that opens a
+        socket and says nothing holds the accept loop for as long as it likes.
+        """
+        sock, addr = super().get_request()
+        sock.settimeout(15)
+        try:
+            wrapped = self.ssl_context.wrap_socket(sock, server_side=True)
+        except BaseException:
+            try:
+                sock.close()
+            finally:
+                raise
+        wrapped.settimeout(None)
+        return wrapped, addr
+
+
+class VServer:
+    """The whole surface: TLS, the bus, the engine bridge, the scheduler."""
+
+    def __init__(self, settings: Settings | None = None, *,
+                 bind: str | None = None, port: int | None = None,
+                 scheduler: bool = True, verbose: bool = False):
+        self.s = settings or default_settings
+        self.binds = [bind] if bind else resolve_binds(self.s)
+        # Kept for anything that wants one name for the listener — the status
+        # line, the log, the address handed to the app.
+        self.bind = self.binds[0] if bind else resolve_bind(self.s)
+        self.port = int(port or self.s.phone_port)
+        self.verbose = verbose
+        self.bus = Broadcast()
+        # Built in `serve_forever`, not here. Constructing a `_Bridge` starts a
+        # thread that opens the index, re-checks every note's mtime and may
+        # write to `state/` — real work, and wrong to do as a side effect of
+        # making an object. It also meant a server that *refuses* to start
+        # (nothing enrolled) had already opened a database before saying so.
+        self.bridge: _Bridge | None = None
+        self.enrolment = Enrolment(self.s)
+        self.stopping = False
+        self._scheduler = scheduler
+        self._httpds: list[_TLSServer] = []
+        self.tts_ready = False
+        self.stt_ready = False
+
+    @property
+    def devices(self) -> frozenset[str]:
+        """Who may connect *right now* — read off disk, never a boot snapshot.
+        See `Enrolment` for why that distinction is the whole point."""
+        return self.enrolment.names
+
+    # ---- TLS ----------------------------------------------------------
+    def context(self) -> ssl.SSLContext:
+        ca, _ = pki.ensure_ca(self.s)
+        crt, key = pki.ensure_server(self.s)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # 1.2 is the floor rather than 1.3 only because a phone that has been
+        # sitting in a drawer through an OS version is still a phone Parsa
+        # expects to work; both are modern enough that nothing here is at risk.
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.verify_mode = ssl.CERT_REQUIRED     # the access control, entire
+        ctx.load_verify_locations(cafile=str(ca))
+        ctx.load_cert_chain(certfile=str(crt), keyfile=str(key))
+        return ctx
+
+    # ---- warm-up ------------------------------------------------------
+    def _warm(self) -> None:
+        """Load Whisper and Piper before the first message rather than during
+        it. Both are multi-second cold loads, and paying that inside the first
+        voice reply is how a working system reads as a broken one."""
+        def _run() -> None:
+            try:
+                self.bridge.transcriber()
+                self.stt_ready = True
+            except Exception as exc:    # noqa: BLE001
+                print(f"  stt unavailable — voice in is off: {_scrub(exc)}")
+            try:
+                self.bridge.synth()
+                self.tts_ready = True
+            except Exception as exc:    # noqa: BLE001
+                print(f"  tts unavailable — replies will be text only: "
+                      f"{_scrub(exc)}")
+        threading.Thread(target=_run, daemon=True, name="v-http-warm").start()
+
+    def _start_scheduler(self) -> None:
+        from .scheduler import Scheduler
+
+        def _run() -> None:
+            # Its own engine, on its own thread — same rule as everywhere else.
+            engine = Engine(self.s, surface=persona_mod.PHONE)
+            try:
+                Scheduler(engine, self.s, sink=build_sink(self.bus)).run(interval=30)
+            except Exception as exc:    # noqa: BLE001
+                print(f"  scheduler stopped: {_scrub(exc)}")
+            finally:
+                engine.close()
+        threading.Thread(target=_run, daemon=True, name="v-http-scheduler").start()
+
+    # ---- run ----------------------------------------------------------
+    def serve_forever(self) -> None:
+        if not self.devices:
+            raise ApiError(
+                500, "no device is enrolled — run `cli phone enrol <name>` "
+                     "first, or nothing will be able to connect")
+        # Tests inject a stub in place of this; a real run builds it here, once
+        # the enrolment check above has decided there is any point.
+        if self.bridge is None:
+            self.bridge = _Bridge(self.s)
+        ctx = self.context()
+        opened: list[str] = []
+        for address in self.binds:
+            try:
+                httpd = _TLSServer((address, self.port), _Handler)
+            except OSError as exc:
+                # One address failing is not the run failing: a tailnet
+                # interface that has not come up yet, or a lease that changed
+                # since the certificate was issued, must not take the LAN
+                # listener down with it.
+                print(f"  could not listen on {address}: {_scrub(exc)}")
+                continue
+            httpd.ssl_context = ctx         # type: ignore[attr-defined]
+            httpd.app = self                # type: ignore[attr-defined]
+            self._httpds.append(httpd)
+            opened.append(address)
+        if not self._httpds:
+            raise ApiError(500, f"could not listen on any of "
+                                f"{', '.join(self.binds)}:{self.port}")
+
+        self._warm()
+        if self._scheduler:
+            self._start_scheduler()
+        tail = pki.tailnet_ip()
+        for address in opened:
+            label = "  tailnet " if address == tail else "  local   "
+            print(f"{label} https://{address}:{self.port}")
+        print(f"  devices: {', '.join(sorted(self.devices))}")
+
+        threads = [threading.Thread(target=h.serve_forever, kwargs={"poll_interval": 0.5},
+                                    daemon=True, name=f"v-http-{a}")
+                   for h, a in zip(self._httpds[1:], opened[1:])]
+        for t in threads:
+            t.start()
+        try:
+            self._httpds[0].serve_forever(poll_interval=0.5)
+        finally:
+            self.stopping = True
+            for httpd in self._httpds:
+                try:
+                    httpd.server_close()
+                except OSError:
+                    pass
+            self.bridge.stop()
+
+    def stop(self) -> None:
+        self.stopping = True
+        for httpd in self._httpds:
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+
+def resolve_binds(s: Settings | None = None) -> list[str]:
+    """Every address to listen on — one socket each, never a wildcard.
+
+    `0.0.0.0` is not the answer, even though it would be one line instead of
+    this function. mTLS means a hostile client cannot get a request through,
+    but it can still reach the port, and a port that answers is a port worth
+    attacking; a wildcard bind also quietly publishes V to every docker bridge
+    on the box. Naming the interfaces keeps the reachable surface equal to the
+    set of addresses the certificate was actually issued for.
+
+    **Both, not one.** The first version picked the tailnet address if there
+    was one and the LAN address otherwise — which is exactly wrong for a phone
+    that toggles its VPN. Android permits one VPN at a time, so a work VPN and
+    Tailscale cannot both be up; the phone therefore arrives over the tailnet
+    sometimes and over the LAN the rest of the time, and a server listening on
+    whichever address it preferred at start-up is unreachable for half of that.
+    Two sockets cost two threads.
+    """
+    s = s or default_settings
+    if s.phone_bind:
+        return [h.strip() for h in s.phone_bind.split(",") if h.strip()]
+    hosts = [h for h in pki.local_hosts() if not h.startswith("127.")]
+    return hosts or ["127.0.0.1"]
+
+
+def resolve_bind(s: Settings | None = None) -> str:
+    """The primary address — what `phone status` prints and what the app is
+    told to dial first. The tailnet wins when there is one, because it is the
+    address that keeps working when Parsa leaves the house."""
+    binds = resolve_binds(s)
+    tail = pki.tailnet_ip()
+    if tail and tail in binds:
+        return tail
+    return binds[0]
+
+
+def run(settings: Settings | None = None, **kw) -> None:
+    VServer(settings, **kw).serve_forever()

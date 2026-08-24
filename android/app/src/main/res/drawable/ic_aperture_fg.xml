@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The aperture as the launcher icon. The design says the device, the app
+     icon, the favicon and the ambient orb are the same object at different
+     sizes — so this is the same three circles, not a separate mark. At icon
+     size the dash is dropped, per the 16px reduction rule. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- outer ring · deep #5B3FD6 -->
+    <path
+        android:strokeColor="#5B3FD6"
+        android:strokeWidth="4.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,32 a22,22 0 1,0 0.01,0 z" />
+
+    <!-- inner ring · seed #7C5CFF -->
+    <path
+        android:strokeColor="#7C5CFF"
+        android:strokeWidth="3.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,39 a15,15 0 1,0 0.01,0 z" />
+
+    <!-- core dot · the lift-to-deep gradient, flattened to its midpoint -->
+    <path
+        android:fillColor="#A793FF"
+        android:pathData="M54,48.5 a5.5,5.5 0 1,0 0.01,0 z" />
+</vector>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window background is `void` from the design tokens, set here as
+         well as in Compose so the launch window is not a white flash before
+         the first frame lands. -->
+    <style name="Theme.V" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#08080A</item>
+        <item name="android:statusBarColor">#08080A</item>
+        <item name="android:navigationBarColor">#08080A</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

@@ -1,0 +1,29 @@
+[Unit]
+Description=V — the phone transport (mutual TLS, chat, voice, proactive events)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/projects/v
+ExecStart=%h/projects/v/.venv/bin/v serve
+Restart=on-failure
+RestartSec=10
+Environment=V_VAULT=%h/Documents/Brain
+# Unbuffered, or journald shows nothing until a 4 KB block fills — the
+# warm-up prints why STT/TTS failed to stdout, and that is exactly the
+# message you need at the moment it is missing.
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/v/env
+
+# The address the socket binds to is worked out at start-up — the tailnet
+# interface if there is one, the LAN lease otherwise. On a laptop that is a
+# race: systemd starts user units as soon as the network is nominally up, and
+# tailscaled may not have brought its interface back yet, in which case V
+# would bind to the LAN and be unreachable from outside the house until it is
+# restarted by hand. Ten seconds is not a fix for that so much as a wide
+# enough margin that it stops happening, and `Restart=on-failure` covers the
+# case where it does anyway.
+ExecStartPre=/bin/sleep 10
+
+[Install]
+WantedBy=default.target

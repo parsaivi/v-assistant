@@ -1,0 +1,34 @@
+# Virtualenv
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# V's own state and caches now live under XDG, not in the tree — but a stray
+# run with V_STATE pointed here should not be committed.
+state/
+models/
+
+# The gate's ONNX weights: 31MB of binaries that `models/` above happens to
+# match already, which is too load-bearing an accident to leave implicit. They
+# are fetched and derived, not authored — `docs/ambient-wake/prepare_models.py`
+# rebuilds every one — so the repository stays source. The golden vectors under
+# `src/test/resources/` are deliberately NOT ignored: they are 114KB and the
+# feature test has to run on a fresh clone without librosa installed.
+android/app/src/main/assets/models/
+
+# Android
+android/app/build/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+
+# Secrets — the device CA and keys are generated per install, never shipped
+*.key
+*.pk8
+*.crt
+.env

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "v-assistant"
+version = "0.2.0"
+description = "V — a local-first assistant over a Markdown vault"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+# Deliberately empty. Every capability V has by default — structured queries,
+# FTS, capture, reminders, nudges, routing, the git-backed writer — is stdlib
+# or numpy, and a test asserts the free paths stay free. Everything that costs
+# something, downloads something, or talks to someone else's server is an
+# extra, so `pip install v-assistant` gets you a working assistant that
+# reaches no network at all.
+dependencies = []
+
+[project.optional-dependencies]
+# Local semantic search. Pulls torch; the tf-idf backend needs none of it.
+embed = ["sentence-transformers>=3.0", "numpy>=1.26"]
+# Voice in and out.
+voice = ["faster-whisper>=1.0"]
+# The MCP server, so an agent can reach the vault as tools.
+mcp = ["mcp>=1.2"]
+# Everything.
+all = ["v-assistant[embed,voice,mcp]"]
+
+[project.scripts]
+v = "v.cli:main"
+v-mcp = "v.mcp.server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Tests live inside the package so they stay runnable as `python -m v.tests.x`
+# against an installed copy, but they are not part of the wheel.
+[tool.setuptools.exclude-package-data]
+"*" = ["tests/*"]

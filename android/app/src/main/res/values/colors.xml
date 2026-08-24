@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Only the tokens the platform (not Compose) needs to know about. -->
+    <color name="void_bg">#08080A</color>
+    <color name="seed">#7C5CFF</color>
+</resources>

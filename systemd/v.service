@@ -1,0 +1,19 @@
+[Unit]
+Description=V — vault assistant (telegram + scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/projects/v
+ExecStart=%h/projects/v/.venv/bin/v telegram
+Restart=on-failure
+RestartSec=10
+Environment=V_VAULT=%h/Documents/Brain
+# Unbuffered, or journald shows nothing until a 4 KB block fills — the
+# warm-up prints why STT/TTS failed to stdout, and that is exactly the
+# message you need at the moment it is missing.
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/v/env
+
+[Install]
+WantedBy=default.target
