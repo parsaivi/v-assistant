@@ -63,7 +63,16 @@ class Gate(private val context: Context, private val prints: Voiceprint) {
         private const val HEAD_MS = 1_400
     }
 
-    enum class State { OFF, LISTENING, HEARD, YIELDED, NO_MIC }
+    /**
+     * [SILENCED] is not the same as [NO_MIC], and conflating them is how this
+     * feature fails invisibly. `NO_MIC` means the device could not be opened —
+     * ordinary, transient, another app has it. `SILENCED` means it opened and
+     * is returning exact zeroes, which is what Android does instead of refusing
+     * an app that lacks the permission or has been muted by an OS toggle. The
+     * gate looks perfectly healthy in that state and can never fire, so it has
+     * to be a state the notification can name.
+     */
+    enum class State { OFF, LISTENING, HEARD, YIELDED, NO_MIC, SILENCED }
 
     private val _state = MutableStateFlow(State.OFF)
     val state: StateFlow<State> = _state
@@ -144,6 +153,8 @@ class Gate(private val context: Context, private val prints: Voiceprint) {
         val segment = ArrayList<Short>(RATE * 2)
         var inSpeech = false
         var quietMs = 0
+        var silentMs = 0
+        var everNonZero = false
         val frame = ShortArray(Vad.WINDOW)
         val window = FloatArray(Vad.WINDOW)
 
@@ -159,6 +170,20 @@ class Gate(private val context: Context, private val prints: Voiceprint) {
                     got += n
                 }
                 history.write(frame)
+
+                // A real room dithers the low bit; an unbroken run of exact
+                // zeroes is the OS silencing us, not quiet.
+                if (!everNonZero) {
+                    if (frame.any { it.toInt() != 0 }) {
+                        everNonZero = true
+                    } else {
+                        silentMs += Vad.WINDOW * 1000 / RATE
+                        if (silentMs > 3_000) {
+                            _state.value = State.SILENCED
+                            return false
+                        }
+                    }
+                }
 
                 var sum = 0.0
                 for (i in 0 until Vad.WINDOW) {

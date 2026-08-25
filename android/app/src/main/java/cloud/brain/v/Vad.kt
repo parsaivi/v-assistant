@@ -27,6 +27,27 @@ class Vad(context: Context) {
     companion object {
         /** Silero v5 at 16kHz is fixed at 512-sample windows. Not a tunable. */
         const val WINDOW = 512
+
+        /**
+         * Samples of the *previous* window prepended to each call.
+         *
+         * This is not an optimisation, it is a correctness requirement, and
+         * getting it wrong is the most expensive mistake made in this gate so
+         * far. Silero v5's ONNX graph expects 576 samples at 16kHz — 64 of
+         * context plus the 512 new ones — because its first convolution needs
+         * history the exported graph does not keep for itself. The Python
+         * wrapper does this concatenation before every call, which is why the
+         * requirement is invisible if you read only the model's input shape
+         * (`[None, None]`, happily accepting 512).
+         *
+         * Fed bare 512-sample windows the model does not fail. It returns
+         * plausible, well-formed probabilities that are simply always near
+         * zero: measured over twenty seconds of clear speech, max 0.154 and not
+         * one frame above the 0.5 threshold. The gate was perfectly healthy and
+         * permanently deaf. With the context restored, the same audio scores
+         * max 1.000 with 90% of frames above threshold.
+         */
+        const val CONTEXT = 64
         private const val SPEECH = 0.5f
         /** Hysteresis: leaving speech is harder than entering it, so a pause
          *  between two words does not split one utterance into two. */
@@ -35,10 +56,13 @@ class Vad(context: Context) {
 
     private val session = Onnx.session(context, "models/vad.onnx")
     private var state = FloatArray(2 * 1 * 128)
+    private var context64 = FloatArray(CONTEXT)
+    private val buffer = FloatArray(CONTEXT + WINDOW)
     private var speaking = false
 
     fun reset() {
         state = FloatArray(2 * 1 * 128)
+        context64 = FloatArray(CONTEXT)
         speaking = false
     }
 
@@ -48,8 +72,10 @@ class Vad(context: Context) {
      */
     fun probability(window: FloatArray): Float {
         require(window.size == WINDOW) { "silero wants $WINDOW samples, got ${window.size}" }
+        System.arraycopy(context64, 0, buffer, 0, CONTEXT)
+        System.arraycopy(window, 0, buffer, CONTEXT, WINDOW)
         val inputs = mapOf(
-            "input" to Onnx.tensor(window, 1, WINDOW.toLong()),
+            "input" to Onnx.tensor(buffer, 1, (CONTEXT + WINDOW).toLong()),
             "state" to Onnx.tensor(state, 2, 1, 128),
             "sr" to OnnxTensor.createTensor(Onnx.env, longArrayOf(16_000L))
         )
@@ -66,6 +92,8 @@ class Vad(context: Context) {
             state = flat
         }
         inputs.values.forEach { it.close() }
+        // Carry the tail of this window into the next call.
+        System.arraycopy(window, WINDOW - CONTEXT, context64, 0, CONTEXT)
         speaking = if (speaking) p >= SILENCE else p >= SPEECH
         return p
     }

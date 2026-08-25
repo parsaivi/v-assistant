@@ -54,8 +54,28 @@ fun EnrollScreen(onDone: () -> Unit) {
                 meta = "listening · take ${captured + 1} of ${Voiceprint.ENROLL_TARGET}"
                 val s = enrollment.capture(wake, speaker)
                 if (s == null) {
-                    caption = "Didn’t catch that — once more."
-                    meta = "take ${captured + 1} not counted"
+                    // Say which kind of nothing this was. "Didn't catch that"
+                    // in response to a microphone the OS is silencing is the
+                    // single most useless sentence this screen could produce —
+                    // it invites saying the word louder, forever.
+                    when (enrollment.fault) {
+                        is Enrollment.Heard.Silenced -> {
+                            caption = "The microphone is handing back silence."
+                            meta = "grant V the microphone in Settings, then try again"
+                            running = false
+                            return@LaunchedEffect
+                        }
+                        is Enrollment.Heard.Unavailable -> {
+                            caption = "Something else is using the microphone."
+                            meta = "close it and press Begin again"
+                            running = false
+                            return@LaunchedEffect
+                        }
+                        else -> {
+                            caption = "Didn’t catch that — once more."
+                            meta = "take ${captured + 1} not counted"
+                        }
+                    }
                     delay(700)
                     continue
                 }

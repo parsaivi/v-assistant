@@ -420,7 +420,16 @@ FRIDAY = Persona(
         model="fish-audio/s2.1-pro",
         voice="",
         reference="evie.mp3",
-        piper="en_GB-alan-medium",
+        # Jenny, not Alan. The reference clone is Evie and it is the voice
+        # Friday is *supposed* to have — but a clone only exists on the hosted
+        # path, and the local path is the one that runs whenever OpenRouter is
+        # unreachable, which on a phone at home is most of the time. This used
+        # to be `en_GB-alan-medium`: the same male voice as V's fallback, so
+        # Friday and V were audibly the same person and summoning her by name
+        # changed nothing you could hear. Two agents with separate memory
+        # scopes and one voice is a costume, which is exactly what
+        # `persona.py` exists to avoid.
+        piper="en_GB-jenny_dioco-medium",
         piper_fa="fa_IR-ganji-medium",
     ),
 )

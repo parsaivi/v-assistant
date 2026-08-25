@@ -1,12 +1,16 @@
 package cloud.brain.v
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
+import android.util.Log
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -45,6 +49,30 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
 
     data class Result(val kept: Int, val dropped: Int, val cohesion: Float)
 
+    /**
+     * Why a capture produced nothing, when it produced nothing.
+     *
+     * This distinction is the whole point of the type. Android does not refuse
+     * a microphone an app is not allowed to use — it hands over an `AudioRecord`
+     * that opens cleanly, reports `STATE_INITIALIZED`, and returns **exact
+     * zeroes forever** (`AudioFlinger: setRecordSilenced ... silenced 1`). Every
+     * layer above sees a quiet room. Enrollment then waits, times out, and says
+     * "didn't catch that", which is both true and completely useless: the user
+     * says the word louder, fifteen times, and it can never work.
+     *
+     * [Silenced] is that case, detected and named, so the screen can say the
+     * one thing that helps.
+     */
+    sealed interface Heard {
+        class Utterance(val pcm: ShortArray) : Heard
+        /** Waited, the mic works, nobody spoke. */
+        object Nothing : Heard
+        /** The mic is delivering digital silence — permission or an OS toggle. */
+        object Silenced : Heard
+        /** Could not open it at all; usually another app holds it. */
+        object Unavailable : Heard
+    }
+
     /** One live test: what the gate would have scored for this utterance. */
     data class Probe(
         val durationMs: Int,
@@ -64,8 +92,14 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
      * not plausibly the word — too short, too long, or unusable by the
      * embedding network. The caller just asks again.
      */
+    /** The reason the last [capture] or [probe] came back empty. */
+    @Volatile var fault: Heard? = null
+        private set
+
     suspend fun capture(wake: WakeWord, speaker: SpeakerId): Sample? {
-        val pcm = Mic.withUi { recordOneUtterance() } ?: return null
+        val heard = Mic.withUi { listen() }
+        fault = heard.takeUnless { it is Heard.Utterance }
+        val pcm = (heard as? Heard.Utterance)?.pcm ?: return null
         if (pcm.size < WakeWord.MIN_SAMPLES || pcm.size > WakeWord.MAX_SAMPLES) return null
 
         val int16 = FloatArray(pcm.size) { pcm[it].toFloat() }
@@ -109,6 +143,8 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
     }
 
     companion object {
+        private const val TAG = "Vgate"
+
         /**
          * Which takes survive outlier rejection, given each one's mean cosine
          * to the others.
@@ -153,7 +189,9 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
      * than no probe at all.
      */
     suspend fun probe(wake: WakeWord, speaker: SpeakerId): Probe? {
-        val pcm = Mic.withUi { recordOneUtterance() } ?: return null
+        val heard = Mic.withUi { listen() }
+        fault = heard.takeUnless { it is Heard.Utterance }
+        val pcm = (heard as? Heard.Utterance)?.pcm ?: return null
         if (pcm.size < WakeWord.MIN_SAMPLES) {
             return Probe(pcm.size * 1000 / Gate.RATE, 0f, null, tooShort = true)
         }
@@ -175,20 +213,29 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
 
     // ---- capture ----------------------------------------------------------
     @SuppressLint("MissingPermission")
-    private suspend fun recordOneUtterance(): ShortArray? = withContext(Dispatchers.Default) {
+    private suspend fun listen(): Heard = withContext(Dispatchers.Default) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "RECORD_AUDIO not granted")
+            return@withContext Heard.Silenced
+        }
         Features.load(context)
         val minBuf = AudioRecord.getMinBufferSize(
             Gate.RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        if (minBuf <= 0) return@withContext null
+        if (minBuf <= 0) return@withContext Heard.Unavailable
 
         val record = try {
             AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, Gate.RATE,
                         AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
                         maxOf(minBuf * 4, Vad.WINDOW * 16))
         } catch (e: Exception) {
-            return@withContext null
+            Log.w(TAG, "AudioRecord would not construct", e)
+            return@withContext Heard.Unavailable
         }
-        if (record.state != AudioRecord.STATE_INITIALIZED) { record.release(); return@withContext null }
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            return@withContext Heard.Unavailable
+        }
         try {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.getDevices(AudioManager.GET_DEVICES_INPUTS)
@@ -203,6 +250,7 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
         var inSpeech = false
         var quietMs = 0
         var waitedMs = 0
+        var everNonZero = false
 
         try {
             record.startRecording()
@@ -210,9 +258,13 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
                 var got = 0
                 while (got < Vad.WINDOW) {
                     val n = record.read(frame, got, Vad.WINDOW - got)
-                    if (n <= 0) return@withContext null
+                    if (n <= 0) return@withContext Heard.Unavailable
                     got += n
                 }
+                // Real rooms are never digitally silent — even a mute room
+                // dithers the low bit. An unbroken run of exact zeroes means
+                // the OS is silencing us, not that it is quiet.
+                if (!everNonZero) everNonZero = frame.any { it.toInt() != 0 }
                 for (i in 0 until Vad.WINDOW) window[i] = frame[i] / 32768f
                 vad.probability(window)
                 val ms = Vad.WINDOW * 1000 / Gate.RATE
@@ -223,16 +275,23 @@ class Enrollment(private val context: Context, private val prints: Voiceprint) {
                 } else if (inSpeech) {
                     for (x in frame) seg.add(x)
                     quietMs += ms
-                    if (quietMs >= 320) return@withContext seg.toShortArray()
+                    if (quietMs >= 320) return@withContext Heard.Utterance(seg.toShortArray())
                 } else {
                     waitedMs += ms
-                    if (waitedMs > 10_000) return@withContext null   // he walked away
+                    if (waitedMs > 1_500 && !everNonZero) {
+                        Log.w(TAG, "microphone is delivering digital silence")
+                        return@withContext Heard.Silenced
+                    }
+                    if (waitedMs > 10_000) return@withContext Heard.Nothing
                 }
-                if (seg.size > Gate.RATE * 4) return@withContext seg.toShortArray()
+                if (seg.size > Gate.RATE * 4) {
+                    return@withContext Heard.Utterance(seg.toShortArray())
+                }
             }
-            null
+            Heard.Nothing
         } catch (e: Exception) {
-            null
+            Log.w(TAG, "capture failed", e)
+            Heard.Unavailable
         } finally {
             try { record.stop() } catch (e: Exception) { /* already stopped */ }
             record.release()

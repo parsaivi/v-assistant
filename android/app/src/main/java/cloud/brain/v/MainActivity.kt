@@ -66,7 +66,23 @@ class MainActivity : ComponentActivity() {
             // there was no way to finish. Once it is live, it is somewhere the
             // user goes deliberately.
             var calibrating by remember { mutableStateOf(false) }
-            val needsCalibration = enrolled && prints.shadowMode && !wantsVoice
+            // "Save and close" used to be a no-op: it cleared `calibrating`,
+            // but `needsCalibration` was still true because shadow mode was
+            // still on, so the screen immediately re-opened itself and there
+            // was no way off it. Opening once per launch is the intent, not
+            // trapping.
+            var calibrationSeen by remember { mutableStateOf(false) }
+            val shadow = prints.shadowMode
+            val needsCalibration = enrolled && shadow && !wantsVoice && !calibrationSeen
+            // Which surface was chosen, and the three facts that chose it.
+            // Every one of these lives in encrypted storage that cannot be read
+            // from outside the app, so without this line a wrong screen is
+            // diagnosed by reasoning rather than by looking.
+            android.util.Log.i("Vgate", "route: enrolled=$enrolled shadow=$shadow " +
+                "voice=$wantsVoice templates=${prints.templates().size} " +
+                "-> " + when {
+                    !enrolled -> "enroll"; wantsVoice -> "voice"
+                    calibrating || needsCalibration -> "calibrate"; else -> "chat" })
 
             when {
                 // Enrollment first, always. Nothing else about the gate works
@@ -78,7 +94,7 @@ class MainActivity : ComponentActivity() {
                 })
                 wantsVoice -> VoiceScreen(onDone = { dismissed = true })
                 calibrating || needsCalibration -> CalibrateScreen(
-                    onDone = { calibrating = false },
+                    onDone = { calibrating = false; calibrationSeen = true },
                     onReenroll = { enrolled = false; calibrating = false })
                 else -> {
                     val model: VModel = viewModel()

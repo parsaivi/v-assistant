@@ -26,15 +26,17 @@ import java.nio.ByteOrder
  * what [shadowMode] collects. Constants in a source file would be a guess
  * wearing a number's clothes.
  */
-class Voiceprint(context: Context) {
+class Voiceprint(context: Context, file: String = FILE) {
 
     companion object {
-        private const val FILE = "v-voiceprint"
+        /** The real store. Tests pass their own name — see the constructor. */
+        const val FILE = "v-voiceprint"
         private const val K_TEMPLATES = "wake.templates"
         private const val K_CENTROID = "speaker.centroid"
         private const val K_WAKE_T = "wake.threshold"
         private const val K_SPEAKER_T = "speaker.threshold"
         private const val K_SHADOW = "shadow"
+        private const val K_LISTENING = "listening"
         private const val K_LOG = "shadow.log"
 
         /** Starting points, not answers. The wake figure is deliberately loose
@@ -52,12 +54,22 @@ class Voiceprint(context: Context) {
         private const val LOG_CAP = 400
     }
 
+    /**
+     * [file] exists so an instrumented test can exercise this class without
+     * writing into Parsa's actual voiceprint.
+     *
+     * That is not hypothetical caution. A storage test that used the default
+     * store left his `shadowMode` flipped and appended a fabricated entry to
+     * his shadow log — the log whose whole purpose is to be an honest record of
+     * what the phone heard. A test that corrupts the data it is verifying is
+     * worse than no test.
+     */
     private val prefs: SharedPreferences = run {
         val key = MasterKey.Builder(context)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
         EncryptedSharedPreferences.create(
-            context, FILE, key,
+            context, file, key,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
     }
@@ -104,6 +116,23 @@ class Voiceprint(context: Context) {
     var speakerThreshold: Float
         get() = prefs.getFloat(K_SPEAKER_T, DEFAULT_SPEAKER)
         set(v) = prefs.edit().putFloat(K_SPEAKER_T, v).apply()
+
+    /**
+     * The off switch for the always-on microphone.
+     *
+     * Not a debug flag — the single most important control in the app. A thing
+     * that holds the microphone for every waking hour has to have an obvious,
+     * one-tap "stop", reachable without opening anything, or the honest
+     * description of it is spyware with good intentions. It lives here rather
+     * than in a settings screen because the notification is where it belongs:
+     * that is the surface that is visible precisely when the app is not.
+     *
+     * Persisted, so turning it off survives a reboot. Someone who switched the
+     * microphone off does not expect it back on in the morning.
+     */
+    var listeningEnabled: Boolean
+        get() = prefs.getBoolean(K_LISTENING, true)
+        set(v) = prefs.edit().putBoolean(K_LISTENING, v).apply()
 
     /** While true the gate scores everything and acts on nothing. */
     var shadowMode: Boolean

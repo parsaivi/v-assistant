@@ -62,6 +62,21 @@ mic ──► Silero VAD ──► utterance segmentation ──► openWakeWord
         quiet room         of speech                other words      other people
 ```
 
+> **The bug that cost the most so far.** Silero v5's ONNX graph expects **576
+> samples** at 16 kHz — 64 of context plus the 512 new ones — because its first
+> convolution needs history the exported graph does not carry itself. The Python
+> wrapper concatenates that before every call, so the requirement is invisible if
+> you read only the declared input shape (`[None, None]`, which accepts 512
+> happily).
+>
+> Fed bare 512-sample windows the model does not fail. It returns well-formed
+> probabilities that are simply always near zero: over twenty seconds of clear
+> speech, **max 0.154 and not one frame above threshold**. The gate was perfectly
+> healthy and permanently deaf — VAD is the first stage, so nothing downstream
+> could ever run. With the context restored the same audio scores **max 1.000,
+> 90 % of frames above threshold**. `GatePipelineTest.vadSeparatesSpeechFromSilence`
+> is the regression test.
+
 **Why VAD first.** An RMS threshold was tried and is not enough: a fan, a
 keyboard and traffic through a window all clear any threshold that a quiet
 sentence also clears. Silero distinguishes speech from *loud*, which is the
@@ -360,12 +375,46 @@ src/v/core/httpapi.py   `/v1/wake` takes `agent`
 APK: **62 MB** (32 MB models, 18.5 MB onnxruntime arm64). ABI filtered to
 `arm64-v8a`; the AAR ships four ABIs and every phone this will run on is arm64.
 
+### Verified on the phone
+
+A Xiaomi 11T Pro, **Android 12 (SDK 31)**. `GatePipelineTest` re-runs the design's
+own measurement against real ONNX Runtime on ARM, and it reproduces:
+
+| | desktop | phone (arm64) |
+|---|---|---|
+| speaker margin | +0.286 | **+0.2889** |
+| same-speaker min | 0.691 | 0.687 |
+| different-speaker max | 0.405 | 0.398 |
+| VAD silence / speech | — | 0.009 / 0.99999 |
+
+That is what entitles the thresholds derived on a laptop to be used on the phone.
+
+Running end to end on that phone: the gate holds the microphone, segments real
+utterances and scores them (`4 candidates logged · would fire: 3` after a few
+minutes in a room), and the mTLS link carries proactive events. Note that
+reinstalling the app **regenerates its keypair**, so `v phone enrol <name>` has
+to be re-run after every reinstall or the phone shows "not reachable" — the
+device certificate on the laptop is bound to a key that no longer exists.
+
+**MIUI needs four things granted by hand**, none of them optional:
+*Install via USB* and *USB debugging (Security settings)* in developer options
+(without the second, `adb` cannot grant permissions or inject taps, and Gradle's
+`connectedAndroidTest` install path fails with `INSTALL_FAILED_USER_RESTRICTED`
+— installing both APKs with plain `adb install` and driving them with
+`am instrument` works); *Autostart* and battery *No restrictions*, or the
+always-on service is killed; and *Show on Lock screen* per-app, or
+`setShowWhenLocked` is refused and the wake screen cannot appear over the lock
+screen.
+
 ### Tests
 
 - `FeaturesTest` — 4 tests, JVM, golden vectors vs the Python reference
 - `GateLogicTest` — 7 tests, JVM: outlier rejection and close-phrase matching.
   The second caught a real bug — the original rule also matched closers as a
   *prefix*, so "that's all right, what about Tuesday" hung up mid-question.
+- `GatePipelineTest` — 6 tests, **on the device**: the speaker margin, embedding
+  normalisation, wake-descriptor determinism, the VAD's speech/silence split, and
+  that the models load from the packaged assets
 - `test_httpapi` — 27 tests, 3 new: wake is free and says one thing; the wake
   word chooses who answers; an unknown agent still answers
 
@@ -398,7 +447,9 @@ long answer having to be sat through.
 ## 12. Not done
 
 - **A trained wake detector.** See §5 — deliberate, revisit after shadow mode.
-- **Nothing has run on a physical phone.** Everything here compiles, the APK
+- **The conversation has not been run end to end.** The models, the VAD and the
+  features are all verified on the phone; enrollment, a real wake, barge-in and a
+  spoken turn against the laptop are not. Those need Parsa's voice, not a fixture. Everything here compiles, the APK
   builds, the feature front-end is verified against golden vectors and the server
   tests pass — but no audio has gone through this on-device. The numbers in §3
   come from desktop ONNX Runtime on real speech; on-device latency and battery

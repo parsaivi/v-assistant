@@ -61,6 +61,7 @@ fun CalibrateScreen(onDone: () -> Unit, onReenroll: () -> Unit) {
     var speakerT by remember { mutableFloatStateOf(prints.speakerThreshold) }
     var shadow by remember { mutableStateOf(prints.shadowMode) }
 
+    var listening by remember { mutableStateOf(prints.listeningEnabled) }
     var probing by remember { mutableStateOf(false) }
     var probe by remember { mutableStateOf<Enrollment.Probe?>(null) }
     var probeNote by remember { mutableStateOf("") }
@@ -92,6 +93,37 @@ fun CalibrateScreen(onDone: () -> Unit, onReenroll: () -> Unit) {
         Spacer(Modifier.height(6.dp))
         Text("${entries.size} candidates logged · would fire: $firing",
              fontFamily = V.mono, fontSize = 10.5.sp, color = V.dim2)
+
+        // ---- the off switch, first and unmissable ----
+        //
+        // This was originally only an action on the ongoing notification, which
+        // is a channel at IMPORTANCE_MIN — Android collapses those and hides
+        // their buttons, so in practice there was no way to stop the
+        // microphone at all. A thing that listens all day needs its stop to be
+        // the most findable control in the app, not the most clever one.
+        Spacer(Modifier.height(22.dp))
+        Section("Microphone")
+        Row(verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            Button(
+                onClick = {
+                    listening = !listening
+                    prints.listeningEnabled = listening
+                    context.startService(
+                        android.content.Intent(context, VService::class.java)
+                            .setAction(if (listening) VService.ACTION_LISTEN
+                                       else VService.ACTION_STOP_LISTENING))
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (listening) V.refuse else V.free)) {
+                Text(if (listening) "Stop listening" else "Start listening",
+                     fontFamily = V.sans, fontWeight = FontWeight.Medium,
+                     color = V.void)
+            }
+            Text(if (listening) "the mic is open" else "the mic is off",
+                 fontFamily = V.mono, fontSize = 10.5.sp,
+                 color = if (listening) V.body else V.dim1)
+        }
 
         // ---- the live probe, which is the useful half ----
         Spacer(Modifier.height(20.dp))
@@ -179,8 +211,16 @@ fun CalibrateScreen(onDone: () -> Unit, onReenroll: () -> Unit) {
              fontFamily = V.mono, fontSize = 10.5.sp, color = V.dim2)
 
         // ---- committing ----
+        // Going live is deliberately *not* the loudest thing here, and that is
+        // a correction. It used to be the one filled button on a screen you
+        // land on straight after enrolling, with an empty log and two default
+        // thresholds — so the obvious action was to leave shadow mode having
+        // measured nothing, which is exactly what shadow mode exists to
+        // prevent. It stays reachable, and says what it is committing to.
         Spacer(Modifier.height(26.dp))
+        val measured = entries.size >= 20 || probe != null
         Button(
+            enabled = !shadow || measured,
             onClick = {
                 persist()
                 shadow = !shadow
@@ -189,9 +229,18 @@ fun CalibrateScreen(onDone: () -> Unit, onReenroll: () -> Unit) {
                 if (!shadow) onDone()
             },
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (shadow) V.seed else V.line3)) {
+                containerColor = if (!shadow) V.line3 else if (measured) V.seed else V.line2,
+                disabledContainerColor = V.line2)) {
             Text(if (shadow) "Start acting on these" else "Back to shadow mode",
-                 fontFamily = V.sans, fontWeight = FontWeight.Medium)
+                 fontFamily = V.sans, fontWeight = FontWeight.Medium,
+                 color = if (shadow && !measured) V.dim1 else V.paperHi)
+        }
+        if (shadow && !measured) {
+            Spacer(Modifier.height(6.dp))
+            Text("Probe once, or let it listen for a while first — going live on "
+                 + "two untested numbers is how this ends up ignoring you.",
+                 fontFamily = V.sans, fontSize = 12.5.sp, lineHeight = 19.sp,
+                 color = V.dim1)
         }
 
         Spacer(Modifier.height(6.dp))

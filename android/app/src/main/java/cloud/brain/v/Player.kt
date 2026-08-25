@@ -58,14 +58,18 @@ class Player(private val context: Context) {
             try {
                 mp.setAudioAttributes(
                     AudioAttributes.Builder()
-                        // USAGE_ASSISTANT, and nothing else. The gate listens on
-                        // the phone's own microphone, so there is no SCO link to
-                        // follow and no routing decision left to make: if
-                        // headphones are connected A2DP already carries this to
-                        // them, and if they are not it comes out of the phone.
-                        // The whole `overHeadset` branch this replaces existed
-                        // only to chase a bluetooth mic that is no longer used.
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        // USAGE_MEDIA, which is what this was before the SCO
+                        // removal and what it should have stayed. Dropping the
+                        // `overHeadset` branch was right — the gate listens on
+                        // the phone, so A2DP already carries a reply to any
+                        // connected headphones and there is no route to choose.
+                        // Switching the survivor to USAGE_ASSISTANT was not: it
+                        // bought nothing, and an assistant-usage stream is at
+                        // the mercy of per-device policy about where assistant
+                        // audio goes and how loud. MEDIA plays at media volume
+                        // like every other sound the phone makes, which is the
+                        // original reasoning and still correct.
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build())
                 mp.setDataSource(file.absolutePath)
