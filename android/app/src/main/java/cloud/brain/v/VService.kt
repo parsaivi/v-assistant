@@ -54,13 +54,33 @@ import java.util.concurrent.atomic.AtomicLong
 class VService : LifecycleService() {
 
     companion object {
-        const val CHANNEL_STATUS = "v-status"
+        // v-status2, not v-status. A NotificationChannel's importance is fixed
+        // at creation — Android ignores later changes, by design, so that an
+        // app cannot quietly promote itself after the user has seen it. The
+        // original channel was created at IMPORTANCE_MIN, which hides action
+        // buttons, so raising it in code does nothing on a phone that already
+        // has it. A new id is the only way to ship the change.
+        const val CHANNEL_STATUS = "v-status2"
         const val CHANNEL_PROACTIVE = "v-proactive"
         private const val ONGOING_ID = 1
 
         /** Set when the start came from the UI, which is the only origin
          *  allowed to arm a microphone service. See [armed]. */
         const val EXTRA_ARM = "arm"
+
+        /** The off switch, delivered as an intent so the notification's action
+         *  button can reach it without opening the app. */
+        const val ACTION_LISTEN = "cloud.brain.v.LISTEN"
+        const val ACTION_STOP_LISTENING = "cloud.brain.v.STOP_LISTENING"
+
+        /** "Save" on a notification that carried a file. The three extras are
+         *  everything `VFile` needs; passing them rather than a rel alone
+         *  means the download does not have to ask the server what it is
+         *  about to fetch. */
+        const val ACTION_SAVE_FILE = "cloud.brain.v.SAVE_FILE"
+        const val EXTRA_REL = "rel"
+        const val EXTRA_NAME = "name"
+        const val EXTRA_MIME = "mime"
 
         fun start(context: Context, arm: Boolean = true) {
             val intent = Intent(context, VService::class.java)
@@ -125,6 +145,29 @@ class VService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        // The off switch. Handled before anything else, because the whole
+        // point of it is that it works even when the rest of this is confused.
+        when (intent?.action) {
+            ACTION_STOP_LISTENING -> {
+                prints.listeningEnabled = false
+                gateJob?.cancel()
+                gateJob = null
+                gate = null
+                conversation?.cancel()
+                foreground(status())
+                return START_STICKY
+            }
+            ACTION_LISTEN -> {
+                prints.listeningEnabled = true
+                armed = true
+            }
+            ACTION_SAVE_FILE -> {
+                save(intent.getStringExtra(EXTRA_REL).orEmpty(),
+                     intent.getStringExtra(EXTRA_NAME).orEmpty(),
+                     intent.getStringExtra(EXTRA_MIME).orEmpty())
+                return START_STICKY
+            }
+        }
         // Re-checked on every start rather than only in onCreate: enrollment
         // finishes while this service is already running, and the gate has to
         // pick that up without the user restarting anything.
@@ -167,7 +210,7 @@ class VService : LifecycleService() {
                     throw e
                 } catch (e: Exception) {
                     connected = false
-                    notifications.notify(ONGOING_ID, ongoing("offline"))
+                    notifications.notify(ONGOING_ID, ongoing(status()))
                 } finally {
                     // Re-probe the address on every reconnect, not only after
                     // an exception. `Api` caches whichever address answered
@@ -200,12 +243,23 @@ class VService : LifecycleService() {
                 override fun onOpen(eventSource: EventSource, response: okhttp3.Response) {
                     connected = true
                     notifications.notify(ONGOING_ID, ongoing(status()))
+                    // Reachable again, which usually means the laptop woke or
+                    // the network changed — either way whatever is on the home
+                    // screen has been stale for as long as this was down.
+                    Widgets.onEvent(applicationContext)
                 }
 
                 override fun onEvent(eventSource: EventSource, id: String?,
                                      type: String?, data: String) {
                     id?.toLongOrNull()?.let { seq.set(it) }
                     proactive(type ?: "v", data)
+                    // The half of the widget story a cloud-backed card cannot
+                    // tell. This service is already holding an authenticated
+                    // socket to the machine that owns the data, so a reminder
+                    // firing or the 10:00 brief landing redraws the home screen
+                    // at the moment it happens — no polling interval, no push
+                    // service, and nobody in the path who was not already there.
+                    Widgets.onEvent(applicationContext)
                 }
 
                 override fun onClosed(eventSource: EventSource) {
@@ -233,27 +287,95 @@ class VService : LifecycleService() {
      * hence no sound, no vibration, and no badge.
      */
     private fun proactive(kind: String, data: String) {
-        val text = try {
-            JSONObject(data).optString("text").ifBlank { return }
+        val event = try {
+            JSONObject(data)
         } catch (e: Exception) {
             return
         }
+        // A file may arrive with no words around it — the outbox sweep sends
+        // one when a chart was rendered while nobody was asking — so the file
+        // is enough to notify about on its own, and the text is not.
+        val file = event.optJSONObject("data")?.optJSONArray("files")
+            ?.takeIf { it.length() > 0 }?.let { VFile.parse(it.getJSONObject(0)) }
+        val text = event.optString("text").ifBlank { file?.name ?: return }
+
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
-        val notification = NotificationCompat.Builder(this, CHANNEL_PROACTIVE)
+        val builder = NotificationCompat.Builder(this, CHANNEL_PROACTIVE)
             .setSmallIcon(R.drawable.ic_stat_v)
             .setContentTitle("V")
-            .setContentText(text.lineSequence().first())
+            .setContentText(if (file != null) "${file.name} · ${file.size()}"
+                            else text.lineSequence().first())
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setColor(0xFF7C5CFF.toInt())
             .setContentIntent(open)
             .setAutoCancel(true)
             .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .build()
-        notifications.notify(kind.hashCode() and 0xFFFF, notification)
+
+        if (file != null) {
+            // The whole point of putting the action here rather than only in
+            // the app: a file pushed at 3am should be one tap from Downloads
+            // at 8, without opening anything.
+            val intent = Intent(this, VService::class.java)
+                .setAction(ACTION_SAVE_FILE)
+                .putExtra(EXTRA_REL, file.rel)
+                .putExtra(EXTRA_NAME, file.name)
+                .putExtra(EXTRA_MIME, file.mime)
+            // `getForegroundService`, not `getService`. A plain `startService`
+            // from the background throws on Android 8+, and the moment this
+            // button is most likely to be pressed — a file pushed overnight,
+            // tapped in the morning — is exactly the moment this service is
+            // most likely to have been killed and not yet restarted.
+            // `onCreate` calls `foreground()` before anything else, so the
+            // five-second promise that comes with it is already kept.
+            val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            val save =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    PendingIntent.getForegroundService(
+                        this, file.rel.hashCode(), intent, flags)
+                else
+                    PendingIntent.getService(this, file.rel.hashCode(), intent, flags)
+            builder.addAction(0, "Save", save)
+        }
+        notifications.notify(kind.hashCode() and 0xFFFF, builder.build())
+    }
+
+    /**
+     * Fetch a file V pushed and put it in Downloads, reporting either way.
+     *
+     * Reported as a notification rather than swallowed, because this runs with
+     * no window open and nobody watching a progress bar: the only evidence
+     * that "Save" did anything is what appears afterwards, and a silent
+     * failure here is indistinguishable from a silent success.
+     */
+    private fun save(rel: String, name: String, mime: String) {
+        if (rel.isBlank()) return
+        val id = ("save:" + rel).hashCode() and 0xFFFF
+        lifecycleScope.launch {
+            val done = try {
+                val target = Files.scratch(applicationContext, name)
+                java.io.FileOutputStream(target).use { api.download(rel, it) }
+                Files.publish(applicationContext, target, mime)
+                    ?: run { Files.sendTo(applicationContext, target, mime); "this phone" }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+            notifications.notify(id, NotificationCompat.Builder(this@VService,
+                                                                CHANNEL_PROACTIVE)
+                .setSmallIcon(R.drawable.ic_stat_v)
+                .setContentTitle(if (done != null) name else "Couldn't save $name")
+                .setContentText(if (done != null) "saved to $done"
+                                else "V wasn't reachable — try again from the app")
+                .setColor(0xFF7C5CFF.toInt())
+                .setAutoCancel(true)
+                .setSilent(true)
+                .build())
+        }
     }
 
     // ---- the gate --------------------------------------------------------
@@ -269,6 +391,7 @@ class VService : LifecycleService() {
      */
     private fun listen() {
         if (!armed) return
+        if (!prints.listeningEnabled) return
         if (!prints.isEnrolled) {
             foreground("not enrolled · open V to teach it your voice")
             return
@@ -276,6 +399,12 @@ class VService : LifecycleService() {
         if (gateJob?.isActive == true) return
         val g = Gate(applicationContext, prints).also { gate = it }
         gateJob = lifecycleScope.launch {
+            // Mirror the gate's state into the notification, which is the only
+            // place it is visible with the app closed — and the only way a
+            // silenced microphone is ever discoverable.
+            launch {
+                g.state.collect { notifications.notify(ONGOING_ID, ongoing(status())) }
+            }
             g.run { pcm -> onWake() }
         }
     }
@@ -341,22 +470,49 @@ class VService : LifecycleService() {
 
     /** What the ongoing notification says — the only place the gate's state is
      *  visible when the app is closed. */
-    private fun status(): String = when {
-        !prints.isEnrolled -> "not enrolled"
-        !armed -> "open V to start listening"
-        prints.shadowMode -> "listening · shadow mode · nothing acts yet"
-        gateJob?.isActive == true -> "listening for “Friday” · nothing leaves this room"
-        else -> "connected"
+    /**
+     * What the ongoing notification says.
+     *
+     * **Both halves, always.** These used to be two independent notifications
+     * racing for one id: the SSE loop wrote "offline" on every failed reconnect
+     * and the gate wrote "listening…", so whichever fired last won and the other
+     * fact vanished. On a phone that could not reach the laptop the reconnect
+     * loop fired every few seconds and permanently erased any sign of whether
+     * the microphone was working — which is the one thing this line exists to
+     * show. They are not alternatives; the gate is local and runs perfectly well
+     * with the laptop asleep.
+     */
+    private fun status(): String {
+        val ear = when {
+            !prints.listeningEnabled -> "listening off"
+            !prints.isEnrolled -> "not enrolled"
+            !armed -> "open V to start listening"
+            gate?.state?.value == Gate.State.SILENCED -> "microphone muted"
+            gate?.state?.value == Gate.State.NO_MIC -> "microphone busy"
+            prints.shadowMode -> "shadow mode · nothing acts yet"
+            gateJob?.isActive == true -> "listening for “Friday”"
+            else -> "not listening"
+        }
+        return if (connected) ear else "$ear · laptop unreachable"
     }
 
     // ---- notifications ----------------------------------------------------
     private fun channels() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         notifications.createNotificationChannel(
-            NotificationChannel(CHANNEL_STATUS, "Connection",
-                                NotificationManager.IMPORTANCE_MIN).apply {
-                description = "Whether V can be reached. Silent."
+            // LOW, not MIN. MIN collapses the notification into the shade's
+            // bottom strip and hides its actions — which made "Stop listening"
+            // unreachable, i.e. made the microphone's off switch invisible.
+            // Still silent and still badge-less; it just has to be able to
+            // show one button.
+            NotificationChannel(CHANNEL_STATUS, "Listening",
+                                NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Whether V is listening, and whether the laptop " +
+                              "can be reached. Silent, and carries the " +
+                              "microphone's off switch."
                 setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
             })
         notifications.createNotificationChannel(
             NotificationChannel(CHANNEL_PROACTIVE, "V speaks first",
@@ -416,7 +572,22 @@ class VService : LifecycleService() {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+        // The one-tap microphone switch, on the notification rather than behind
+        // the app, because this notification is the only part of V that is
+        // visible while the gate is running and the app is closed. Requiring
+        // someone to open an app to stop a microphone is requiring them to
+        // trust the app.
+        val listening = prints.listeningEnabled
+        val toggle = PendingIntent.getService(
+            this, 1,
+            Intent(this, VService::class.java).setAction(
+                if (listening) ACTION_STOP_LISTENING else ACTION_LISTEN),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
         return NotificationCompat.Builder(this, CHANNEL_STATUS)
+            .addAction(0, if (listening) "Stop listening" else "Start listening",
+                       toggle)
             .setSmallIcon(R.drawable.ic_stat_v)
             .setContentTitle("V")
             .setContentText(state)
@@ -425,7 +596,7 @@ class VService : LifecycleService() {
             .setSilent(true)
             .setShowWhen(false)
             .setContentIntent(open)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 }

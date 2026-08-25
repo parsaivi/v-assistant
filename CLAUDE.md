@@ -19,10 +19,11 @@ imported as `v.*`. Anything referring to the old layout is out of date.
 ```
 src/v/
   cli.py        33 subcommands + the REPL; entry point for the `v` console script
-  core/         46 modules — see the table in README.md
+  core/         47 modules — see the table in README.md
   mcp/          the MCP server (40 tools) + the privacy guard
-  tests/        336 tests, plain asserts, no pytest
-android/        Kotlin + Compose client for the phone transport
+  tests/        472 tests, plain asserts, no pytest
+android/        Kotlin + Compose client for the phone transport, plus two
+                Glance home-screen widgets over `GET /v1/glance`
 systemd/        v.service (telegram + scheduler), v-serve.service (phone)
 docs/           the voice-interface design brief
 ```
@@ -44,10 +45,10 @@ There is **no pytest, no linter, no build step.** Each test file is executable
 and prints its own summary. The full suite:
 
 ```
-test_core 89 · test_shell 33 · test_mcp 18 · test_tasks 51 · test_memory 31
-test_briefing 15 · test_telegram 31 · test_tts 12 · test_httpapi 24
-test_traits 11 · test_agents 19 · test_mcp 20 · test_graph ·
-test_ui_animation                                            (336 total)
+test_core 90 · test_shell 33 · test_mcp 20 · test_tasks 51 · test_memory 31
+test_briefing 15 · test_telegram 31 · test_tts 12 · test_httpapi 39
+test_traits 11 · test_agents 19 · test_graph 95 ·
+test_ui_animation 25                                         (472 total)
 ```
 
 Two tests are sensitive to the pinned clock — `config.py` forces

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 4×3 by default, resizable down to one row. The row count is computed from
+     the height it is actually given (`PrioritiesWidget.fits`), so shrinking it
+     drops tasks off the bottom rather than clipping one in half. -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="110dp"
+    android:targetCellWidth="4"
+    android:targetCellHeight="3"
+    android:resizeMode="horizontal|vertical"
+    android:minResizeWidth="180dp"
+    android:minResizeHeight="70dp"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/glance_default_loading_layout"
+    android:description="@string/widget_priorities_description"
+    android:widgetCategory="home_screen" />

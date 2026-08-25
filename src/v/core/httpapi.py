@@ -58,9 +58,11 @@ import traceback
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 from . import pki
+from .files import (ATTACH_LIMIT, file_meta, mime_for,
+                    save_attachment, take_queued_files)
 from .config import Settings, settings as default_settings
 from . import persona as persona_mod
 from .engine import Engine
@@ -220,13 +222,15 @@ class Broadcast:
             return len(self._subs)
 
 
-def build_sink(bus: Broadcast):
+def build_sink(bus: Broadcast, s: Settings | None = None):
     """A `Scheduler(..., sink=...)` that publishes instead of printing.
 
     Same contract `telegram.build_sink` implements against the same jobs — the
     scheduler hands over something with a `.render()` (a `Response`) or a plain
     string, and no job has to know which surface is listening.
     """
+    s = s or default_settings
+
     def sink(source: str, item) -> None:
         name, payload = item if isinstance(item, tuple) else (source, item)
         items = payload if isinstance(payload, list) else [payload]
@@ -236,9 +240,15 @@ def build_sink(bus: Broadcast):
             text = getattr(p, "render", lambda: str(p))()
             if not text or not text.strip():
                 continue
+            data = getattr(p, "data", None) or {}
             bus.publish(str(name), text, {
                 "buttons": _buttons(getattr(p, "buttons", None)),
                 "route": getattr(p, "route", ""),
+                # A scheduled job can hand over a file the same way a turn
+                # can — the weekly rollup's chart, a brag draft — and the
+                # phone renders it with the same chip either way.
+                "files": [file_meta(s, rel) for rel in (data.get("files") or [])
+                          if isinstance(rel, str)],
             })
     return sink
 
@@ -408,7 +418,7 @@ def for_speech(text: str) -> str:
     return text[:SPEAK_LIMIT]
 
 
-def payload(resp) -> dict:
+def payload(resp, settings: Settings | None = None) -> dict:
     """The JSON the app renders a turn from.
 
     Every field the design's cost line needs is here and none of it is
@@ -439,8 +449,153 @@ def payload(resp) -> dict:
         "local": not bool(data.get("list_cost_usd") or resp.cost),
         "refused": bool(data.get("refused")),
         "degraded": bool(data.get("degraded")),
+        # Files this turn produced. `data["files"]` is a list of vault-relative
+        # paths — that is all a producer knows and all it should have to know —
+        # and the name, size and type are resolved here, so the phone can draw
+        # a chip without downloading the bytes to find out what they are.
+        "files": [file_meta(settings or default_settings, rel)
+                  for rel in (data.get("files") or [])
+                  if isinstance(rel, str)],
     }
 
+
+# ---- the home screen -------------------------------------------------------
+# How many of each the snapshot carries. Both are "one more than the widest
+# widget draws", so a task ticked from the home screen leaves a full list
+# behind instead of a gap that waits for the next fetch.
+GLANCE_TASKS = 6
+GLANCE_EVENTS = 5
+
+
+def glance(engine, now: dt.datetime | None = None) -> dict:
+    """Everything the two home-screen widgets draw, in one free call.
+
+    A widget is not a small chat window. It gets a few hundred milliseconds of
+    a process that Android may kill mid-draw, it cannot show a spinner without
+    lying, and for most of the day the phone is on a network from which this
+    server is simply not reachable. So the contract here is different from
+    every other endpoint: one request, everything, no follow-ups — and the
+    phone keeps the last answer and draws *that* when the socket is down,
+    stamped with when it was true.
+
+    Free by construction. Calendar, tasks and reminders are SQL and Markdown;
+    nothing here reaches a model, and `test_httpapi` asserts the cost is 0.0 so
+    a later "just summarise the day for the widget" has to argue with a test
+    rather than quietly bill a home screen every half hour.
+
+    Times go out as ISO instants and never as "in 42m". The widget on screen is
+    a picture taken when it was last redrawn, which may be twenty minutes ago;
+    a relative label baked in here would still say "in 42m" long after the
+    meeting started, which is worse than saying nothing. The phone computes the
+    gap at draw time from the absolute time.
+    """
+    now = now or dt.datetime.now()
+    day = now.date()
+    q = engine.q
+
+    events = q.calendar.on(day)
+    nxt = q.calendar.next_up(now)
+    tasks = q.tasks.priorities(today=day, limit=GLANCE_TASKS)
+    shape = q.tasks.backlog_shape(day)
+    pending = [r for r in engine.reminders.pending() if r.due.date() <= day]
+
+    counts = {
+        "open": shape["open"],
+        "overdue": shape["overdue"],
+        "due_today": shape["due_today"],
+        "events": len(events),
+        "left": len([e for e in events if not _past(e, now)]),
+        "reminders": len(pending),
+        "closed_last_7": shape["closed_last_7"],
+    }
+    return {
+        "at": now.isoformat(timespec="seconds"),
+        "day": day.isoformat(),
+        "next": _event(nxt, now) if nxt else None,
+        "events": [_event(e, now) for e in events[:GLANCE_EVENTS]],
+        "tasks": [_task(t, day) for t in tasks],
+        "reminders": [{"id": r.id, "text": _plain(r.text, 80),
+                       "at": r.due.isoformat(timespec="minutes")}
+                      for r in pending[:3]],
+        "counts": counts,
+        "headline": _headline(counts),
+    }
+
+
+def _past(event, now: dt.datetime) -> bool:
+    at = event.starts_at()
+    return at is not None and at < now
+
+
+def _event(event, now: dt.datetime) -> dict:
+    at = event.starts_at()
+    return {
+        "date": event.date.isoformat(),
+        "what": _plain(event.summary, 80),
+        "where": _plain(event.location or "", 60),
+        "when": event.time_label,
+        "all_day": event.all_day,
+        "at": at.isoformat(timespec="minutes") if at else None,
+        "past": _past(event, now),
+        # Today or not is a rendering decision — "14:00" alone is a lie on a
+        # card that might be showing tomorrow's first meeting because today
+        # has none left.
+        "today": event.date == now.date(),
+    }
+
+
+# A widget row is one line of ~40 characters. Some tasks in this vault are a
+# paragraph with five wikilinks in them (a quarterly key result, written as a
+# checkbox), and 500 characters of JSON per row to render 40 of them is waste
+# at both ends. Cut generously rather than to the visible width: the card is
+# resizable and the font is the phone's, so what fits is not knowable here.
+GLANCE_TEXT = 120
+
+
+def _plain(text: str, limit: int = GLANCE_TEXT) -> str:
+    """Wikilinks flattened to their display text, and the line kept short.
+
+    `[[MR-1320 feat(...)|MR-1320]]` is a link on every other surface and noise
+    on a home screen, where there is nothing to click through to and no room
+    for the brackets. `notes.WIKILINK` already knows the shape, including the
+    `#heading` form, so this is the same rule and not a second one.
+    """
+    from . import notes
+    out = notes.WIKILINK.sub(lambda m: m.group(2) or m.group(1), text).strip()
+    out = re.sub(r"\s+", " ", out)
+    return out if len(out) <= limit else out[:limit - 1].rstrip() + "…"
+
+
+def _task(task, day: dt.date) -> dict:
+    age = task.age_days(day) or 0
+    return {
+        "id": task.id,
+        "text": _plain(task.text),
+        "where": task.section or task.rel.rsplit("/", 1)[-1][:-3],
+        "area": task.area or "",
+        "due": task.due.isoformat() if task.due else "",
+        "days": age,
+        "overdue": task.is_overdue(day),
+        "doing": task.state == "doing",
+        "carried": task.carried,
+    }
+
+
+def _headline(counts: dict) -> str:
+    """The same sentence `briefing.headline` writes, from the same numbers —
+    but off `left` rather than `events`, because a widget read at 6pm should
+    not still be announcing three meetings that all finished."""
+    bits = []
+    if counts["left"]:
+        bits.append(f"{counts['left']} event{'' if counts['left'] == 1 else 's'}")
+    if counts["due_today"]:
+        bits.append(f"{counts['due_today']} due")
+    if counts["overdue"]:
+        bits.append(f"{counts['overdue']} overdue")
+    if counts["reminders"]:
+        n = counts["reminders"]
+        bits.append(f"{n} reminder{'' if n == 1 else 's'}")
+    return " · ".join(bits) or "nothing pressing"
 
 # ---- the request handler --------------------------------------------------
 class _Handler(BaseHTTPRequestHandler):
@@ -482,7 +637,39 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "bad Content-Length")
         if n > limit:
             raise ApiError(413, "too large")
-        return self.rfile.read(n) if n else b""
+        if not n:
+            return b""
+        raw = self.rfile.read(n)
+        self._read += len(raw)
+        return raw
+
+    def _drain(self) -> None:
+        """Swallow any request body the handler did not read.
+
+        Keep-alive makes an unread body poison the *next* request on the same
+        socket. `BaseHTTPRequestHandler` parses a request line, the handler
+        returns without touching `rfile`, and the leftover bytes are still
+        sitting there when the parser reads the following request — so a two
+        byte `{}` in front of `POST /v1/chat` becomes the request line
+        `{}POST /v1/chat`, and the phone is told `Unsupported method
+        ('{}POST')` about a request that was perfectly well formed.
+
+        `h_wake` and `h_session_new` take no arguments in the body and never
+        read one, while `Api.wake`/`Api.newSession` post `{}` because OkHttp
+        requires a body on POST. That pairing was harmless while a wake only
+        happened on a headset connecting; the gate calls it far more often, and
+        OkHttp pools connections, so it started corrupting the next request.
+
+        Draining here rather than in those two handlers is deliberate: it makes
+        the invariant true for every route, including ones not yet written.
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        remaining = n - self._read
+        if remaining > 0:
+            self.rfile.read(remaining)
 
     def _json_body(self) -> dict:
         raw = self._body(limit=1024 * 1024)
@@ -512,10 +699,15 @@ class _Handler(BaseHTTPRequestHandler):
                    "application/json; charset=utf-8")
 
     # ---- routing ------------------------------------------------------
+    #: Bytes of this request's body a handler has consumed, so `_drain` knows
+    #: what is left. Reset per request by `do_GET`/`do_POST`.
+    _read = 0
+
     def do_GET(self) -> None:       # noqa: N802 — BaseHTTPRequestHandler's name
         self._dispatch("GET")
 
     def do_POST(self) -> None:      # noqa: N802
+        self._read = 0
         self._dispatch("POST")
 
     def _dispatch(self, method: str) -> None:
@@ -537,6 +729,7 @@ class _Handler(BaseHTTPRequestHandler):
             if handler is None:
                 raise ApiError(404, f"no route for {method} {url.path}")
             handler(self, query)
+            self._drain()
         except ApiError as exc:
             self._fail(exc.status, exc.message)
         except (BrokenPipeError, ConnectionResetError):
@@ -579,19 +772,130 @@ class _Handler(BaseHTTPRequestHandler):
             **stats,
         })
 
+    def h_glance(self, query: dict) -> None:
+        """The home-screen snapshot. See `glance()` for why it is one call.
+
+        Answered on the engine thread like everything else, and with a shorter
+        timeout than a chat turn: a widget that waits sixty seconds has already
+        been killed by Android, and the phone would rather be told nothing and
+        keep drawing what it has.
+        """
+        snap = self.app.bridge.call(lambda e: glance(e), timeout=20)
+        snap["device"] = self._peer_cn()
+        self._json(snap)
+
     def h_chat(self, query: dict) -> None:
         body = self._json_body()
         text = (body.get("text") or "").strip()
-        if not text:
-            raise ApiError(400, "text is required")
-        mtype = body.get("message_type") or "text"
         extra = body.get("extra") if isinstance(body.get("extra"), dict) else {}
-        resp = self.app.bridge.call(
-            lambda e: e.handle(text, message_type=mtype,
-                               has_location=bool(body.get("has_location")),
-                               has_file=bool(body.get("has_file")),
-                               extra=extra))
-        self._json(payload(resp))
+        # An attachment uploaded a moment ago, named by the path `/v1/attach`
+        # gave back. Two calls rather than one multipart request, because the
+        # caption is the interesting half: it is UTF-8 prose that routes the
+        # turn, and putting it in a query string or an HTTP header — the only
+        # places a raw-body upload could carry it — would mean latin-1
+        # mangling every Persian caption Parsa writes.
+        file_rel = (body.get("file_rel") or "").strip()
+        if file_rel:
+            extra = {**extra, "file_rel": file_rel}
+        has_file = bool(body.get("has_file")) or bool(file_rel)
+        if not text and not has_file:
+            raise ApiError(400, "text is required")
+        # A photo with no caption is a complete message — it is how most
+        # attachments are actually sent — and `router` already reads
+        # `has_file` as enough to route on. Telegram has always allowed it;
+        # this endpoint used to reject it at the door.
+        mtype = body.get("message_type") or ("document" if has_file else "text")
+
+        def _work(engine):
+            resp = engine.handle(text, message_type=mtype,
+                                 has_location=bool(body.get("has_location")),
+                                 has_file=has_file, extra=extra)
+            return resp, take_queued_files(engine)
+
+        resp, queued = self.app.bridge.call(_work)
+        out = payload(resp, self.app.s)
+        out["files"] = out["files"] + queued
+        self._json(out)
+
+    def h_attach(self, query: dict) -> None:
+        """Bytes in, a vault path out. Say something about it with `/v1/chat`.
+
+        Shaped like `/v1/voice`: the body is the file and nothing else, so
+        there is no multipart parser here and no dependency to add one. The
+        name rides in the query string, where it is percent-encoded and
+        therefore safe for any script; the caption does not, for the reason
+        `h_chat` gives.
+
+        The upload is a vault write like any other — `save_binary`, a `[bot]`
+        commit, revertible with `v undo`. That is why it happens here and not
+        as a temp file the next turn might pick up: a file that is in the vault
+        is a file that is backed up, indexed and undoable, and one that is not
+        is one more thing to lose.
+        """
+        name = (query.get("name") or [""])[0].strip() or "file"
+        data = self._body(limit=ATTACH_LIMIT + 1)
+        if not data:
+            raise ApiError(400, "empty upload")
+        if len(data) > ATTACH_LIMIT:
+            raise ApiError(413, f"{len(data) / 1e6:.1f} MB is over the "
+                                f"{ATTACH_LIMIT // 1_000_000} MB attachment "
+                                f"limit — every attachment is a git commit in "
+                                f"a vault that gets cloned.")
+        meta = self.app.bridge.call(
+            lambda e: save_attachment(e, data, name), timeout=120)
+        self._json(meta)
+
+    def h_file(self, query: dict) -> None:
+        """A file out of the vault, by its relative path.
+
+        No privacy-folder check, and that is a decision rather than an
+        oversight. `mcp/guard.py` blocks private folders because the thing on
+        the other side is a *model*; the thing on the other side of this socket
+        is Parsa's own phone, proved by a client certificate this machine
+        issued, and `/v1/chat` already answers questions out of those same
+        folders. Blocking the file while serving the sentence would be a rule
+        that only stops the honest half.
+
+        What *is* enforced is the vault boundary: `vault.path()` resolves and
+        refuses anything that climbs out, so `?rel=../../.ssh/id_rsa` is a 400
+        and not a key. Losing the phone is answered where it is answerable —
+        `pki.revoke`, which this handler is behind like every other.
+        """
+        rel = (query.get("rel") or [""])[0].strip()
+        if not rel:
+            raise ApiError(400, "rel is required")
+        # Resolved by the engine's own `Vault`, not by a second copy of the
+        # rule here. It is pure string arithmetic so it costs nothing to ask
+        # the engine thread for it, and one implementation of "inside the
+        # vault" is the difference between a boundary and a suggestion.
+        try:
+            path = self.app.bridge.call(lambda e: e.vault.path(rel), timeout=20)
+        except ApiError as exc:
+            # `VaultError: path escapes the vault` arrives here as a 500,
+            # which is the wrong shape for it: the caller sent a bad path, and
+            # a phone told "server error" would retry it forever.
+            if exc.status != 500:
+                raise
+            raise ApiError(400, exc.message) from exc
+        except Exception as exc:        # noqa: BLE001
+            # Same conclusion by the other route. `_Bridge` wraps whatever the
+            # closure raised into an ApiError, but nothing guarantees the
+            # object behind `bridge` is that one — and every way of failing to
+            # resolve a path is the caller's fault, not this machine's.
+            raise ApiError(400, f"bad path: {_scrub(exc)}") from exc
+        if not path.exists() or not path.is_file():
+            raise ApiError(404, f"no such file: {rel}")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ApiError(500, f"could not read {rel}: {exc}")
+        # `attachment` and not `inline`: this is a download, and the name is
+        # what the phone will file it under. RFC 5987 for the name, because
+        # half of them are Persian and a bare `filename=` is latin-1 only.
+        quoted = quote(Path(rel).name, safe="")
+        self._send(200, data, mime_for(rel), {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+        })
 
     def h_voice(self, query: dict) -> None:
         """Audio in, an answer out. The transcript travels with it.
@@ -631,9 +935,13 @@ class _Handler(BaseHTTPRequestHandler):
                         "state": "unsure", "empty": True,
                         "buttons": [], "citations": []})
             return
-        resp = self.app.bridge.call(
-            lambda e: e.handle(transcript, message_type="voice"))
-        out = payload(resp)
+        def _work(engine):
+            return (engine.handle(transcript, message_type="voice"),
+                    take_queued_files(engine))
+
+        resp, queued = self.app.bridge.call(_work)
+        out = payload(resp, self.app.s)
+        out["files"] = out["files"] + queued
         out["transcript"] = transcript
         self._json(out)
 
@@ -656,8 +964,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not action:
             raise ApiError(400, "action is required")
         pay = body.get("payload") if isinstance(body.get("payload"), dict) else {}
-        resp = self.app.bridge.call(lambda e: e.act(action, pay))
-        self._json(payload(resp))
+
+        def _work(engine):
+            return engine.act(action, pay), take_queued_files(engine)
+
+        resp, queued = self.app.bridge.call(_work)
+        out = payload(resp, self.app.s)
+        out["files"] = out["files"] + queued
+        self._json(out)
 
     def h_session_new(self, query: dict) -> None:
         def _work(engine: Engine) -> dict:
@@ -806,7 +1120,10 @@ def _suffix(content_type: str) -> str:
 
 _ROUTES = {
     ("GET", "/v1/hello"): _Handler.h_hello,
+    ("GET", "/v1/glance"): _Handler.h_glance,
     ("POST", "/v1/chat"): _Handler.h_chat,
+    ("POST", "/v1/attach"): _Handler.h_attach,
+    ("GET", "/v1/file"): _Handler.h_file,
     ("POST", "/v1/voice"): _Handler.h_voice,
     ("POST", "/v1/speak"): _Handler.h_speak,
     ("POST", "/v1/act"): _Handler.h_act,
@@ -919,7 +1236,8 @@ class VServer:
             # Its own engine, on its own thread — same rule as everywhere else.
             engine = Engine(self.s, surface=persona_mod.PHONE)
             try:
-                Scheduler(engine, self.s, sink=build_sink(self.bus)).run(interval=30)
+                Scheduler(engine, self.s,
+                          sink=build_sink(self.bus, self.s)).run(interval=30)
             except Exception as exc:    # noqa: BLE001
                 print(f"  scheduler stopped: {_scrub(exc)}")
             finally:

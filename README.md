@@ -43,10 +43,10 @@ v serve                  # the phone transport — see The phone
 ```
 
 ```bash
-python3 -m v.tests.test_core       # 89 · test_shell 33 · test_mcp 18
+python3 -m v.tests.test_core       # 90 · test_shell 33 · test_mcp 20
 python3 -m v.tests.test_tasks      # 51 · test_memory 31
-python3 -m v.tests.test_briefing   # 15 · test_telegram 31 · test_tts 10
-python3 -m v.tests.test_httpapi    # 24 · test_ui_animation           (302 total)
+python3 -m v.tests.test_briefing   # 15 · test_telegram 31 · test_tts 12
+python3 -m v.tests.test_httpapi    # 39 · test_ui_animation 25        (347 total)
 ```
 
 ### Where things live
@@ -99,7 +99,8 @@ notes, and that is all.
 | `shells.py` | the model seam: tiering, cost, the Claude Code driver | tiered |
 | `telegram.py` | **the bot** — owner-only, archive groups, buttons, proactive push, voice | $0 |
 | `pki.py` | the private CA — one certificate per device, never transmitted | $0 |
-| `httpapi.py` | **the phone** — mutual TLS, chat, voice both ways, proactive SSE | $0 |
+| `httpapi.py` | **the phone** — mutual TLS, chat, voice both ways, proactive SSE, the home-screen snapshot | $0 |
+| `files.py` | attachments in and out — where they land, and the outbox between processes | $0 |
 | `ui.py` | the design tokens: colour, glyphs, markdown, cost lines, the aperture | $0 |
 | `tui.py` | **the window** — frame, panes, palette, key handling, ambient state | $0 |
 | `engine.py` | the single entry point | — |
@@ -880,7 +881,10 @@ deliberately a deliberate act.
 | Endpoint | Does |
 |---|---|
 | `GET /v1/hello` | note count, whether speech is loaded, the event cursor |
-| `POST /v1/chat` | text in, a turn out |
+| `GET /v1/glance` | the home-screen snapshot: next event, priorities, counts |
+| `POST /v1/chat` | text in, a turn out — plus `file_rel` for an attachment |
+| `POST /v1/attach` | bytes in, a vault path out |
+| `GET /v1/file` | a file out of the vault, by path |
 | `POST /v1/voice` | WAV in, the transcript **and** the turn out |
 | `POST /v1/speak` | text in, OGG/Opus out (Piper) |
 | `POST /v1/act` | a button press — the same `engine.act` the REPL calls |
@@ -942,6 +946,95 @@ touch surface.
 
 **The assets directory is gitignored.** `cli phone enrol` writes the device's
 private key into it, and this repo gets pushed.
+
+### Files, both directions
+
+Attaching works in two calls, not one multipart request: `POST /v1/attach`
+takes the bytes and the name and gives back a vault path, then `POST /v1/chat`
+carries that path with the caption. The split is because of the caption — it is
+UTF-8 prose that *routes the turn*, and the only places a raw-body upload could
+carry it are a query string or an HTTP header, both of which would mangle every
+Persian caption Parsa writes. So the bytes go up the way a voice note does,
+with nothing to parse, and the sentence goes up as ordinary JSON.
+
+The upload is a vault write like any other — `save_binary` into
+`attachments/phone/`, a `[bot]` commit, revertible with `v undo` — for the same
+reason the rest of them are: a file that is in the vault is backed up, indexed
+and undoable, and a file in a temp directory is one more thing to lose. It caps
+at 25 MB, stricter than Telegram's own 50, because every attachment is a commit
+in a repository that gets cloned and a vault that gains a 400 MB screen
+recording is one nobody can clone again. A photo with no caption is a whole
+message, and `router` already reads `has_file` as enough to route on.
+
+Coming back, a turn carries `files` — name, size and type, never the bytes.
+Most files V mentions are never opened, and four megabytes riding along with
+every answer would make the fast local ones feel like the slow ones; the phone
+fetches from `GET /v1/file` when the chip is tapped. That endpoint enforces the
+vault boundary and deliberately *not* the private-folder rule: `mcp/guard.py`
+blocks those because the thing on the other side is a model, and the thing on
+the other side of this socket is Parsa's phone behind a certificate this
+machine issued — one that `/v1/chat` already answers out of those same folders
+to. A rule that serves the sentence and withholds the file only stops the
+honest half. Losing the phone is answered where it is answerable: `pki.revoke`.
+
+`vault_send_file` no longer means "send to Telegram". It queues into the
+`outbox` table — a channel that had been built and never used — because the
+process that *makes* a file is not the process holding a socket to the phone:
+it runs inside whatever MCP subprocess an agent turn spawned, while the event
+stream lives in `v-serve`. A row in SQLite is the whole mechanism, and being
+durable is the point, since a chart rendered while the phone was in a tunnel is
+still waiting when it comes back rather than having been broadcast to nobody.
+Telegram still goes inline alongside it, best-effort, because an HTTP call to
+Telegram's API needs no socket of ours.
+
+Two drainers read that queue: a chat turn takes anything waiting so a chart
+asked for from the phone arrives *with* the answer, and a one-minute scheduler
+sweep catches whatever no turn came to collect. `Reminders.claim` makes that
+safe — `WHERE sent IS NULL` in the same statement as the update, so the loser
+of the race gets nothing rather than sending the file twice. Arriving with no
+app open, a file becomes a notification with a **Save** action that downloads
+it into Downloads without opening anything.
+
+### Two cards on the home screen
+
+`TodayWidget` is the next thing on the calendar with the rest of the day under
+it; `PrioritiesWidget` is what to do next, with a box that ticks the checkbox
+in the Markdown note it came from. Glance, which is Compose compiled down to
+`RemoteViews` — so they share `Design.kt`'s palette by construction rather than
+by a second copy of the hexes, and lose the three things a launcher will not
+render: IBM Plex (system mono instead), any animation (hence no aperture — the
+mark *is* the state machine, and a still one would be the muted state), and any
+way to show an error.
+
+That last constraint is the design. A widget cannot say "request failed"
+without becoming a bug report on someone's wallpaper, and for most of the day
+the laptop is asleep or the phone is off the tailnet — so `Snapshot` keeps the
+last answer on disk, every card draws from it instantly, and the header carries
+the time it was true, in amber once it is over half an hour old. Same honesty
+the cost line is built on, different surface.
+
+Both cards read one `GET /v1/glance`, which is why that endpoint exists rather
+than the widgets making four calls between them: the expensive part of reaching
+V from a home screen is not the query — it is free and runs in milliseconds —
+but waking a radio and completing a handshake. Three refreshes arriving at once
+collapse into one request.
+
+Refreshes come from three places, and only the first is Android's:
+`updatePeriodMillis` at its 30-minute floor, which is the one that still works
+when the service has been killed; the header tap; and `VService`, which
+redraws both cards the moment anything comes down the event stream. That third
+one is what a cloud-backed widget cannot do — the socket is already open to the
+machine that owns the data, so a reminder firing or the 10:00 brief landing
+reaches the home screen with no polling interval and no push service in the
+path.
+
+The tick is optimistic on purpose. The box strikes through and the card redraws
+*before* the request goes out, because a home screen that waits for a sleeping
+laptop before acknowledging a thumb feels broken even while it is working. The
+write itself is unchanged — `engine.act("complete_task")`, the same call the
+chat buttons make, `[bot]`-committed and undoable with `v undo`. If it fails,
+the next fetch puts the task back, which is the correct outcome: the note is
+the truth and the card is a picture of it.
 
 ## Brag entries, drafted as work closes
 

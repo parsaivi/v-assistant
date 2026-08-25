@@ -97,16 +97,64 @@ class StubBridge:
         def __init__(self, key="v"):
             self.key = key
 
-    def __init__(self, response=None):
+    class _Outbox:
+        """The two outbox methods `files.take_queued_files` uses.
+
+        Empty by default, because the common turn has no file waiting — and a
+        stub that always had one would hide the case that matters, which is
+        that a plain chat must not pay for this.
+        """
+
+        def __init__(self, rows=None):
+            self.rows = list(rows or [])
+            self.claimed = []
+
+        def unsent(self):
+            return list(self.rows)
+
+        def claim(self, oid):
+            if oid in self.claimed:
+                return False        # the interlock, so a test can prove it
+            self.claimed.append(oid)
+            return True
+
+    class _Vault:
+        def __init__(self, present=True):
+            self.present = present
+
+        def exists(self, rel):
+            return self.present
+
+        def path(self, rel):
+            from pathlib import Path as _P
+            return _P("/nowhere") / rel
+
+    def __init__(self, response=None, outbox=None, settings=None):
         self.response = response or FakeResponse()
         self.calls = []
         self.conn = StubConn()
+        # `h_chat` hands over any file V queued since the last turn, so every
+        # handler that returns a turn now touches these two.
+        self.reminders = StubBridge._Outbox(outbox)
+        self.vault = StubBridge._Vault()
+        self.s = settings or __import__("v.core.config", fromlist=["settings"]).settings
         # `h_wake` reports who answered, so the stub needs an agent to be. A
         # handler that reached for `engine.persona` and found nothing here
         # would raise inside the closure and fail every wake at runtime while
         # every test still passed.
         self.persona = StubBridge._Persona()
         self.switched = []
+
+    def handle(self, text, **kw):
+        self.handled = getattr(self, "handled", [])
+        self.handled.append((text, kw))
+        return self.response
+
+    def end_session(self, reason="quit"):
+        pass
+
+    def start_session(self):
+        pass
 
     def switch_agent(self, key):
         self.switched.append(key)
@@ -683,6 +731,69 @@ def an_audio_content_type_picks_the_extension_ffmpeg_needs():
     eq(httpapi._suffix(""), ".ogg", "an unknown type falls back, never crashes")
 
 
+# ---- keep-alive -----------------------------------------------------------
+@test
+def a_body_no_handler_reads_does_not_corrupt_the_next_request():
+    """`/v1/wake` takes its arguments in the query string and never reads a
+    body, but the phone posts `{}` because OkHttp requires one on POST. Left
+    unread, those two bytes sit in the socket and are parsed as the front of
+    the *following* request line — the phone gets `Unsupported method
+    ('{}POST')` for a request that was perfectly well formed, and only when
+    connections happen to be reused, which is why it survived until the gate
+    started calling wake often."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        server, thread, port = stand_up(s)
+        try:
+            ctx = client_context(s, with_cert=True)
+            # One connection, reused — that is the whole point.
+            conn = http.client.HTTPSConnection("127.0.0.1", port, context=ctx,
+                                               timeout=20)
+            conn.request("POST", "/v1/wake?source=gate", body=b"{}")
+            first = conn.getresponse()
+            eq(first.status, 200)
+            first.read()
+
+            conn.request("POST", "/v1/chat", body=json.dumps({"text": "hi"}).encode())
+            res = conn.getresponse()
+            eq(res.status, 200,
+               "the second request on a reused connection must parse")
+            ok("Unsupported method" not in res.read().decode(),
+               "the previous body leaked into this request line")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_partially_read_body_is_also_drained():
+    """The same hazard, one step subtler: a handler that reads *some* of the
+    body. `_drain` tracks what was consumed rather than assuming all or
+    nothing."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        server, thread, port = stand_up(s)
+        try:
+            ctx = client_context(s, with_cert=True)
+            conn = http.client.HTTPSConnection("127.0.0.1", port, context=ctx,
+                                               timeout=20)
+            # /v1/session/new reads nothing and is posted a body too.
+            conn.request("POST", "/v1/session/new", body=b"{}")
+            first = conn.getresponse()
+            eq(first.status, 200)
+            first.read()          # http.client wants the response drained too
+            conn.request("GET", "/v1/hello")
+            eq(conn.getresponse().status, 200,
+               "a GET after an undrained POST must still parse")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
 # ---- the wake word --------------------------------------------------------
 @test
 def a_wake_runs_no_model_and_says_one_short_thing():
@@ -767,6 +878,357 @@ def an_unknown_wake_agent_still_answers():
         shutil.rmtree(root)
 
 
+
+# ---- the home-screen snapshot ---------------------------------------------
+class _Ev:
+    """Shaped like `calendar.Event` — the four things `_event` reads."""
+
+    def __init__(self, summary, start=None, location="", day=None):
+        import datetime as _dt
+        self.summary, self.location = summary, location
+        self.date = day or _dt.date(2026, 8, 25)
+        self.start = start
+        self.all_day = start is None
+
+    @property
+    def time_label(self):
+        return "all-day" if self.all_day else self.start.strftime("%H:%M")
+
+    def starts_at(self):
+        import datetime as _dt
+        return None if self.all_day else _dt.datetime.combine(self.date, self.start)
+
+
+class _Task:
+    def __init__(self, tid, text, due=None, state="open", carried=1):
+        self.id, self.text, self.due, self.state = tid, text, due, state
+        self.section, self.area, self.rel, self.carried = "Tasks", "Work", "n.md", carried
+
+    def age_days(self, today=None):
+        import datetime as _dt
+        return (( today or _dt.date.today()) - self.due).days if self.due else None
+
+    def is_overdue(self, today=None):
+        return (self.age_days(today) or 0) > 0
+
+
+class _Rem:
+    def __init__(self, rid, text, due):
+        self.id, self.text, self.due = rid, text, due
+
+
+class StubGlanceEngine:
+    """The engine surface `glance()` touches, and nothing else — so the day a
+    handler reaches past it, this test is what says so."""
+
+    def __init__(self, events=(), nxt=None, tasks=(), reminders=(), shape=None):
+        import types
+        cal = types.SimpleNamespace(on=lambda d: list(events),
+                                    next_up=lambda now: nxt)
+        tk = types.SimpleNamespace(
+            priorities=lambda today=None, limit=6: list(tasks),
+            backlog_shape=lambda today=None: shape or {
+                "open": 31, "overdue": 4, "due_today": 2, "closed_last_7": 7})
+        self.q = types.SimpleNamespace(calendar=cal, tasks=tk)
+        self.reminders = types.SimpleNamespace(pending=lambda: list(reminders))
+
+
+@test
+def a_glance_is_one_call_and_costs_nothing():
+    """The claim the widget rests on: one request, everything on the card, and
+    no path through it that could reach a model."""
+    import datetime as dtm
+    now = dtm.datetime(2026, 8, 25, 13, 18)
+    day = now.date()
+    snap = httpapi.glance(StubGlanceEngine(
+        events=[_Ev("standup", dtm.time(9, 30)),
+                _Ev("روزانه قیمت گذاری", dtm.time(14, 0), "Divar")],
+        nxt=_Ev("روزانه قیمت گذاری", dtm.time(14, 0), "Divar"),
+        tasks=[_Task(11, "write the brief", dtm.date(2026, 8, 20)),
+               _Task(12, "book the flight")],
+        reminders=[_Rem(3, "call mom", dtm.datetime(2026, 8, 25, 17, 30))]), now)
+
+    eq(snap["day"], day.isoformat())
+    eq(snap["next"]["what"], "روزانه قیمت گذاری")
+    eq(snap["next"]["at"], "2026-08-25T14:00", "an instant, never 'in 42m'")
+    eq(snap["counts"]["events"], 2)
+    eq(snap["counts"]["left"], 1, "09:30 is over; only 14:00 is still ahead")
+    eq(snap["tasks"][0]["id"], 11)
+    ok(snap["tasks"][0]["overdue"], "five days past its date")
+    eq(snap["tasks"][1]["due"], "", "an undated task has no due string")
+    eq(snap["reminders"][0]["at"], "2026-08-25T17:30")
+    eq(snap["headline"], "1 event · 2 due · 4 overdue · 1 reminder")
+
+
+@test
+def a_glance_with_nothing_on_it_still_draws():
+    """The empty case is the common one on a Friday, and a widget cannot show
+    an error — so every field a renderer reads has to be present and empty
+    rather than absent."""
+    import datetime as dtm
+    snap = httpapi.glance(StubGlanceEngine(shape={
+        "open": 0, "overdue": 0, "due_today": 0, "closed_last_7": 0}),
+        dtm.datetime(2026, 8, 25, 9, 0))
+    eq(snap["next"], None)
+    eq(snap["events"], [])
+    eq(snap["tasks"], [])
+    eq(snap["headline"], "nothing pressing")
+
+
+@test
+def a_relative_time_is_never_baked_into_the_snapshot():
+    """A widget redraws every half hour at best. Any "in 42m" this endpoint
+    wrote would go on being wrong for twenty-nine of those minutes, so the
+    phone is given instants and does the arithmetic at draw time."""
+    import datetime as dtm
+    import re
+    snap = httpapi.glance(StubGlanceEngine(
+        events=[_Ev("standup", dtm.time(14, 0))],
+        nxt=_Ev("standup", dtm.time(14, 0)),
+        tasks=[_Task(11, "write the brief", dtm.date(2026, 8, 20))],
+        reminders=[_Rem(3, "call mom", dtm.datetime(2026, 8, 25, 17, 30))]),
+        dtm.datetime(2026, 8, 25, 13, 18))
+
+    # Values only — `reminders` is a key, and a key is not a rendered label.
+    relative = re.compile(r"\bin \d+\s*(m|h|min|hour)|\bago\b|\bnow\b", re.I)
+    def walk(node):
+        if isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+        elif isinstance(node, str):
+            ok(not relative.search(node),
+               f"{node!r} is a label that goes stale on a home screen")
+    walk(snap)
+    eq(snap["next"]["at"], "2026-08-25T14:00")
+    eq(snap["tasks"][0]["days"], 5, "the gap is a number the phone can label")
+
+
+@test
+def the_glance_route_is_served_to_an_enrolled_phone():
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        import datetime as dtm
+
+        class Bridge(StubBridge):
+            def call(self, fn, timeout=0):
+                return fn(StubGlanceEngine(
+                    tasks=[_Task(11, "write the brief")]))
+
+        server, thread, port = stand_up(s, Bridge())
+        try:
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=client_context(s, with_cert=True),
+                timeout=20)
+            conn.request("GET", "/v1/glance")
+            res = conn.getresponse()
+            eq(res.status, 200)
+            body = json.loads(res.read())
+            eq(body["device"], "pixel")
+            eq(body["tasks"][0]["text"], "write the brief")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+# ---- files, both directions -----------------------------------------------
+class StubFileEngine:
+    """A real vault behind the two calls `files.save_attachment` makes."""
+
+    def __init__(self, s):
+        from v.core.vaultfs import Vault
+        self.s = s
+        self.vault = Vault(s)
+        self.reminders = StubBridge._Outbox()
+
+
+@test
+def an_upload_lands_in_the_vault_as_an_undoable_commit():
+    """An attachment is a vault write like any other. Saving it to a temp
+    directory the next turn might pick up would mean a file that is not backed
+    up, not indexed and not undoable — one more thing to lose."""
+    root, s = make_vault()
+    s.git_enabled = True
+    try:
+        pki.enrol("pixel", s)
+        engine = StubFileEngine(s)
+
+        class Bridge(StubBridge):
+            def call(self, fn, timeout=0):
+                return fn(engine)
+
+        server, thread, port = stand_up(s, Bridge())
+        try:
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=client_context(s, with_cert=True),
+                timeout=20)
+            conn.request("POST", "/v1/attach?name=" +
+                         "%D8%B9%DA%A9%D8%B3.png",     # عکس.png
+                         body=b"\x89PNG\r\n fake",
+                         headers={"Content-Type": "image/png"})
+            res = conn.getresponse()
+            eq(res.status, 200)
+            meta = json.loads(res.read())
+
+            ok(meta["rel"].startswith("attachments/phone/"), meta["rel"])
+            ok(meta["rel"].endswith("عکس.png"),
+               f"a Persian filename must survive: {meta['rel']}")
+            eq(meta["mime"], "image/png")
+            eq(meta["bytes"], 11)
+            ok((root / meta["rel"]).exists(), "the bytes should be on disk")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def an_attachment_with_no_caption_is_still_a_message():
+    """A photo with no words is how most attachments are actually sent, and
+    `router` already reads `has_file` as enough to route on. This endpoint used
+    to reject it at the door with "text is required"."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        bridge = StubBridge()
+        server, thread, port = stand_up(s, bridge)
+        try:
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=client_context(s, with_cert=True),
+                timeout=20)
+            body = json.dumps({"text": "",
+                               "file_rel": "attachments/phone/x.png"})
+            conn.request("POST", "/v1/chat", body=body.encode(),
+                         headers={"Content-Type": "application/json"})
+            eq(conn.getresponse().status, 200)
+
+            text, kw = bridge.handled[-1]
+            eq(text, "")
+            ok(kw["has_file"], "the file is what makes this routable")
+            eq(kw["extra"]["file_rel"], "attachments/phone/x.png")
+            eq(kw["message_type"], "document")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_turn_with_no_file_still_says_so():
+    """`files` is present and empty rather than absent — the phone renders it
+    unconditionally, and a key that only sometimes exists is a crash."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        server, thread, port = stand_up(s)
+        try:
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=client_context(s, with_cert=True),
+                timeout=20)
+            conn.request("POST", "/v1/chat", body=b'{"text": "hi"}',
+                         headers={"Content-Type": "application/json"})
+            eq(json.loads(conn.getresponse().read())["files"], [])
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_download_cannot_climb_out_of_the_vault():
+    """The one check this endpoint really makes. Private folders are
+    deliberately *not* blocked — that guard exists to keep notes away from a
+    model, and this is Parsa's own phone behind a certificate this machine
+    issued — so the vault boundary is the whole boundary, and it has to hold."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        engine = StubFileEngine(s)
+
+        class Bridge(StubBridge):
+            def call(self, fn, timeout=0):
+                return fn(engine)
+
+        server, thread, port = stand_up(s, Bridge())
+        try:
+            ctx = client_context(s, with_cert=True)
+            for escape in ("../../etc/passwd", "..%2f..%2fetc%2fpasswd"):
+                conn = http.client.HTTPSConnection("127.0.0.1", port,
+                                                   context=ctx, timeout=20)
+                conn.request("GET", f"/v1/file?rel={escape}")
+                res = conn.getresponse()
+                body = res.read()
+                ok(res.status in (400, 404),
+                   f"{escape!r} returned {res.status}: {body[:120]!r}")
+
+            # And the honest case still works, Persian name and all.
+            rel = "attachments/phone/عکس.png"
+            (root / "attachments/phone").mkdir(parents=True)
+            (root / rel).write_bytes(b"PNGDATA")
+            conn = http.client.HTTPSConnection("127.0.0.1", port, context=ctx,
+                                               timeout=20)
+            conn.request("GET", "/v1/file?rel=" +
+                         "attachments/phone/%D8%B9%DA%A9%D8%B3.png")
+            res = conn.getresponse()
+            eq(res.status, 200)
+            eq(res.read(), b"PNGDATA")
+            eq(res.getheader("Content-Type"), "image/png")
+            ok("filename*=UTF-8''" in (res.getheader("Content-Disposition") or ""),
+               "a Persian filename needs RFC 5987, not latin-1")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_queued_file_rides_out_with_the_next_turn():
+    """`vault_send_file` runs in a different process from the socket. The row
+    it leaves is collected by whichever drainer gets there first — here, a chat
+    turn, so a chart asked for from the phone arrives *with* the answer rather
+    than a minute later on the event stream."""
+    from v.core import files
+    root, s = make_vault()
+    try:
+        rel = "attachments/phone/chart.png"
+        (root / "attachments/phone").mkdir(parents=True)
+        (root / rel).write_bytes(b"x" * 40)
+
+        engine = StubFileEngine(s)
+        engine.reminders.rows = [
+            {"id": 1, "kind": "file",
+             "body": json.dumps({"rel": rel, "caption": "spend by category"})},
+            {"id": 2, "kind": "reminder", "body": "not a file"},
+            {"id": 3, "kind": "file",
+             "body": json.dumps({"rel": "attachments/phone/deleted.png"})},
+        ]
+        out = files.take_queued_files(engine)
+
+        eq(len(out), 1, "the reminder is not a file and the deleted one is gone")
+        eq(out[0]["name"], "chart.png")
+        eq(out[0]["caption"], "spend by category")
+        eq(out[0]["bytes"], 40)
+        eq(engine.reminders.claimed, [1, 3],
+           "a file that vanished between queue and delivery is still claimed, "
+           "or it is retried forever")
+
+        # The second drainer finds nothing: `claim` is the interlock.
+        eq(files.take_queued_files(engine), [])
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_file_name_from_outside_cannot_become_a_path():
+    from v.core import files
+    eq(files.safe_name("../../etc/passwd"), "etcpasswd")
+    eq(files.safe_name("عکس من.png"), "عکس من.png")
+    eq(files.safe_name("  ...  "), "")
+    eq(files.mime_for("a/b/c.PDF"), "application/pdf")
+    eq(files.mime_for("no-extension"), "application/octet-stream")
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items())

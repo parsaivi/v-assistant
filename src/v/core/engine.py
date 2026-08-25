@@ -1458,6 +1458,21 @@ class Engine:
             return Response(f"Appended to [[{rel[:-3]}]].",
                             buttons=[Button("↩ Undo", "undo",
                                             {"commit": change.commit})])
+        if action == "complete_task":
+            # Emitted by `_task_done`'s disambiguation buttons since they were
+            # written, and by the priorities widget on the home screen — and
+            # unhandled here until both had a way to be pressed, which is to
+            # say it answered "Unknown action: complete_task" to its own button.
+            task = self.q.tasks.get(int(payload["id"]))
+            if task is None:
+                return Response(
+                    "That task isn't in the index any more — the note it was "
+                    "in has probably changed. Say `tasks` for the live list.",
+                    route="structured:task-missing")
+            if not task.is_open:
+                return Response(f"“{task.text}” is already ticked.",
+                                route="structured:task-done")
+            return self._complete(task, now)
         if action == "route":
             forced = router.Route(payload["intent"], 1.0, "chosen")
             return self._capture(forced, payload.get("text", ""), now, {},

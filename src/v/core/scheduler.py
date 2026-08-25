@@ -95,6 +95,15 @@ class Scheduler:
             # has come due.
             Job("deferred-answers", None, self._deferred, interval_minutes=5,
                 catch_up=False),
+            # Files V made while nobody was asking. `vault_send_file` runs
+            # inside whatever process an agent turn spawned, which is not the
+            # process holding a socket to the phone, so it leaves a row in the
+            # outbox instead — and this is the sweep that gets a chart rendered
+            # at 3am onto the phone in the morning. A chat turn drains the same
+            # queue first when there is one, so this usually finds it empty;
+            # `Reminders.claim` is what makes two drainers safe.
+            Job("outbox", None, self._outbox, interval_minutes=1,
+                catch_up=False),
         ]
 
     # ---- the loop ----------------------------------------------------
@@ -207,6 +216,26 @@ class Scheduler:
 
     def _fire_reminders(self):
         return self.engine.due_reminders()
+
+    def _outbox(self):
+        """Hand over anything queued, as ordinary responses.
+
+        Returned as `Response`s rather than published directly because this
+        object does not know what a bus is — the sink does, and the same job
+        has to work when the sink is Telegram, a terminal, or nothing at all.
+        Which also means the Telegram surface gets these for free the day it
+        wants them, without a second queue.
+        """
+        from .engine import Response
+        from .files import take_queued_files
+        out = []
+        for meta in take_queued_files(self.engine):
+            caption = meta.get("caption") or ""
+            text = f"{caption}\n\n" if caption else ""
+            out.append(Response(f"{text}`{meta['rel']}`",
+                                data={"files": [meta["rel"]]},
+                                route="outbox:file"))
+        return out or None
 
     def _reindex(self):
         from . import index

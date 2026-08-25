@@ -160,6 +160,19 @@ def _err(msg: str) -> str:
     return f"ERROR: {msg}"
 
 
+def _reminders():
+    """The outbox, opened per call.
+
+    Not cached: `Reminders` holds a sqlite3 connection, this server answers on
+    a thread pool, and a connection may only be used from the thread that
+    opened it — the same rule `_Bridge` exists for on the phone transport. One
+    connection per `vault_send_file` costs a file open on a database this
+    process touches a handful of times a day.
+    """
+    from ..core.reminders import Reminders
+    return Reminders(S)
+
+
 def _send_to_telegram(path, *, caption: str = "") -> bool:
     """Best-effort push of a rendered file to Telegram, alongside the local
     browser tab `open_file()` already opened. Local import, same reason
@@ -943,16 +956,16 @@ _TELEGRAM_FILE_LIMIT = 50 * 1024 * 1024
 
 @mcp.tool(
     description=(
-        "Send a file that already exists in the vault to Parsa's Telegram "
-        "chat — a filled timesheet, a rendered .pdf or .docx, a screenshot "
-        "someone dropped in an attachments folder. Different from "
-        "vault_chart/vault_trend/vault_map, which build and send a chart "
-        "this process just rendered; this hands over something already "
-        "sitting on disk. Takes a vault-relative path, same as every other "
-        "tool here. Images are sent as an inline photo; everything else as "
-        "a downloadable document. Fails with an explanation — not silently "
-        "— if the path doesn't exist, is in a private folder, is over "
-        "Telegram's 50MB bot upload limit, or no bot is configured."
+        "Send a file that already exists in the vault to Parsa — a filled "
+        "timesheet, a rendered .pdf or .docx, a screenshot someone dropped in "
+        "an attachments folder. Different from vault_chart/vault_trend/"
+        "vault_map, which build and send a chart this process just rendered; "
+        "this hands over something already sitting on disk. Takes a "
+        "vault-relative path, same as every other tool here. Goes to whichever "
+        "surfaces are reachable: the phone always (it is queued, so it arrives "
+        "even if the phone is asleep), and Telegram too when a bot is "
+        "configured. Fails with an explanation — not silently — if the path "
+        "doesn't exist or is in a private folder."
     )
 )
 def vault_send_file(rel_path: str, caption: str = "") -> str:
@@ -967,17 +980,32 @@ def vault_send_file(rel_path: str, caption: str = "") -> str:
     if not path.exists() or not path.is_file():
         return _err(f"no such file: {rel_path}")
     size = path.stat().st_size
-    if size > _TELEGRAM_FILE_LIMIT:
-        return _err(f"{rel_path} is {size / 1_000_000:.1f} MB — over "
-                    f"Telegram's {_TELEGRAM_FILE_LIMIT // 1_000_000} MB bot "
-                    f"upload limit.")
-    if not S.telegram_bot_token:
-        return _err("no telegram_bot_token configured")
-    if not S.telegram_owner_id:
-        return _err("no Telegram owner claimed yet — message the bot once first")
-    if _send_to_telegram(path, caption=caption):
-        return f"Sent {rel_path} to Telegram."
-    return _err(f"failed to send {rel_path} to Telegram — see server logs")
+
+    # The phone first, and unconditionally. This is a *queue* — a row in the
+    # outbox that `v-serve` drains onto the event stream, or that the next chat
+    # turn picks up and hands over with its answer — so unlike the Telegram
+    # call below it cannot fail because something is asleep. It is also the
+    # only path that does not put the file through a third party, which is why
+    # it is not the fallback.
+    sent = []
+    try:
+        _reminders().queue("file", json.dumps({"rel": rel_path,
+                                               "caption": caption}))
+        sent.append("the phone")
+    except Exception as exc:            # noqa: BLE001
+        return _err(f"could not queue {rel_path}: {exc}")
+
+    # Telegram second, inline, best-effort. Inline because it needs no socket
+    # from this process to Parsa — it is an HTTP call to Telegram's own API,
+    # which any process can make — and best-effort because a file has already
+    # been delivered by the time we get here.
+    if S.telegram_bot_token and S.telegram_owner_id:
+        if size > _TELEGRAM_FILE_LIMIT:
+            sent.append(f"but not Telegram ({size / 1_000_000:.1f} MB is over "
+                        f"its {_TELEGRAM_FILE_LIMIT // 1_000_000} MB bot limit)")
+        elif _send_to_telegram(path, caption=caption):
+            sent.append("Telegram")
+    return f"Sent {rel_path} to {' and '.join(sent)}."
 
 
 # ----------------------------------------------------------------- writes --

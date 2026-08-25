@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The one directory this app publishes to other apps: downloads it has
+     fetched out of the vault, so "open" and "share" have something to hand
+     over. Deliberately not `<files-path path="." />` — the same filesDir holds
+     `glance.json` and, more to the point, is a sibling of the private key that
+     is the entire access control for the vault. A provider that exports the
+     whole directory is one misfiled path away from exporting that. -->
+<paths>
+    <files-path name="downloads" path="downloads/" />
+</paths>

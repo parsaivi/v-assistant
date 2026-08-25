@@ -183,6 +183,26 @@ class Reminders:
                           (dt.datetime.now().timestamp(), oid))
         self.conn.commit()
 
+    def claim(self, oid: int) -> bool:
+        """Mark sent, and say whether *this* caller is the one that did it.
+
+        `mark_sent` is fine when one drainer exists. Two do: a chat turn hands
+        over anything queued since the last one, so a chart asked for from the
+        phone arrives *with* the answer rather than a minute later on the event
+        stream — and the scheduler sweeps whatever no turn came to collect. Two
+        readers of the same table, on two threads with two connections, is a
+        race whose visible symptom would be the same file delivered twice.
+
+        `WHERE sent IS NULL` makes the read and the write one statement, so the
+        loser of the race gets `rowcount == 0` and skips it. Cheaper and more
+        obviously correct than a lock across two processes.
+        """
+        cur = self.conn.execute(
+            "UPDATE outbox SET sent=? WHERE id=? AND sent IS NULL",
+            (dt.datetime.now().timestamp(), oid))
+        self.conn.commit()
+        return cur.rowcount > 0
+
 
 def _row(r: sqlite3.Row) -> Reminder:
     return Reminder(

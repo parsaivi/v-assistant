@@ -12,7 +12,10 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
- * The eight endpoints of `assistant/core/httpapi.py`, and the turn they return.
+ * The eleven endpoints of `v/core/httpapi.py`, and the turn they return.
+ *
+ * Most of them are a conversation. `glance` is not — it feeds the home
+ * screen — and `attach`/`download` move bytes rather than turns.
  *
  * `Turn` carries every field the design's cost line needs, and carries them as
  * non-optional data. The brief calls the cost line "a product feature, not
@@ -36,6 +39,10 @@ data class Turn(
     val local: Boolean,
     val transcript: String? = null,
     val mine: Boolean = false,  // true for the user's own line in the log
+    /** Files this turn produced, plus anything V queued while nobody was
+     *  asking. Always present, never null — the log renders it
+     *  unconditionally, and a field that is sometimes absent is a crash. */
+    val files: List<VFile> = emptyList(),
 ) {
     /**
      * `◈ route · ⟡ n notes · 1.24s · $0.0000 · ◉ 0.94`
@@ -75,7 +82,11 @@ data class Turn(
                            b.optJSONObject("payload")?.toString() ?: "{}")
                 }
             } ?: emptyList()
+            val files = o.optJSONArray("files")?.let { a ->
+                (0 until a.length()).map { VFile.parse(a.getJSONObject(it)) }
+            } ?: emptyList()
             return Turn(
+                files = files,
                 text = o.optString("text"),
                 spoken = o.optString("spoken", o.optString("text")),
                 state = o.optString("state", "speaking"),
@@ -97,6 +108,37 @@ data class Turn(
 }
 
 data class Button(val label: String, val action: String, val payload: String)
+
+/**
+ * A file sitting in the vault that V has handed over.
+ *
+ * Metadata only. The bytes stay on the laptop until Parsa asks for them —
+ * a turn that answered "here is the chart" by pushing four megabytes down the
+ * socket would make every such answer feel like the slow ones, and most of
+ * them are never opened.
+ */
+data class VFile(val rel: String, val name: String, val bytes: Long,
+                 val mime: String, val caption: String = "") {
+
+    val isImage: Boolean get() = mime.startsWith("image/")
+
+    /** `1.2 MB` · `840 KB` · `12 B`. Shown on the chip, because tapping it
+     *  starts a download and the size is what decides whether to. */
+    fun size(): String = when {
+        bytes >= 1_000_000 -> String.format("%.1f MB", bytes / 1_000_000.0)
+        bytes >= 1_000 -> "${bytes / 1_000} KB"
+        else -> "$bytes B"
+    }
+
+    companion object {
+        fun parse(o: JSONObject) = VFile(
+            rel = o.optString("rel"),
+            name = o.optString("name"),
+            bytes = o.optLong("bytes"),
+            mime = o.optString("mime", "application/octet-stream"),
+            caption = o.optString("caption"))
+    }
+}
 
 data class Hello(val notes: Int, val tts: Boolean, val stt: Boolean,
                  val device: String, val seq: Long)
@@ -177,10 +219,55 @@ class Api(private val context: Context) {
               o.optString("device"), o.optLong("seq"))
     }
 
-    suspend fun chat(text: String): Turn = withContext(Dispatchers.IO) {
-        val payload = JSONObject().put("text", text)
-        Turn.parse(JSONObject(body(post("${base()}/v1/chat", payload))))
+    /**
+     * The home-screen snapshot — everything both widgets draw, in one call.
+     *
+     * Returned raw rather than parsed into a `Turn`, because it is not a turn:
+     * nothing was said, nothing was spent, and there is no cost line to render.
+     * `Snapshot` owns the shape from here.
+     */
+    suspend fun glance(): JSONObject = withContext(Dispatchers.IO) {
+        JSONObject(body(get("${base()}/v1/glance")))
     }
+
+    /** [fileRel] is a path `attach` just returned. Two calls rather than one
+     *  multipart request — see `httpapi.h_chat` for why the caption cannot
+     *  ride along with the bytes. */
+    suspend fun chat(text: String, fileRel: String = ""): Turn =
+        withContext(Dispatchers.IO) {
+            val payload = JSONObject().put("text", text)
+            if (fileRel.isNotBlank()) payload.put("file_rel", fileRel)
+            Turn.parse(JSONObject(body(post("${base()}/v1/chat", payload))))
+        }
+
+    /**
+     * Upload bytes; get back where they landed in the vault.
+     *
+     * The name goes in the query string because it is the one piece of
+     * metadata that survives percent-encoding intact — including the Persian
+     * filenames half of these have. The bytes are the whole body, exactly as
+     * `voice` posts a WAV, so neither end needs a multipart parser.
+     */
+    suspend fun attach(data: ByteArray, name: String, mime: String): VFile =
+        withContext(Dispatchers.IO) {
+            val q = java.net.URLEncoder.encode(name, "UTF-8")
+            val req = Request.Builder()
+                .url("${base()}/v1/attach?name=$q")
+                .post(data.toRequestBody(mime.toMediaType()))
+                .build()
+            VFile.parse(JSONObject(body(http.newCall(req).execute())))
+        }
+
+    /** The bytes of a file already in the vault. Streamed to [sink] rather
+     *  than returned, so a 40 MB video is not held in the heap twice. */
+    suspend fun download(rel: String, sink: java.io.OutputStream): Long =
+        withContext(Dispatchers.IO) {
+            val q = java.net.URLEncoder.encode(rel, "UTF-8")
+            get("${base()}/v1/file?rel=$q").use { r ->
+                check(r)
+                r.body?.byteStream()?.copyTo(sink) ?: 0L
+            }
+        }
 
     /** WAV in, an answer plus the transcript out. See `Recorder` for why WAV. */
     suspend fun voice(wav: ByteArray): Turn = withContext(Dispatchers.IO) {

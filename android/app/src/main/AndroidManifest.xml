@@ -61,6 +61,58 @@
             android:exported="false"
             android:foregroundServiceType="microphone|dataSync" />
 
+        <!-- How a file V sent gets out of this app and into a viewer, a
+             share sheet, or Downloads. Not exported: `grantUriPermissions`
+             hands out one URI at a time, to one app, for as long as the
+             intent lives — which is the difference between "open this chart"
+             and "any app may read what V has sent me". -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- The home screen.
+
+             Two cards, two receivers, one snapshot behind both. `exported` is
+             true because the launcher is a different process and has to be
+             able to deliver APPWIDGET_UPDATE — it is not a surface anything
+             can send arbitrary intents to: the only actions declared are
+             Android's own, and everything the cards can do (fetch, tick a box)
+             goes through the same mutual-TLS client as the rest of the app.
+
+             Neither is a way into the vault that the phone did not already
+             have. A widget on a locked home screen shows what a notification
+             from `VService` already shows, and the tick it can perform is the
+             `complete_task` button V has been offering in chat all along. -->
+        <receiver
+            android:name=".TodayWidgetReceiver"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_today" />
+        </receiver>
+
+        <receiver
+            android:name=".PrioritiesWidgetReceiver"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_priorities" />
+        </receiver>
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

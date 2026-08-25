@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The card the widgets sit on.
+
+     A drawable rather than `GlanceModifier.cornerRadius`, which only rounds
+     from API 31 while this app runs from 26 — and a square black slab on a
+     wallpaper reads as a rendering failure rather than as a design.
+
+     `panel` and `line`, straight from the brief's palette. Not translucent:
+     the type scale here is the brief's smallest, and dim2 metadata over
+     someone's photograph is unreadable in a way no amount of blur fixes. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+       android:shape="rectangle">
+    <solid android:color="#0E0E12" />
+    <corners android:radius="16dp" />
+    <stroke android:width="1dp" android:color="#1E1E28" />
+</shape>

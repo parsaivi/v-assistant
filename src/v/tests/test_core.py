@@ -1249,6 +1249,41 @@ def engine_never_spends_money():
 
 
 @test
+def a_widget_can_tick_a_box_it_only_knows_by_id():
+    """`complete_task` was emitted as a button by the disambiguation path and
+    handled by nothing, so pressing V's own button answered "Unknown action".
+    The priorities widget presses it too, and a home screen has no way to say
+    what the task was — only its id — so the id has to be enough."""
+    root, s = make_vault()
+    s.embedding_backend = "tfidf"
+    rel = "01 - Daily Notes/2026/07 - July/2026-07-02.md"
+    (root / rel).write_text("## Tasks\n\n- [ ] buy milk\n- [ ] ship pricing\n",
+                            encoding="utf-8")
+    index.rebuild(s, full=True)
+    try:
+        e = Engine(s)
+        task = next(t for t in e.q.tasks.open() if t.text == "buy milk")
+
+        resp = e.act("complete_task", {"id": task.id})
+        eq(resp.cost, 0.0, "ticking a box must not reach a model")
+        ok("buy milk" in resp.text, resp.text)
+        ok("- [x] buy milk" in (root / rel).read_text(encoding="utf-8"))
+        ok(any(b.action == "undo" for b in resp.buttons),
+           "a write from the home screen still offers the way back")
+
+        # Pressed twice — a widget is a picture, and the stale copy of it that
+        # is still on screen after the first tap is pressable.
+        again = e.act("complete_task", {"id": task.id})
+        ok("already ticked" in again.text, again.text)
+
+        gone = e.act("complete_task", {"id": 1})
+        ok("isn't in the index" in gone.text, gone.text)
+        e.close()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
 def null_llm_refuses_loudly():
     provider = llm.NullLLM()
     ok(not provider.available)

@@ -17,6 +17,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // arm64 only. The onnxruntime AAR ships four ABIs at ~7MB each and
         // every phone this will be installed on is arm64; carrying x86 and
@@ -69,6 +70,14 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
 
+    // The home screen. Glance is Compose that compiles down to RemoteViews,
+    // which is the only thing a launcher will render — so a widget cannot use
+    // the app's own composables, its fonts, or any of its animation. What it
+    // does buy is that the two cards are written in the same language as the
+    // three screens instead of in XML layouts, and share `Design.kt`'s palette
+    // by construction rather than by a second copy of the hexes.
+    implementation("androidx.glance:glance-appwidget:1.1.1")
+
     // The wake gate. Three small models run on every frame of audio that
     // reaches the phone, and they have to run *on* the phone: the whole point
     // of the gate is that nothing crosses the wire until it has passed. There
@@ -84,4 +93,10 @@ dependencies {
     // reference on the JVM, so the riskiest code in the gate does not need a
     // phone to be verified.
     testImplementation("junit:junit:4.13.2")
+
+    // The gate's models have to be proved on the phone's own CPU, not just on
+    // a laptop's. `GatePipelineTest` re-runs the speaker-separation measurement
+    // from the design note against the real ONNX Runtime on ARM.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

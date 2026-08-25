@@ -1,5 +1,7 @@
 package cloud.brain.v
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -60,6 +62,17 @@ fun ChatScreen(model: VModel, onCalibrate: () -> Unit = {}) {
 
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val pending by model.pending.collectAsState()
+    val busyFile by model.busyFile.collectAsState()
+
+    // The system picker. `OpenDocument` and not `GetContent`: it returns a
+    // URI this app may read even after the process restarts, and it can be
+    // pointed at Drive, Photos or anything else that publishes a provider —
+    // which is the difference between "attach a file" and "attach a photo".
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { model.attach(it) }
+    }
 
     LaunchedEffect(turns.size) {
         if (turns.isNotEmpty()) listState.animateScrollToItem(turns.size - 1)
@@ -87,7 +100,8 @@ fun ChatScreen(model: VModel, onCalibrate: () -> Unit = {}) {
             contentPadding = PaddingValues(horizontal = V.gutter, vertical = 12.dp),
         ) {
             items(turns) { turn ->
-                if (turn.mine) UserLine(turn.text) else AnswerBlock(turn, model)
+                if (turn.mine) UserLine(turn.text)
+                else AnswerBlock(turn, model, busyFile)
             }
         }
 
@@ -101,6 +115,10 @@ fun ChatScreen(model: VModel, onCalibrate: () -> Unit = {}) {
             onHoldStart = { model.startListening() },
             onHoldEnd = { model.stopListening() },
             listening = ambient == Ambient.LISTENING,
+            pending = pending,
+            attaching = busyFile == "attaching…",
+            onAttach = { picker.launch(arrayOf("*/*")) },
+            onDropPending = { model.dropPending() },
         )
     }
 }
@@ -147,13 +165,29 @@ private fun Header(ambient: Ambient, status: String, notes: Int,
         // foreign object; this line already exists to say what the gate is
         // doing, so it is the honest place to hang "and here is where you
         // change it".
-        Text(
-            text = if (notes > 0) status else status.ifEmpty { "—" },
-            style = TextStyle(fontFamily = V.mono, fontSize = V.meta, color = V.dim2),
+        //
+        // A *single* tap, not a long press. The long press was undiscoverable —
+        // there is no affordance on a mono metadata line suggesting it can be
+        // held — which left the calibration screen unreachable in practice once
+        // it had been dismissed once. Nothing else on this line consumes a tap.
+        // Both lines carry the gesture, including — especially — the one that
+        // says "tap to calibrate". Wiring the instruction's neighbour and not
+        // the instruction itself is a target nobody will hit.
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.pointerInput(Unit) {
-                detectTapGestures(onLongPress = { onCalibrate() })
+                detectTapGestures(onTap = { onCalibrate() })
             },
-        )
+        ) {
+            Text(
+                text = if (notes > 0) status else status.ifEmpty { "—" },
+                style = TextStyle(fontFamily = V.mono, fontSize = V.meta,
+                                  color = V.dim2),
+            )
+            Text("tap to calibrate · microphone on/off",
+                 style = TextStyle(fontFamily = V.mono, fontSize = 9.sp,
+                                   color = V.dim3))
+        }
     }
 }
 
@@ -214,7 +248,7 @@ private fun UserLine(text: String) {
 }
 
 @Composable
-private fun AnswerBlock(turn: Turn, model: VModel) {
+private fun AnswerBlock(turn: Turn, model: VModel, busyFile: String? = null) {
     // Settle: the answer arrives by moving up 10dp and fading in over 320ms.
     // Never a typewriter — the brief forbids it, and a typewriter also makes a
     // fast local answer feel slower than the model it did not need.
@@ -251,6 +285,19 @@ private fun AnswerBlock(turn: Turn, model: VModel) {
                               letterSpacing = 0.04.sp,
                               color = if (turn.local) V.free.copy(alpha = .75f)
                                       else V.dim2))
+
+        // Files V handed over. Above the citations, below the cost line: they
+        // are part of the answer rather than a source for it, and the one
+        // thing on a turn that costs something to act on.
+        if (turn.files.isNotEmpty()) {
+            Column(Modifier.padding(start = V.hang, top = 8.dp)) {
+                turn.files.forEach { f ->
+                    FileChip(f, busy = busyFile == f.rel,
+                             onOpen = { model.openFile(f) },
+                             onSave = { model.fetch(f) })
+                }
+            }
+        }
 
         if (turn.citations.isNotEmpty()) {
             Column(Modifier.padding(start = V.hang, top = 4.dp)) {
@@ -400,15 +447,65 @@ private fun Fault(message: String, onRetry: () -> Unit) {
 @Composable
 private fun Composer(value: String, onValue: (String) -> Unit, onSend: () -> Unit,
                      onHoldStart: () -> Unit, onHoldEnd: () -> Unit,
-                     listening: Boolean) {
+                     listening: Boolean, pending: VFile? = null,
+                     attaching: Boolean = false, onAttach: () -> Unit = {},
+                     onDropPending: () -> Unit = {}) {
+  Column(
+      Modifier
+          .fillMaxWidth()
+          .background(V.surface)
+          .navigationBarsPadding()) {
+
+    // What is already uploaded and waiting for a caption. A receipt, not an
+    // intention: by the time this row exists the bytes are in the vault, which
+    // is why it names a size and can be dismissed but not "retried".
+    if (pending != null || attaching) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(start = V.gutter, end = V.gutter, top = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(V.NOTE, style = TextStyle(fontFamily = V.mono,
+                                           fontSize = V.small, color = V.seed))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (pending == null) "attaching…"
+                else "${pending.name} · ${pending.size()}",
+                maxLines = 1,
+                modifier = Modifier.weight(1f),
+                style = TextStyle(fontFamily = V.mono, fontSize = V.small,
+                                  color = if (pending == null) V.dim2 else V.bodyHi))
+            if (pending != null) {
+                Text("✕",
+                     modifier = Modifier
+                         .pointerInput(Unit) {
+                             detectTapGestures { onDropPending() }
+                         }
+                         .padding(start = 10.dp, top = 4.dp, bottom = 4.dp),
+                     style = TextStyle(fontFamily = V.mono, fontSize = V.small,
+                                       color = V.dim2))
+            }
+        }
+    }
+
     Row(
         Modifier
             .fillMaxWidth()
-            .background(V.surface)
-            .padding(horizontal = V.gutter, vertical = 10.dp)
-            .navigationBarsPadding(),
+            .padding(horizontal = V.gutter, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // The attach affordance, in the prompt's own position. A `+` rather
+        // than a paperclip icon: the brief's icon set is six Unicode glyphs
+        // and none of them is a paperclip, so inventing a seventh — or
+        // shipping the first drawable in an app that has none — costs more
+        // than a character that means the same thing.
+        Text("+",
+             modifier = Modifier
+                 .pointerInput(Unit) { detectTapGestures { onAttach() } }
+                 .padding(end = 10.dp, top = 4.dp, bottom = 4.dp),
+             style = TextStyle(fontFamily = V.mono, fontSize = V.bodyText,
+                               color = if (pending != null) V.seed else V.muted))
         Text("›", style = TextStyle(fontFamily = V.mono, fontSize = V.bodyText,
                                     color = V.seed))
         Spacer(Modifier.width(10.dp))
@@ -456,5 +553,55 @@ private fun Composer(value: String, onValue: (String) -> Unit, onSend: () -> Uni
                  style = TextStyle(fontFamily = V.mono, fontSize = 15.sp,
                                    color = if (listening) V.seed else V.muted))
         }
+    }
+  }
+}
+
+/**
+ * A file V is offering, and the two things worth doing with it.
+ *
+ * Two targets rather than one, because they are genuinely different intents
+ * and the wrong guess is annoying in both directions: "open" is for the chart
+ * you want to look at once, "save" is for the PDF you need to keep. Neither
+ * downloads anything until it is pressed — the turn carried the name and the
+ * size, which is enough to decide with.
+ */
+@Composable
+private fun FileChip(file: VFile, busy: Boolean, onOpen: () -> Unit,
+                     onSave: () -> Unit) {
+    Row(
+        Modifier
+            .padding(bottom = 6.dp)
+            .border(1.dp, if (busy) V.seed.copy(alpha = .5f) else V.line3,
+                    RoundedCornerShape(7.dp))
+            .background(Color(0xFF14141B), RoundedCornerShape(7.dp)),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            Modifier
+                .pointerInput(file) { detectTapGestures { onOpen() } }
+                .padding(start = 11.dp, end = 9.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(if (file.isImage) "◫" else V.NOTE,
+                 style = TextStyle(fontFamily = V.mono, fontSize = V.small,
+                                   color = if (busy) V.seed else V.muted))
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text(file.name, maxLines = 1,
+                     style = TextStyle(fontFamily = V.mono, fontSize = V.small,
+                                       color = V.bodyHi))
+                Text(if (busy) "fetching…" else file.size(),
+                     style = TextStyle(fontFamily = V.mono, fontSize = 9.5.sp,
+                                       color = if (busy) V.seed else V.dim2))
+            }
+        }
+        Box(Modifier.width(1.dp).height(26.dp).background(V.line3))
+        Text("save",
+             modifier = Modifier
+                 .pointerInput(file) { detectTapGestures { onSave() } }
+                 .padding(horizontal = 12.dp, vertical = 10.dp),
+             style = TextStyle(fontFamily = V.mono, fontSize = V.small,
+                               color = V.muted))
     }
 }

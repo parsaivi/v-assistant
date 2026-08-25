@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">V</string>
+
+    <!-- Shown in the launcher's widget picker. Written as what the card is,
+         not as what it does, because the picker is a list of nouns. -->
+    <string name="widget_today_description">The next thing on the calendar, and the rest of the day under it.</string>
+    <string name="widget_priorities_description">What to do next, with a box to tick when it is done.</string>
 </resources>
