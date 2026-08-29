@@ -59,6 +59,7 @@ fun ChatScreen(model: VModel, onCalibrate: () -> Unit = {}) {
     val notes by model.notes.collectAsState()
     val fault by model.fault.collectAsState()
     val levels by model.levels.collectAsState()
+    val heard by model.heard.collectAsState()
 
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -115,6 +116,7 @@ fun ChatScreen(model: VModel, onCalibrate: () -> Unit = {}) {
             onHoldStart = { model.startListening() },
             onHoldEnd = { model.stopListening() },
             listening = ambient == Ambient.LISTENING,
+            heard = heard,
             pending = pending,
             attaching = busyFile == "attaching…",
             onAttach = { picker.launch(arrayOf("*/*")) },
@@ -205,7 +207,7 @@ private fun stateLabel(a: Ambient) = when (a) {
  * is the one thing the brief says about this component that is not a number.
  */
 @Composable
-private fun Waveform(levels: FloatArray, ambient: Ambient) {
+internal fun Waveform(levels: FloatArray, ambient: Ambient) {
     val active = ambient == Ambient.LISTENING || ambient == Ambient.SPEAKING
     Row(
         Modifier
@@ -351,7 +353,7 @@ private val PERSIAN = Regex("[\\u0600-\\u06FF\\u0750-\\u077F\\uFB50-\\uFDFF\\uFE
  * direction rather than infecting the paragraph it sits in.
  */
 @Composable
-private fun Persianable(text: String, color: Color, mono: Boolean,
+internal fun Persianable(text: String, color: Color, mono: Boolean,
                         rtlAccent: Color = V.line3) {
     val blocks = remember(text) { split(text) }
     Column {
@@ -447,7 +449,8 @@ private fun Fault(message: String, onRetry: () -> Unit) {
 @Composable
 private fun Composer(value: String, onValue: (String) -> Unit, onSend: () -> Unit,
                      onHoldStart: () -> Unit, onHoldEnd: () -> Unit,
-                     listening: Boolean, pending: VFile? = null,
+                     listening: Boolean, heard: String = "",
+                     pending: VFile? = null,
                      attaching: Boolean = false, onAttach: () -> Unit = {},
                      onDropPending: () -> Unit = {}) {
   Column(
@@ -511,9 +514,15 @@ private fun Composer(value: String, onValue: (String) -> Unit, onSend: () -> Uni
         Spacer(Modifier.width(10.dp))
         Box(Modifier.weight(1f)) {
             if (value.isEmpty()) {
-                Text("ask, or hold to speak",
+                // The words as they form, when the phone is transcribing them
+                // itself and can say so before the button is released. A wrong
+                // hearing is a *state*, and one he can see while it is still
+                // his turn is one he can fix by saying it again — rather than
+                // after V has already answered the wrong question.
+                Text(if (heard.isNotBlank()) heard else "ask, or hold to speak",
                      style = TextStyle(fontFamily = V.mono, fontSize = V.transcript,
-                                       color = V.dim3))
+                                       color = if (heard.isNotBlank()) V.paperHi
+                                               else V.dim3))
             }
             BasicTextField(
                 value = value,

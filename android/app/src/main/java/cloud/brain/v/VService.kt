@@ -419,6 +419,20 @@ class VService : LifecycleService() {
      */
     private fun onWake() {
         if (conversation?.isActive == true) return
+        // A screen is recording — the chat composer's hold-to-talk, enrollment,
+        // calibration. What the gate just matched is Parsa talking *into* that
+        // screen, and the only right answer is to ignore it.
+        //
+        // This is the second half of the fix; `Mic.withUi` around the composer
+        // is the first. Both are needed, and for different reasons: the flag
+        // parks the gate for the length of the hold, and this catches the
+        // segment that was already captured and queued for scoring when the
+        // button went down. Without the pair, every held-to-talk message was
+        // answered by V twice — once properly, and once by a wake that said
+        // "Yes?" over the top of it and opened a fresh session, which then
+        // ended by calling `newSession` and throwing away the thread he was
+        // in the middle of.
+        if (Mic.uiHolding) return
         val g = gate ?: return
         g.yieldMic()
         show()

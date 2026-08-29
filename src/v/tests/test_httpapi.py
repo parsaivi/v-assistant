@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import traceback
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -171,7 +172,39 @@ class StubBridge:
         return "the transcript"
 
     def speak(self, text):
-        return b"OggS-not-really"
+        # One frame per sentence, and the text in it, so a streaming test can
+        # prove *which* sentences arrived and in what order rather than only
+        # that some bytes did.
+        return b"OggS:" + text.encode("utf-8")
+
+    # ---- the streaming halves -----------------------------------------
+    def push_chunk(self, utt, pcm, *, final):
+        self.chunks = getattr(self, "chunks", [])
+        self.chunks.append((utt, len(pcm), final))
+        # Each chunk contributes one word, so the transcript grows visibly.
+        heard = getattr(self, "heard", [])
+        if pcm:
+            heard.append(f"chunk{len(heard) + 1}")
+        self.heard = heard
+        return " ".join(heard)
+
+    def synth(self):
+        """What `SpeechSpool` asks how many sentences it may run at once."""
+        return self
+
+    #: Serial by default, like Piper. Overridden by the concurrency test.
+    concurrency = 1
+
+    def spool(self, turn, text):
+        # The real `SpeechSpool`, not a fake: the thing worth testing is that
+        # it splits, synthesizes in order and terminates, and a stub of it
+        # would test nothing but the stub.
+        self.spools = getattr(self, "spools", {})
+        self.spools[turn] = httpapi.SpeechSpool(self, text)
+        return self.spools[turn]
+
+    def spooled(self, turn):
+        return getattr(self, "spools", {}).get(turn)
 
 
 def free_port() -> int:
@@ -1229,6 +1262,359 @@ def a_file_name_from_outside_cannot_become_a_path():
     eq(files.safe_name("  ...  "), "")
     eq(files.mime_for("a/b/c.PDF"), "application/pdf")
     eq(files.mime_for("no-extension"), "application/octet-stream")
+
+# ---- speaking a sentence at a time ----------------------------------------
+#: Three sentences that each clear `tts.MIN_CHUNK_CHARS`, so the splitter keeps
+#: them apart. Anything shorter is glued forward by design, and a spool test
+#: fed short sentences is silently testing one chunk instead of three.
+THREE_SENTENCES = (
+    "one is the first sentence and it is long enough to stand by itself. "
+    "two is the second sentence and it is also long enough to stand alone. "
+    "three is the last sentence here and it stands by itself as well.")
+
+
+@test
+def an_answer_is_split_so_the_first_sentence_can_be_spoken_first():
+    """The split is what makes time-to-first-word stop scaling with the length
+    of the answer, and the rule that earns its keep is the *first* chunk being
+    allowed to stand alone however short it is."""
+    from v.core import tts
+    eq(tts.sentences("Got it. Narmak or Vanak, sir?"),
+       ["Got it.", "Narmak or Vanak, sir?"],
+       "a two-word opener is a whole chunk — that is the point")
+    eq(tts.sentences(""), [])
+    eq(tts.sentences("no punctuation at all"), ["no punctuation at all"])
+
+    # Later fragments are glued forward, so the tail is not a stutter of
+    # one-word audio files.
+    eq(tts.sentences("A long enough opening sentence to stand by itself here. "
+                     "Yes. And then some more words after that one."),
+       ["A long enough opening sentence to stand by itself here.",
+        "Yes. And then some more words after that one."])
+
+    # Persian ؟ ends a sentence; ، does not, being a comma.
+    eq(tts.sentences("مرج ابوالفضل انجام شد؟ بله، انجام شد."),
+       ["مرج ابوالفضل انجام شد؟", "بله، انجام شد."])
+
+    long = "word " * 200
+    parts = tts.sentences(long)
+    ok(len(parts) > 1, "an unpunctuated monologue still gets cut")
+    ok(all(len(x) <= tts.MAX_CHUNK_CHARS for x in parts),
+       "and every piece is under the ceiling")
+    eq(" ".join(parts).split(), long.split(), "without losing or duplicating a word")
+
+
+@test
+def the_spool_yields_each_sentence_as_it_is_made_and_then_stops():
+    spool = httpapi.SpeechSpool(StubBridge(), "First one. Second one here, "
+                                              "which is long enough to stand.")
+    frames = list(spool.frames(timeout=10))
+    eq(len(frames), 2, "one frame per sentence")
+    eq(frames[0], b"OggS:First one.", "and the first sentence is first")
+    ok(spool.done.is_set(), "the spool finishes rather than hanging on EOF")
+
+    # An answer with nothing speakable in it must terminate, not block.
+    empty = httpapi.SpeechSpool(StubBridge(), "   ")
+    eq(list(empty.frames(timeout=5)), [])
+    ok(empty.done.is_set())
+
+
+@test
+def sentences_are_published_in_order_however_they_finish():
+    """The hosted voice runs four at a time, so a later sentence routinely
+    finishes before an earlier one — it is a fixed round trip per call, not
+    work proportional to length. Publishing them as they land would read the
+    answer out of order, which is worse than reading it slowly."""
+    import threading
+
+    class Wide(StubBridge):
+        concurrency = 4
+
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Barrier(3, timeout=10)
+
+        def speak(self, text):
+            # All three in flight together, then finish back to front: the
+            # worst ordering the real thing can produce, made deterministic.
+            self.started.wait()
+            time.sleep({"one": 0.30, "two": 0.15}.get(text.split()[0], 0.0))
+            return b"OggS:" + text.split()[0].encode()
+
+    # Each sentence has to clear `tts.MIN_CHUNK_CHARS` on its own, or the
+    # splitter glues it to its neighbour — which is right, and which is what
+    # this test caught itself doing when the sentences were "One. Two. Three."
+    spool = httpapi.SpeechSpool(Wide(), THREE_SENTENCES)
+    frames = list(spool.frames(timeout=20))
+    eq([f.decode() for f in frames], ["OggS:one", "OggS:two", "OggS:three"],
+       "source order, not completion order")
+
+
+@test
+def one_failed_sentence_does_not_take_the_rest_of_the_answer_with_it():
+    """A single sentence the voice choked on is a gap in the reading. The
+    sentences around it were already made and are still worth hearing."""
+    class Flaky(StubBridge):
+        def speak(self, text):
+            if text.startswith("two"):
+                raise RuntimeError("that one broke")
+            return b"OggS:" + text.split()[0].encode()
+
+    spool = httpapi.SpeechSpool(Flaky(), THREE_SENTENCES)
+    frames = [f.decode() for f in list(spool.frames(timeout=20))]
+    eq(frames, ["OggS:one", "OggS:three"], "the gap is skipped, not fatal")
+    ok(spool.done.is_set())
+
+
+@test
+def a_voice_that_cannot_speak_ends_the_stream_instead_of_hanging():
+    """The words are already on screen; a broken Piper must not also cost the
+    phone a two-minute wait on a socket that will never produce a frame."""
+    class Mute(StubBridge):
+        def speak(self, text):
+            raise RuntimeError("piper is not installed")
+
+    spool = httpapi.SpeechSpool(Mute(), "One. Two.")
+    eq(list(spool.frames(timeout=10)), [])
+    ok(spool.done.is_set())
+    ok("piper" in spool.error, f"the reason is kept: {spool.error!r}")
+
+
+@test
+def the_turn_only_spools_audio_when_the_caller_asks_for_it():
+    """The widgets and the terminal call these endpoints and have no speaker.
+    Warming Piper for an answer nobody hears is work done for nothing."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        bridge = StubBridge()
+        server, thread, port = stand_up(s, bridge)
+        try:
+            def chat(path):
+                conn = http.client.HTTPSConnection(
+                    "127.0.0.1", port, context=client_context(s, with_cert=True),
+                    timeout=20)
+                conn.request("POST", path, json.dumps({"text": "hi"}),
+                             {"Content-Type": "application/json"})
+                return json.loads(conn.getresponse().read())
+
+            quiet = chat("/v1/chat")
+            ok("turn" not in quiet, "no speaker asked, no audio made")
+
+            loud = chat("/v1/chat?speak=1")
+            ok(loud.get("turn"), "asked for, so there is a turn id to read")
+
+            # And that id streams the answer as length-prefixed frames.
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=client_context(s, with_cert=True),
+                timeout=20)
+            conn.request("GET", f"/v1/say?turn={loud['turn']}")
+            res = conn.getresponse()
+            eq(res.status, 200)
+            raw = res.read()
+            frames, i = [], 0
+            while i + 4 <= len(raw):
+                n = int.from_bytes(raw[i:i + 4], "big")
+                frames.append(raw[i + 4:i + 4 + n])
+                i += 4 + n
+            ok(frames and frames[0].startswith(b"OggS:"),
+               f"the first frame is audio, got {frames[:1]}")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def an_expired_or_unknown_turn_is_a_404_rather_than_a_hang():
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        server, thread, port = stand_up(s)
+        try:
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=client_context(s, with_cert=True),
+                timeout=20)
+            conn.request("GET", "/v1/say?turn=nosuchturn")
+            eq(conn.getresponse().status, 404)
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+# ---- an utterance arriving in pieces --------------------------------------
+@test
+def the_bridge_keeps_one_stream_per_utterance_and_drops_it_when_it_ends():
+    """The registry between the handler and `stt.Stream`, which the endpoint
+    tests stub over. Built without an engine — `_Bridge.__init__` starts a
+    thread that opens the index — because none of what is under test needs one.
+    """
+    import threading
+    from v.core import stt
+
+    class Model:
+        """Whisper's shape, minus Whisper: one word per chunk it is given."""
+        RATE = 16_000
+        model_size = "fake"
+
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe_pcm(self, pcm, *, language=None, initial_prompt=None):
+            self.calls += 1
+            return stt.Transcript(
+                text=f"word{self.calls}", language="en", language_probability=1.0,
+                duration=len(pcm) / 2 / self.RATE, seconds_taken=0.0,
+                model="fake")
+
+    bridge = httpapi._Bridge.__new__(httpapi._Bridge)
+    bridge._streams = {}
+    bridge._streams_lock = threading.Lock()
+    bridge._stt_lock = threading.Lock()
+    model = Model()
+    bridge.transcriber = lambda: model
+
+    # A second of audio at a time. `stt.MIN_CHUNK_SECONDS` is 6, so the first
+    # five are held rather than run — that holding is the point, not a bug.
+    second = b"\x01\x00" * 16_000
+    for _ in range(5):
+        eq(bridge.push_chunk("utt-1", second, final=False), "")
+    eq(model.calls, 0, "short pieces are held, not run one pass each")
+
+    eq(bridge.push_chunk("utt-1", second, final=False), "word1",
+       "the sixth second crosses the threshold and runs once")
+    eq(model.calls, 1)
+    ok("utt-1" in bridge._streams, "the utterance is still open")
+
+    # Two utterances at once stay separate.
+    bridge.push_chunk("utt-2", second, final=False)
+    eq(len(bridge._streams), 2)
+
+    eq(bridge.push_chunk("utt-1", second, final=True), "word1 word2",
+       "the tail is transcribed and joined onto what came before")
+    ok("utt-1" not in bridge._streams, "a finished utterance is dropped")
+    ok("utt-2" in bridge._streams, "and the other one is untouched")
+
+    # A tail shorter than the threshold must still be run, never dropped.
+    model.calls = 0
+    bridge.push_chunk("utt-3", second, final=False)
+    eq(model.calls, 0, "one second is under the threshold")
+    eq(bridge.push_chunk("utt-3", b"", final=True), "word1",
+       "and `final` forces the held audio through rather than losing it")
+
+
+@test
+def an_abandoned_utterance_does_not_hold_a_transcript_forever():
+    import threading
+    bridge = httpapi._Bridge.__new__(httpapi._Bridge)
+    bridge._streams = {}
+    bridge._streams_lock = threading.Lock()
+    bridge._stt_lock = threading.Lock()
+    bridge.transcriber = lambda: None
+
+    # An utterance from before the TTL — the app was killed mid-sentence.
+    bridge._streams["old"] = (time.time() - httpapi._Bridge.STREAM_TTL - 1,
+                              object())
+    bridge._streams["new"] = (time.time(), object())
+    with bridge._streams_lock:
+        bridge._sweep_streams()
+    ok("old" not in bridge._streams, "swept")
+    ok("new" in bridge._streams, "and only the stale one")
+
+
+
+@test
+def chunks_transcribe_as_they_arrive_and_only_the_last_one_answers():
+    """The whole point of the streaming path: everything but the tail is
+    already through Whisper when the finger lifts, and the turn runs on the
+    same request that ended the sentence rather than needing another."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        bridge = StubBridge()
+        server, thread, port = stand_up(s, bridge)
+        try:
+            def chunk(final, body=b"\x00\x01" * 800):
+                conn = http.client.HTTPSConnection(
+                    "127.0.0.1", port, context=client_context(s, with_cert=True),
+                    timeout=20)
+                conn.request("POST",
+                             f"/v1/voice/chunk?utt=abc123&final={1 if final else 0}",
+                             body, {"Content-Type": "application/octet-stream"})
+                res = conn.getresponse()
+                return res.status, json.loads(res.read())
+
+            status, first = chunk(False)
+            eq(status, 200)
+            eq(first["transcript"], "chunk1")
+            eq(first["final"], False)
+            ok("text" not in first, "a mid-utterance chunk does not answer")
+            eq(getattr(bridge, "handled", []), [],
+               "and must not have run a turn")
+
+            status, second = chunk(False)
+            eq(second["transcript"], "chunk1 chunk2", "the transcript grows")
+
+            status, last = chunk(True)
+            eq(status, 200)
+            eq(last["transcript"], "chunk1 chunk2 chunk3")
+            eq(last["text"], "Noted, sir.", "the final chunk carries the turn")
+            eq(len(bridge.handled), 1, "exactly one turn, on the last chunk")
+            eq(bridge.handled[0][0], "chunk1 chunk2 chunk3",
+               "and it is given the whole transcript, not the last piece")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_streamed_utterance_with_nothing_in_it_is_not_an_error():
+    """Same posture as the one-shot path: a button brushed is an ordinary
+    thing to do, and an error dialog for it trains you to dismiss dialogs."""
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        bridge = StubBridge()
+        server, thread, port = stand_up(s, bridge)
+        try:
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=client_context(s, with_cert=True),
+                timeout=20)
+            conn.request("POST", "/v1/voice/chunk?utt=quiet1&final=1", b"",
+                         {"Content-Type": "application/octet-stream"})
+            res = conn.getresponse()
+            eq(res.status, 200)
+            body = json.loads(res.read())
+            ok(body["empty"], "an empty utterance is a state, not a failure")
+            eq(getattr(bridge, "handled", []), [], "and runs no turn")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def an_utterance_id_from_outside_cannot_become_anything_else():
+    root, s = make_vault()
+    try:
+        pki.enrol("pixel", s)
+        server, thread, port = stand_up(s)
+        try:
+            for bad in ("../../etc", "a b", "'; drop", "x" * 65, ""):
+                conn = http.client.HTTPSConnection(
+                    "127.0.0.1", port,
+                    context=client_context(s, with_cert=True), timeout=20)
+                conn.request("POST",
+                             "/v1/voice/chunk?utt=" + quote(bad) + "&final=0",
+                             b"\x00\x01", {"Content-Type": "application/octet-stream"})
+                eq(conn.getresponse().status, 400, f"{bad!r} should be refused")
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(root)
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items())

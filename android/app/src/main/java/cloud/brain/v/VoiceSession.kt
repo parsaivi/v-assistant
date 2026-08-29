@@ -65,7 +65,11 @@ object VoiceSession {
 
     enum class Phase { IDLE, WAKE, LISTENING, THINKING, SPEAKING }
 
-    data class Line(val fromV: Boolean, val text: String)
+    /** [cost] is set on V's turns only, and is the line the transcript hangs
+     *  under the answer — the same string the ambient screen shows while he
+     *  is saying it, kept per-turn so scrolling back does not show the price
+     *  of the newest answer under an older one. */
+    data class Line(val fromV: Boolean, val text: String, val cost: String = "")
 
     private val _phase = MutableStateFlow(Phase.IDLE)
     val phase: StateFlow<Phase> = _phase
@@ -79,6 +83,10 @@ object VoiceSession {
     private val _lines = MutableStateFlow<List<Line>>(emptyList())
     val lines: StateFlow<List<Line>> = _lines
 
+    /** Live microphone level, one value per bar, zeroed when nothing is open. */
+    private val _levels = MutableStateFlow(FloatArray(Recorder.BARS))
+    val levels: StateFlow<FloatArray> = _levels
+
     val isOpen: Boolean get() = _phase.value != Phase.IDLE
 
     @Volatile private var cancelled = false
@@ -90,68 +98,93 @@ object VoiceSession {
      * Run one conversation to its end. Returns when the session closes; the
      * caller is responsible for handing the microphone back to the gate.
      */
-    suspend fun run(context: Context, api: Api, player: Player, recorder: Recorder) {
-        cancelled = false
-        val barge = BargeIn(context)
-        _lines.value = emptyList()
-        _phase.value = Phase.WAKE
-        _caption.value = "Yes?"
-        _cost.value = "wake matched locally · \$0.0000"
+    suspend fun run(context: Context, api: Api, player: Player, recorder: Recorder) =
+        coroutineScope {
+            val speech = Speech(api, player)
+            val dictation = Dictation(api, recorder)
+            // The bars on the ambient screen are the microphone's own RMS,
+            // mirrored out of the recorder for as long as this session owns it.
+            // Mirrored rather than read straight off the recorder because the
+            // recorder belongs to the service while the screen may not exist yet
+            // when the first word is spoken — the same reason this object exists
+            // at all.
+            val meter = launch { recorder.levels.collect { _levels.value = it } }
+            cancelled = false
+            val barge = BargeIn(context)
+            _lines.value = emptyList()
+            _phase.value = Phase.WAKE
+            _caption.value = "Yes?"
+            _cost.value = "wake matched locally · \$0.0000"
 
-        try {
-            player.takeFocus()
+            try {
+                player.takeFocus()
 
-            // The greeting runs no model on the server and says one line, so
-            // plugging into a conversation does not begin with a recital.
-            val greeting = try { api.wake("gate", WAKE_AGENT) } catch (e: Exception) { null }
-            val opening = greeting?.spoken?.ifBlank { "Yes?" } ?: "Yes?"
-            _caption.value = opening
-            say(api, player, barge, opening)
+                // The greeting runs no model on the server and says one line, so
+                // plugging into a conversation does not begin with a recital.
+                val greeting = try { api.wake("gate", WAKE_AGENT) } catch (e: Exception) { null }
+                val opening = greeting?.spoken?.ifBlank { "Yes?" } ?: "Yes?"
+                _caption.value = opening
+                sayText(api, player, barge, opening)
 
-            while (!cancelled) {
-                _phase.value = Phase.LISTENING
-                _caption.value = ""
-                _cost.value = "listening · nothing sent yet"
+                while (!cancelled) {
+                    _phase.value = Phase.LISTENING
+                    _caption.value = ""
+                    _cost.value = "listening · nothing sent yet"
 
-                val wav = recorder.record(untilSilence = true,
-                                          giveUpMs = SILENCE_TIMEOUT_MS,
-                                          context = context)
-                if (wav == null || cancelled) break     // silence, or the button
+                    // Transcribed in pieces as he speaks: the recorder cuts
+                    // at silences and each piece goes through Whisper while
+                    // the next is still being said, so the wait after he stops
+                    // is one pass over the tail rather than over the whole
+                    // thing. A short answer — most of them — never reaches the
+                    // chunk threshold and stays a single pass, which is the
+                    // point; see `Recorder.CHUNK_MIN_MS`.
+                    val heardIt = dictation.listen(
+                        untilSilence = true,
+                        giveUpMs = SILENCE_TIMEOUT_MS,
+                        context = context,
+                        onPartial = { _caption.value = it },
+                        onThinking = {
+                            _phase.value = Phase.THINKING
+                            _cost.value = "◈ thinking"
+                        })
+                    if (heardIt.wav == null || cancelled) break  // silence, or the button
 
-                _phase.value = Phase.THINKING
-                _cost.value = "◈ thinking"
-                val turn = api.voice(wav)
+                    _phase.value = Phase.THINKING
+                    _cost.value = "◈ thinking"
+                    val turn = heardIt.turn ?: api.voice(heardIt.wav, speak = true)
 
-                val heard = turn.transcript.orEmpty().trim()
-                if (heard.isNotEmpty()) _lines.value = _lines.value + Line(false, heard)
+                    val heard = turn.transcript.orEmpty().trim()
+                    if (heard.isNotEmpty()) _lines.value = _lines.value + Line(false, heard)
 
-                val reply = turn.spoken.ifBlank { turn.text }
-                if (reply.isNotBlank()) {
-                    _lines.value = _lines.value + Line(true, reply)
-                    _phase.value = Phase.SPEAKING
-                    _caption.value = reply
-                    _cost.value = turn.costLine()
-                    say(api, player, barge, reply)
+                    val reply = turn.spoken.ifBlank { turn.text }
+                    if (reply.isNotBlank()) {
+                        _lines.value = _lines.value + Line(true, reply, turn.costLine())
+                        _phase.value = Phase.SPEAKING
+                        _caption.value = reply
+                        _cost.value = turn.costLine()
+                        say(speech, player, barge, turn)
+                    }
+
+                    if (closes(heard)) break
                 }
-
-                if (closes(heard)) break
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _caption.value = "Lost him."
+                _cost.value = e.message ?: "connection failed"
+            } finally {
+                meter.cancel()
+                _levels.value = FloatArray(Recorder.BARS)
+                player.stop()
+                player.releaseFocus()
+                _phase.value = Phase.IDLE
+                _caption.value = ""
+                _cost.value = ""
+                // A fresh session next time, so the next wake does not inherit
+                // this conversation's context.
+                try { api.newSession() } catch (e: Exception) { /* best effort */ }
             }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            _caption.value = "Lost him."
-            _cost.value = e.message ?: "connection failed"
-        } finally {
-            player.stop()
-            player.releaseFocus()
-            _phase.value = Phase.IDLE
-            _caption.value = ""
-            _cost.value = ""
-            // A fresh session next time, so the next wake does not inherit
-            // this conversation's context.
-            try { api.newSession() } catch (e: Exception) { /* best effort */ }
         }
-    }
 
     /**
      * Speak one reply, and stop the moment Parsa starts talking over it.
@@ -165,15 +198,29 @@ object VoiceSession {
      * which is the same posture the Telegram surface takes when Piper is
      * missing at the other end.
      */
-    private suspend fun say(api: Api, player: Player, barge: BargeIn, text: String) {
+    private suspend fun say(speech: Speech, player: Player, barge: BargeIn,
+                            turn: Turn) {
+        race(player, barge) { speech.play(turn) }
+    }
+
+    /** The greeting has no turn behind it — it is one fixed sentence that
+     *  runs no model — so it takes the one-blob path and is very likely to
+     *  come straight out of the voice cache. */
+    private suspend fun sayText(api: Api, player: Player, barge: BargeIn,
+                                text: String) {
         val ogg = try {
             api.speak(text)
         } catch (e: Exception) {
             return
         }
+        race(player, barge) { player.play(ogg) }
+    }
+
+    private suspend fun race(player: Player, barge: BargeIn,
+                             speaking: suspend () -> Unit) {
         try {
             coroutineScope {
-                val playing = async { player.play(ogg) }
+                val playing = async { speaking() }
                 val interrupted = async { barge.await() }
                 select<Unit> {
                     playing.onAwait {

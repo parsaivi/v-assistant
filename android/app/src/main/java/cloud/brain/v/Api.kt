@@ -39,6 +39,10 @@ data class Turn(
     val local: Boolean,
     val transcript: String? = null,
     val mine: Boolean = false,  // true for the user's own line in the log
+    /** The id `GET /v1/say` streams this answer's audio from, when one was
+     *  asked for. Empty means nothing was spooled — a typed turn, a widget,
+     *  or a server with no voice — and the caller simply does not speak. */
+    val turn: String = "",
     /** Files this turn produced, plus anything V queued while nobody was
      *  asking. Always present, never null — the log renders it
      *  unconditionally, and a field that is sometimes absent is a crash. */
@@ -102,6 +106,7 @@ data class Turn(
                              else o.optDouble("confidence"),
                 model = o.optString("model"),
                 local = o.optBoolean("local", true),
+                turn = o.optString("turn"),
                 transcript = if (o.has("transcript")) o.optString("transcript") else null)
         }
     }
@@ -233,12 +238,19 @@ class Api(private val context: Context) {
     /** [fileRel] is a path `attach` just returned. Two calls rather than one
      *  multipart request — see `httpapi.h_chat` for why the caption cannot
      *  ride along with the bytes. */
-    suspend fun chat(text: String, fileRel: String = ""): Turn =
+    suspend fun chat(text: String, fileRel: String = "",
+                     speak: Boolean = false): Turn =
         withContext(Dispatchers.IO) {
             val payload = JSONObject().put("text", text)
             if (fileRel.isNotBlank()) payload.put("file_rel", fileRel)
-            Turn.parse(JSONObject(body(post("${base()}/v1/chat", payload))))
+            Turn.parse(JSONObject(body(
+                post("${base()}/v1/chat${q(speak)}", payload))))
         }
+
+    /** `?speak=1` when the caller has a speaker, so the server starts making
+     *  the audio while this response is still on the wire. Off by default:
+     *  the widgets call these same endpoints and have nothing to play it. */
+    private fun q(speak: Boolean) = if (speak) "?speak=1" else ""
 
     /**
      * Upload bytes; get back where they landed in the vault.
@@ -269,13 +281,86 @@ class Api(private val context: Context) {
             }
         }
 
-    /** WAV in, an answer plus the transcript out. See `Recorder` for why WAV. */
-    suspend fun voice(wav: ByteArray): Turn = withContext(Dispatchers.IO) {
-        val req = Request.Builder()
-            .url("${base()}/v1/voice")
-            .post(wav.toRequestBody("audio/wav".toMediaType()))
-            .build()
-        Turn.parse(JSONObject(body(http.newCall(req).execute())))
+    /** WAV in, an answer plus the transcript out. See `Recorder` for why WAV.
+     *
+     *  The whole-file path, kept as the fallback for when neither the phone's
+     *  own recognizer nor the chunked one is available. */
+    suspend fun voice(wav: ByteArray, speak: Boolean = false): Turn =
+        withContext(Dispatchers.IO) {
+            val req = Request.Builder()
+                .url("${base()}/v1/voice${q(speak)}")
+                .post(wav.toRequestBody("audio/wav".toMediaType()))
+                .build()
+            Turn.parse(JSONObject(body(http.newCall(req).execute())))
+        }
+
+    /**
+     * One piece of an utterance that is still being spoken.
+     *
+     * Raw PCM16LE at 16kHz — exactly what `AudioRecord` hands `Recorder`, so
+     * nothing encodes on this phone and nothing transcodes on the laptop. Cut
+     * at a silence by the recorder, because a cut mid-word measurably damages
+     * the transcript; see `Recorder.CHUNK_MIN_MS`.
+     *
+     * Returns the transcript so far while [final] is false, and the whole turn
+     * when it is true — the answer comes back on the same request that ended
+     * the sentence rather than needing another round trip to start thinking.
+     */
+    suspend fun voiceChunk(utt: String, pcm: ByteArray, final: Boolean,
+                           speak: Boolean = false): JSONObject =
+        withContext(Dispatchers.IO) {
+            val speakArg = if (speak && final) "&speak=1" else ""
+            val req = Request.Builder()
+                .url("${base()}/v1/voice/chunk?utt=$utt" +
+                     "&final=${if (final) 1 else 0}$speakArg")
+                .post(pcm.toRequestBody("application/octet-stream".toMediaType()))
+                .build()
+            JSONObject(body(http.newCall(req).execute()))
+        }
+
+    /**
+     * The answer read aloud, a sentence at a time, as the laptop makes them.
+     *
+     * [onFrame] is called with one complete OGG per sentence, in order, the
+     * moment it arrives — so the first sentence can be playing while the last
+     * is still being synthesized. That is the difference between waiting for
+     * the whole answer's audio (~4.4s measured against the hosted voice) and
+     * waiting for its first sentence.
+     *
+     * Frames are length-prefixed rather than concatenated because a
+     * `MediaPlayer` needs a whole file, not a stream of pages it must demux.
+     */
+    suspend fun say(turn: String, onFrame: suspend (ByteArray) -> Unit): Unit =
+        withContext(Dispatchers.IO) {
+            get("${base()}/v1/say?turn=$turn").use { r ->
+                check(r)
+                val body = r.body ?: return@use
+                val stream = body.byteStream()
+                val head = ByteArray(4)
+                while (true) {
+                    if (!readFully(stream, head)) break
+                    val n = ((head[0].toInt() and 0xFF) shl 24) or
+                            ((head[1].toInt() and 0xFF) shl 16) or
+                            ((head[2].toInt() and 0xFF) shl 8) or
+                            (head[3].toInt() and 0xFF)
+                    // A frame larger than any sentence could produce means the
+                    // stream is out of step; stop rather than allocate on it.
+                    if (n <= 0 || n > 8 * 1024 * 1024) break
+                    val frame = ByteArray(n)
+                    if (!readFully(stream, frame)) break
+                    onFrame(frame)
+                }
+            }
+        }
+
+    private fun readFully(stream: java.io.InputStream, into: ByteArray): Boolean {
+        var off = 0
+        while (off < into.size) {
+            val n = stream.read(into, off, into.size - off)
+            if (n < 0) return false
+            off += n
+        }
+        return true
     }
 
     suspend fun speak(text: String): ByteArray = withContext(Dispatchers.IO) {
@@ -286,12 +371,14 @@ class Api(private val context: Context) {
         }
     }
 
-    suspend fun act(button: Button): Turn = withContext(Dispatchers.IO) {
-        val payload = JSONObject()
-            .put("action", button.action)
-            .put("payload", JSONObject(button.payload))
-        Turn.parse(JSONObject(body(post("${base()}/v1/act", payload))))
-    }
+    suspend fun act(button: Button, speak: Boolean = false): Turn =
+        withContext(Dispatchers.IO) {
+            val payload = JSONObject()
+                .put("action", button.action)
+                .put("payload", JSONObject(button.payload))
+            Turn.parse(JSONObject(body(
+                post("${base()}/v1/act${q(speak)}", payload))))
+        }
 
     suspend fun newSession(): Unit = withContext(Dispatchers.IO) {
         body(post("${base()}/v1/session/new", JSONObject()))

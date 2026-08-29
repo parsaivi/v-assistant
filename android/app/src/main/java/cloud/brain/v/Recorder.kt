@@ -55,6 +55,28 @@ class Recorder {
          *  until the battery dies. */
         private const val MAX_MS = 30_000
 
+        /**
+         * How much audio must pile up before a chunk is worth sending ahead.
+         *
+         * Matches `stt.MIN_CHUNK_SECONDS` on the server, and for the reason
+         * written there: Whisper pads every call to a 30-second window, so the
+         * encoder costs the same for one second of speech as for twenty and N
+         * chunks means N passes. Measured, cutting a 3.2s clip into four
+         * one-second pieces cost 8.1s of compute against 1.6s for one pass.
+         *
+         * So a short question — the common case — piles up less than this,
+         * never emits an early chunk, and is transcribed exactly once when the
+         * finger lifts. Only a long dictation, where there is real speaking
+         * time to hide the work behind, gets cut. A 21-second memo becomes two
+         * passes and the wait at the end is the tail alone.
+         */
+        private const val CHUNK_MIN_MS = 6_000
+
+        /** Quiet this long is a phrase boundary — where a cut is safe.
+         *  Shorter than [SILENCE_MS] because ending a *chunk* early is
+         *  harmless while ending a *turn* early cuts him off. */
+        private const val CHUNK_SILENCE_MS = 300
+
         /** The 21 bars of the design's waveform. */
         const val BARS = 21
     }
@@ -77,8 +99,9 @@ class Recorder {
      */
     @SuppressLint("MissingPermission")
     suspend fun record(untilSilence: Boolean, giveUpMs: Int = 0,
-                       context: android.content.Context? = null): ByteArray? =
-            withContext(Dispatchers.IO) {
+                       context: android.content.Context? = null,
+                       onChunk: (suspend (ByteArray, Boolean) -> Unit)? = null):
+            ByteArray? = withContext(Dispatchers.IO) {
         stopRequested = false
         val minBuffer = AudioRecord.getMinBufferSize(RATE, CHANNEL, ENCODING)
         if (minBuffer <= 0) return@withContext null
@@ -115,6 +138,11 @@ class Recorder {
         var spoke = false
         var quietFor = 0
         var elapsed = 0
+        // What has not been sent ahead yet, and how quiet it has been. Only
+        // touched when a caller actually wants chunks — the handsfree path
+        // and the one-shot path pay nothing for this.
+        val pending = ByteArrayOutputStream()
+        val chunker = Chunker()
 
         try {
             record.startRecording()
@@ -143,6 +171,14 @@ class Recorder {
                 for (i in 0 until n) buf.putShort(frame[i])
                 pcm.write(buf.array())
 
+                if (onChunk != null) {
+                    pending.write(buf.array())
+                    if (chunker.sawFrame(ms, rms)) {
+                        onChunk(pending.toByteArray(), false)
+                        pending.reset()
+                    }
+                }
+
                 if (untilSilence) {
                     if (rms > SILENCE_RMS) {
                         spoke = true
@@ -170,7 +206,49 @@ class Recorder {
         // Under a fifth of a second is a button brushed, not a message. The
         // server treats an empty transcript as an ordinary thing rather than an
         // error, but not sending it at all is quieter still.
-        if (body.size < RATE / 5 * 2) null else wav(body)
+        val brushed = body.size < RATE / 5 * 2
+        if (onChunk != null && !brushed) {
+            // The tail, always, even when it is empty: the final chunk is what
+            // ends the utterance and carries the answer back, so a caller that
+            // never sees one waits forever. A held tail silently dropped is the
+            // bug this line exists to not have.
+            onChunk(pending.toByteArray(), true)
+        }
+        if (brushed) null else wav(body)
+    }
+
+    /**
+     * When to cut a chunk — the whole rule, with no microphone in it.
+     *
+     * Split out of the record loop so it can be tested, because the two
+     * conditions are not interchangeable and getting either wrong is a
+     * regression that only shows up as a slightly wrong transcript:
+     *
+     *  * **Long enough.** Whisper pads every call to a 30-second window, so
+     *    the encoder costs the same for one second of audio as for twenty.
+     *    Cutting eagerly does not spread the work out, it multiplies it —
+     *    measured, a 3.2s clip in four one-second pieces cost 8.1s of compute
+     *    against 1.6s in one pass.
+     *  * **At a silence.** A cut mid-word damages the transcript on both
+     *    sides. Measured, an arbitrary cut turned "Good evening sir" into
+     *    "Whose evening, sir". This one is a correctness condition, not a
+     *    tuning knob.
+     */
+    class Chunker(private val minMs: Int = CHUNK_MIN_MS,
+                  private val quietMs: Int = CHUNK_SILENCE_MS) {
+
+        var pendingMs = 0; private set
+        private var quietFor = 0
+
+        /** Feed one frame; true means cut here and send what has piled up. */
+        fun sawFrame(ms: Int, rms: Double): Boolean {
+            pendingMs += ms
+            quietFor = if (rms > SILENCE_RMS) 0 else quietFor + ms
+            if (pendingMs < minMs || quietFor < quietMs) return false
+            pendingMs = 0
+            quietFor = 0
+            return true
+        }
     }
 
     /** A 44-byte canonical WAV header in front of the samples. */

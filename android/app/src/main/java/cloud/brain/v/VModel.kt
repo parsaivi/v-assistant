@@ -24,6 +24,16 @@ class VModel(app: Application) : AndroidViewModel(app) {
     private val api = Api(app)
     private val recorder = Recorder()
     private val player = Player(app)
+    private val stt = Stt(app)
+    private val speech = Speech(api, player)
+    private val dictation = Dictation(api, recorder)
+
+    /** The live transcript while he is still talking — the phone's own
+     *  recognizer produces this as the words form, and it is shown in place of
+     *  the composer's placeholder so a wrong hearing is visible before the
+     *  turn is spent on it rather than after. */
+    private val _heard = MutableStateFlow("")
+    val heard: StateFlow<String> = _heard.asStateFlow()
 
     private val _turns = MutableStateFlow<List<Turn>>(emptyList())
     val turns: StateFlow<List<Turn>> = _turns.asStateFlow()
@@ -43,7 +53,16 @@ class VModel(app: Application) : AndroidViewModel(app) {
     private val _fault = MutableStateFlow<String?>(null)
     val fault: StateFlow<String?> = _fault.asStateFlow()
 
-    val levels: StateFlow<FloatArray> = recorder.levels
+    /** The waveform's 21 bars, from whichever path is holding the microphone
+     *  — the recorder's own RMS, or the recognizer's, mapped to the same
+     *  scale. The brief requires these to be the real signal in production,
+     *  so neither path is allowed to fake them while the other is running.
+     *
+     *  Mirrored out of the recorder rather than exposed directly, because on
+     *  the on-device route the recorder is not running at all and the signal
+     *  arrives through `Stt`'s RMS callback instead. */
+    private val _levels = MutableStateFlow(FloatArray(Recorder.BARS))
+    val levels: StateFlow<FloatArray> = _levels.asStateFlow()
 
     /**
      * The file picked but not yet sent.
@@ -65,7 +84,10 @@ class VModel(app: Application) : AndroidViewModel(app) {
     private var turnJob: Job? = null
     private var speakJob: Job? = null
 
-    init { refresh() }
+    init {
+        refresh()
+        viewModelScope.launch { recorder.levels.collect { _levels.value = it } }
+    }
 
     fun refresh() = viewModelScope.launch {
         try {
@@ -137,7 +159,7 @@ class VModel(app: Application) : AndroidViewModel(app) {
         turnJob = viewModelScope.launch {
             _ambient.value = Ambient.THINKING
             try {
-                val turn = api.chat(trimmed, file?.rel ?: "")
+                val turn = api.chat(trimmed, file?.rel ?: "", speak = true)
                 _turns.value = _turns.value + turn
                 _fault.value = null
                 speak(turn)
@@ -208,7 +230,7 @@ class VModel(app: Application) : AndroidViewModel(app) {
         turnJob = viewModelScope.launch {
             _ambient.value = Ambient.THINKING
             try {
-                val turn = api.act(button)
+                val turn = api.act(button, speak = true)
                 _turns.value = _turns.value + turn
                 speak(turn)
             } catch (e: Exception) {
@@ -219,58 +241,158 @@ class VModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---- a spoken turn ---------------------------------------------------
+    /**
+     * Hold-to-talk, by whichever route is fastest on this phone.
+     *
+     * Three of them, in order of what they cost him in waiting:
+     *
+     *  1. **The phone's own recognizer.** No upload, no Whisper, and the words
+     *     appear as he says them. See `Stt` for why it is used only when the
+     *     platform confirms the language pack is on the device.
+     *  2. **Chunked upload.** The recorder cuts at silences and each piece is
+     *     transcribed while he is still speaking, so the wait at the end is
+     *     one pass over the tail rather than over everything.
+     *  3. **The whole file**, which is what this always did.
+     *
+     * All three end in the same place, so the surface cannot tell which ran.
+     *
+     * ### The microphone
+     *
+     * The whole turn runs inside `Mic.withUi`, and that is a bug fix rather
+     * than tidiness. `VService`'s gate holds the microphone open scoring
+     * everything it hears against the wake word. Without this claim it went on
+     * doing that *while he held the button*, heard the message he was dictating
+     * into the composer, matched it — he is the enrolled speaker, at arm's
+     * length, which is the easiest possible case for it — and opened a second
+     * conversation on top of the one he was having. That conversation greeted
+     * him with "Yes?", which is why every held message seemed to be answered
+     * with it, and ended by calling `newSession`, which threw away the thread.
+     *
+     * Held for the answer and the speaking too, not only the recording: V's
+     * own voice coming out of the speaker is also something the gate can hear.
+     */
     fun startListening() {
         if (turnJob?.isActive == true) return
         turnJob = viewModelScope.launch {
             _ambient.value = Ambient.LISTENING
-            // `untilSilence = false`: on this surface the button is held, so
-            // the finger is the endpoint detector and a better one than any
-            // threshold. The handsfree path is the one that has to guess.
-            val wav = recorder.record(untilSilence = false)
-            if (wav == null) {
-                _ambient.value = Ambient.IDLE
-                return@launch
-            }
-            _ambient.value = Ambient.THINKING
+            _heard.value = ""
             try {
-                val turn = api.voice(wav)
-                // The transcript is shown as Parsa's own line before the answer
-                // — the design makes a wrong transcript a *state*, and a state
-                // you cannot see is one you cannot correct.
-                turn.transcript?.takeIf { it.isNotBlank() }?.let {
-                    _turns.value = _turns.value + Turn.user(it)
+                Mic.withUi {
+                    val turn = dictate() ?: return@withUi
+                    if (turn.transcript.isNullOrBlank() && turn.text.isBlank()) {
+                        return@withUi
+                    }
+                    // The transcript is shown as Parsa's own line before the
+                    // answer — the design makes a wrong transcript a *state*,
+                    // and a state you cannot see is one you cannot correct.
+                    turn.transcript?.takeIf { it.isNotBlank() }?.let {
+                        _turns.value = _turns.value + Turn.user(it)
+                    }
+                    if (turn.text.isNotBlank()) {
+                        _turns.value = _turns.value + turn
+                        _fault.value = null
+                        speakBlocking(turn)
+                    }
                 }
-                if (turn.text.isNotBlank()) {
-                    _turns.value = _turns.value + turn
-                    speak(turn)
-                } else {
-                    _ambient.value = Ambient.IDLE
-                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _fault.value = reason(e)
+            } finally {
+                _heard.value = ""
+                java.util.Arrays.fill(recognizerBars, 0f)
+                _levels.value = FloatArray(Recorder.BARS)
                 _ambient.value = Ambient.IDLE
             }
         }
     }
 
-    fun stopListening() = recorder.requestStop()
+    /** Whichever of the three routes this phone can run. Null means nothing
+     *  was said, or the microphone could not be opened — both of which are
+     *  ordinary and neither of which is an error dialog. */
+    private suspend fun dictate(): Turn? {
+        if (stt.usable()) {
+            val text = stt.listen(
+                onPartial = { _heard.value = it },
+                onLevel = { level -> _levelsFromRecognizer(level) },
+                register = { stopper -> onDeviceStop = stopper })
+            onDeviceStop = null
+            if (text != null) {
+                // "" is a button brushed, not a failure. Nothing to send.
+                if (text.isBlank()) return null
+                _ambient.value = Ambient.THINKING
+                _heard.value = ""
+                // Text, not audio: the recognizer already did the only job the
+                // upload existed for. `transcript` is filled in here because
+                // the server never saw a voice message and so cannot echo one.
+                return api.chat(text, speak = true).copy(transcript = text)
+            }
+            // Null is a broken recognizer, not silence — fall through and
+            // record properly rather than dropping what he said.
+        }
+
+        // `untilSilence = false`: on this surface the button is held, so the
+        // finger is the endpoint detector and a better one than any threshold.
+        // The handsfree path is the one that has to guess.
+        val heardIt = dictation.listen(
+            untilSilence = false,
+            onPartial = { _heard.value = it },
+            onThinking = { _ambient.value = Ambient.THINKING })
+        heardIt.turn?.let { return it }
+        val wav = heardIt.wav ?: return null
+        _ambient.value = Ambient.THINKING
+        return api.voice(wav, speak = true)
+    }
+
+    /** Set by `Stt.listen` while the phone's own recognizer owns the mic, so
+     *  the button's release can end that turn as well as a recorded one. */
+    private var onDeviceStop: Stt.Stopper? = null
+
+    /** One RMS reading from the phone's recognizer, shifted into the bar
+     *  window the same way `Recorder` shifts its own — so `Waveform` cannot
+     *  tell which path is feeding it. */
+    private fun _levelsFromRecognizer(level: Float) {
+        val bars = recognizerBars
+        System.arraycopy(bars, 1, bars, 0, bars.size - 1)
+        bars[bars.size - 1] = level
+        _levels.value = bars.copyOf()
+    }
+
+    private val recognizerBars = FloatArray(Recorder.BARS)
+
+    fun stopListening() {
+        onDeviceStop?.stop()
+        recorder.requestStop()
+    }
 
     private fun speak(turn: Turn) {
         speakJob?.cancel()
-        val words = turn.spoken.ifBlank { turn.text }
-        if (words.isBlank()) {
+        if (turn.spoken.ifBlank { turn.text }.isBlank()) {
             _ambient.value = Ambient.IDLE
             return
         }
-        speakJob = viewModelScope.launch {
-            _ambient.value = Ambient.SPEAKING
-            try {
-                player.play(api.speak(words))
-            } catch (e: Exception) {
-                // No voice is not a failed turn. The answer is already read.
-            } finally {
-                _ambient.value = Ambient.IDLE
-            }
+        speakJob = viewModelScope.launch { speakBlocking(turn) }
+    }
+
+    /**
+     * Speak it and wait, rather than launching and returning.
+     *
+     * The spoken path needs this: `startListening` holds the microphone for
+     * the length of the turn, and a `speak` that returned immediately would
+     * drop that claim while V was still talking — handing the gate back a
+     * microphone pointed at V's own voice.
+     */
+    private suspend fun speakBlocking(turn: Turn) {
+        if (turn.spoken.ifBlank { turn.text }.isBlank()) return
+        _ambient.value = Ambient.SPEAKING
+        try {
+            speech.play(turn)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // No voice is not a failed turn. The answer is already read.
+        } finally {
+            _ambient.value = Ambient.IDLE
         }
     }
 

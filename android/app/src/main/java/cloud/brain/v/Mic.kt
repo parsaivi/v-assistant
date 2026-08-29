@@ -44,6 +44,19 @@ object Mic {
     /** Read by `Gate` on every loop: false means park and release. */
     val gateMayListen: Boolean get() = !_uiWants.value
 
+    /**
+     * Whether a screen currently owns the microphone.
+     *
+     * Read by `VService.onWake` as a veto. The park flag alone is not enough
+     * to stop a wake: the gate cuts an utterance at a silence and scores it
+     * *afterwards*, so a segment captured a moment before the button went down
+     * can still come back a match while a screen is recording. Without this,
+     * holding to talk in chat would be heard twice — once by the composer he
+     * is talking into, once by a gate that then greets him and opens a second
+     * conversation on top of the one he is having.
+     */
+    val uiHolding: Boolean get() = _uiWants.value
+
     internal fun gateHolds(holding: Boolean) { _gateHolding.value = holding }
 
     /**

@@ -55,6 +55,9 @@ class Unavailable(RuntimeError):
 class Transcriber:
     """Lazily loads the model — importing this module must stay cheap."""
 
+    #: What every path here resamples to, and what the phone already records.
+    RATE = 16_000
+
     def __init__(self, settings: Settings | None = None, model_size: str | None = None):
         self.s = settings or default_settings
         self.model_size = model_size or self.s.whisper_model
@@ -121,6 +124,40 @@ class Transcriber:
             segments=segs,
         )
 
+    def transcribe_pcm(self, pcm: bytes, *, language: str | None = None,
+                       initial_prompt: str | None = None,
+                       vad: bool = True) -> Transcript:
+        """Transcribe raw PCM16LE at [RATE] with no file and no ffmpeg.
+
+        The streaming path calls this several times per utterance, so the temp
+        file and the subprocess that `transcribe` pays once are worth removing.
+        """
+        model = self.load()
+        audio = pcm_to_float(pcm)
+        duration = len(audio) / self.RATE
+        t0 = time.time()
+        segments, info = model.transcribe(
+            audio,
+            language=language or self.s.whisper_language,
+            vad_filter=vad,
+            beam_size=5,
+            initial_prompt=initial_prompt,
+            condition_on_previous_text=False,
+        )
+        segs = [Segment(s.start, s.end, s.text.strip()) for s in segments]
+        elapsed = time.time() - t0
+        return Transcript(
+            text=" ".join(s.text for s in segs).strip(),
+            language=info.language,
+            language_probability=float(info.language_probability),
+            # `info.duration` is what the VAD kept, which is not what was sent
+            # and would make the realtime factor flatter than the truth.
+            duration=duration,
+            seconds_taken=elapsed,
+            model=self.model_size,
+            segments=segs,
+        )
+
     # ---- the measurement the design doc asked for --------------------
     def benchmark(self, audio: Path | str | None = None,
                   sizes: tuple[str, ...] = ("tiny", "base", "small", "medium",
@@ -175,3 +212,105 @@ def _synth_sample(s: Settings) -> Path:
             w.setframerate(16000)
             w.writeframes(b"\x00\x00" * 16000 * 5)
     return path
+
+
+# ---- transcribing while he is still talking --------------------------------
+# The measurement that forced this: `large-v3` on Parsa's i7-1355U runs at
+# ~8x realtime, so 3.2 seconds of speech cost 25.5 seconds to transcribe — and
+# none of it started until the button was released and the whole WAV had been
+# uploaded. The model choice is one fix (`small` measures 1.09x on the same
+# clip); overlapping the work with the speaking is the other, and they compose.
+#
+# The phone already runs Silero VAD to find utterance boundaries for the wake
+# gate, so it can cut the recording at a silence and post each piece as it
+# closes. By the time the finger lifts, everything but the last piece has
+# already been through the model.
+#
+# Chunks are cut at silence *by the sender*, which is what makes this sound
+# rather than clever: whisper is being handed complete phrases, not a stream
+# sliced on a timer mid-word. `initial_prompt` carries the text so far, so the
+# decoder still has the sentence's history to condition on across a boundary.
+
+#: Below this a chunk is held rather than run, and this number is the whole
+#: design. Whisper pads *every* call to a 30-second mel window, so the encoder
+#: costs the same for 0.5s of audio as for 25s and N chunks means N encoder
+#: passes. Measured: cutting a 3.2s clip into four 1s pieces took 8.1s of
+#: compute against 1.6s for the same clip in one pass — five times the work,
+#: to overlap three seconds.
+#:
+#: So the rule is not "stream everything". It is: an utterance short enough to
+#: be one pass stays one pass and costs exactly what it costs today, and only
+#: a long dictation — where there is real speaking time to hide the work
+#: behind — gets cut. At 6 seconds a 25-second memo becomes four passes that
+#: finish as he talks, and a 4-second question stays one pass on release.
+MIN_CHUNK_SECONDS = 6.0
+
+
+def pcm_to_float(pcm: bytes):
+    """PCM16LE bytes → the float32 array faster-whisper wants.
+
+    Handing the model an array rather than a path is not a micro-optimisation
+    here: it removes the temp file *and* the ffmpeg subprocess from every
+    chunk, and this path runs several times per utterance instead of once.
+    """
+    import numpy as np
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+    return np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
+
+
+class Stream:
+    """One utterance, transcribed in pieces as they arrive.
+
+    Not thread-safe by construction and does not need to be: a single utterance
+    has one sender, and `httpapi` serialises whisper behind the same lock the
+    one-shot path uses.
+    """
+
+    def __init__(self, transcriber: "Transcriber", language: str | None = None):
+        self.t = transcriber
+        self.language = language
+        self.parts: list[str] = []
+        self.seconds = 0.0
+        self.compute_seconds = 0.0
+        self._held = b""          # too short to run on its own, yet
+
+    @property
+    def text(self) -> str:
+        return " ".join(p for p in self.parts if p).strip()
+
+    def push(self, pcm: bytes, *, final: bool = False) -> str:
+        """Add audio; returns the transcript so far.
+
+        A chunk shorter than [MIN_CHUNK_SECONDS] is held rather than run,
+        unless this is the last one — a held tail must never be silently
+        dropped, which is the bug this is written to not have. That also means
+        a short utterance runs exactly once, on `final`, which is the point:
+        this path must never be slower than not having it.
+        """
+        self._held += pcm
+        held_seconds = len(self._held) / 2 / Transcriber.RATE
+        if not final and held_seconds < MIN_CHUNK_SECONDS:
+            return self.text
+        if not self._held:
+            return self.text
+        audio, self._held = self._held, b""
+        self.seconds += len(audio) / 2 / Transcriber.RATE
+        # No `initial_prompt`. Feeding the text so far back in as a prompt is
+        # the obvious way to keep context across a boundary and it is a trap:
+        # measured, the decoder re-emitted the prompt as transcript, turning
+        # "Good evening sir. Report 4 is done." into "Report. What four is
+        # done. Good evening, sir." A chunk cut at a silence is a complete
+        # phrase and needs no help; a wrong word is cheaper than a duplicated
+        # sentence.
+        said = self.t.transcribe_pcm(audio, language=self.language)
+        self.compute_seconds += said.seconds_taken
+        if said.text.strip():
+            self.parts.append(said.text.strip())
+        return self.text
+
+    def summary(self) -> str:
+        rt = self.compute_seconds / self.seconds if self.seconds else 0.0
+        return (f"{self.seconds:.1f}s audio in {self.compute_seconds:.1f}s "
+                f"({rt:.2f}x realtime) · {len(self.parts)} chunks · "
+                f"{self.t.model_size}")

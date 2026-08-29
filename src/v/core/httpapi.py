@@ -55,6 +55,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -65,6 +66,7 @@ from .files import (ATTACH_LIMIT, file_meta, mime_for,
                     save_attachment, take_queued_files)
 from .config import Settings, settings as default_settings
 from . import persona as persona_mod
+from . import tts as tts_mod
 from .engine import Engine
 
 API_VERSION = 1
@@ -280,6 +282,15 @@ class _Bridge:
         self._stt_lock = threading.Lock()
         self._tts = None
         self._tts_lock = threading.Lock()
+        # Utterances being transcribed as they are spoken, and answers being
+        # synthesized as they are read. Both are keyed by an id the phone
+        # coins, both are swept by age, and both are deliberately in front of
+        # the engine thread rather than on it: whisper and Piper hold their own
+        # locks and must not queue behind a model turn that is still thinking.
+        self._streams: dict[str, tuple[float, "object"]] = {}
+        self._streams_lock = threading.Lock()
+        self._spools: dict[str, SpeechSpool] = {}
+        self._spools_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="v-http-engine")
         self._thread.start()
@@ -363,6 +374,61 @@ class _Bridge:
             with self._stt_lock:
                 return t.transcribe(wav).text.strip()
 
+    # ---- an utterance arriving in pieces ------------------------------
+    #: An abandoned utterance — the app was killed mid-sentence, the phone lost
+    #: the network — must not hold a transcript forever.
+    STREAM_TTL = 300.0
+
+    def stream(self, utt: str):
+        """The `stt.Stream` for this utterance, made on first sight."""
+        from . import stt
+        with self._streams_lock:
+            self._sweep_streams()
+            found = self._streams.get(utt)
+            if found is None:
+                found = (time.time(), stt.Stream(self.transcriber()))
+            self._streams[utt] = (time.time(), found[1])
+            return found[1]
+
+    def push_chunk(self, utt: str, pcm: bytes, *, final: bool) -> str:
+        """Transcribe one piece of a live utterance; returns the text so far.
+
+        Serialised on `_stt_lock` with the one-shot path, because it is the
+        same model object and faster-whisper does not promise otherwise.
+        """
+        st = self.stream(utt)
+        with self._stt_lock:
+            text = st.push(pcm, final=final)
+        if final:
+            with self._streams_lock:
+                self._streams.pop(utt, None)
+        return text
+
+    def _sweep_streams(self) -> None:
+        cutoff = time.time() - self.STREAM_TTL
+        for key in [k for k, (at, _) in self._streams.items() if at < cutoff]:
+            self._streams.pop(key, None)
+
+    # ---- an answer leaving in pieces ----------------------------------
+    def spool(self, turn: str, text: str) -> "SpeechSpool":
+        """Start synthesizing `text` now, to be read later by `/v1/say`.
+
+        Called on the request thread the moment a turn's words exist, so the
+        first sentence is already being made while the JSON is still on the
+        wire. That overlap is the whole point — see `SpeechSpool`.
+        """
+        with self._spools_lock:
+            cutoff = time.time() - SpeechSpool.TTL
+            for key in [k for k, v in self._spools.items() if v.born < cutoff]:
+                self._spools.pop(key, None)
+            made = SpeechSpool(self, text)
+            self._spools[turn] = made
+            return made
+
+    def spooled(self, turn: str) -> "SpeechSpool | None":
+        with self._spools_lock:
+            return self._spools.get(turn)
+
     def synth(self):
         with self._tts_lock:
             if self._tts is None:
@@ -376,12 +442,137 @@ class _Bridge:
             return self._tts
 
     def speak(self, text: str) -> bytes:
-        """OGG/Opus, because that is what a phone plays without transcoding."""
+        """OGG/Opus, because that is what a phone plays without transcoding.
+
+        The lock is held only for a synthesizer that says it needs it. Piper is
+        a loaded ONNX session and does need it; the hosted voice is an HTTP call
+        whose cost is a fixed round trip, and holding a global lock across that
+        is what made spooling an answer sentence-by-sentence *slower overall*
+        than synthesizing it in one call — measured, 10.9s against 7.0s for the
+        same three sentences. See `tts.RemoteSynthesizer.concurrency`.
+
+        `to_ogg_opus` is outside either branch: it shells out to ffmpeg, which
+        is a separate process per call and has never needed serialising.
+        """
         from . import tts
         m = self.synth()
-        with self._tts_lock:
-            audio = m.synthesize(text)   # MP3 if hosted, WAV if Piper
+        if getattr(m, "concurrency", 1) > 1:
+            audio = m.synthesize(text)
+        else:
+            with self._tts_lock:
+                audio = m.synthesize(text)   # MP3 if hosted, WAV if Piper
         return tts.to_ogg_opus(audio)
+
+
+# ---- speaking the answer before all of it exists --------------------------
+class SpeechSpool:
+    """One turn's answer, synthesized a sentence at a time, read as it fills.
+
+    The shape this replaces: the phone got the answer as JSON, then called
+    `POST /v1/speak`, which synthesized *the whole thing* and returned one blob.
+    Measured on Parsa's laptop that was ~4.4s against the hosted voice — a wait
+    that started only after V already knew every word it was going to say, and
+    that no amount of model choice fixes because it is the wrong shape.
+
+    Here the answer is split by `tts.sentences` and a worker starts on sentence
+    one the moment the turn exists — before the phone has even parsed the JSON.
+    The phone then reads frames off `GET /v1/say`, which blocks only until the
+    *next* sentence is ready rather than until the last one is. Time-to-first-
+    word stops scaling with the length of the answer.
+
+    Synthesis stays strictly in order and strictly serial. Out of order would
+    need reassembly on a phone for no gain, and parallel would need a
+    thread-safe Piper, which `PiperVoice` is not — the `_tts_lock` this takes
+    is the same one `_Bridge.speak` uses, for that reason.
+    """
+
+    #: A spool is dead weight once its turn has been spoken. Kept briefly
+    #: rather than dropped at EOF so a phone that lost the socket mid-answer
+    #: can ask again, and swept on the next turn rather than by a timer —
+    #: there is one user and turns are the only clock that matters.
+    TTL = 300.0
+
+    def __init__(self, bridge: "_Bridge", text: str):
+        self.parts: list[bytes] = []
+        self.done = threading.Event()
+        self.progress = threading.Condition()
+        self.error: str = ""
+        self.born = time.time()
+        self._bridge = bridge
+        self._chunks = tts_mod.sentences(for_speech(text))
+        if not self._chunks:
+            self.done.set()
+            return
+        # Out of order would need reassembly on a phone for no gain, so results
+        # are slotted by index and only ever *published* in order. How many are
+        # in flight at once is the synthesizer's call: Piper is one ONNX session
+        # and must stay serial, while the hosted voice is a fixed round trip per
+        # call and gets slower per sentence unless the trips overlap.
+        try:
+            width = int(getattr(bridge.synth(), "concurrency", 1))
+        except Exception:                   # noqa: BLE001 — no voice loaded yet
+            width = 1
+        self._slots: list[bytes | None] = [None] * len(self._chunks)
+        self._next = 0                      # the lowest index not yet published
+        self._claim = 0                     # the lowest index not yet started
+        self._lock = threading.Lock()
+        workers = max(1, min(width, len(self._chunks)))
+        self._running = workers
+        for n in range(workers):
+            threading.Thread(target=self._run, daemon=True,
+                             name=f"v-speech-spool-{n}").start()
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                i = self._claim
+                if i >= len(self._chunks):
+                    break
+                self._claim += 1
+            try:
+                audio = self._bridge.speak(self._chunks[i])
+            except Exception as exc:        # noqa: BLE001 — reported, not raised
+                # A voice that fails is not a turn that failed: the words are
+                # already on the phone's screen. Recorded so `/v1/say` can end
+                # the stream cleanly instead of hanging until the timeout.
+                self.error = _scrub(exc)
+                audio = b""
+            self._publish(i, audio)
+        with self.progress:
+            self._running -= 1
+            if self._running == 0:
+                self.done.set()
+            self.progress.notify_all()
+
+    def _publish(self, index: int, audio: bytes) -> None:
+        """Slot one result and release every frame now contiguous from the
+        front — so a sentence that finished early still waits its turn, and
+        one that finished late does not hold up the ones behind it twice."""
+        with self.progress:
+            self._slots[index] = audio
+            while (self._next < len(self._slots)
+                   and self._slots[self._next] is not None):
+                ready = self._slots[self._next]
+                if ready:               # a failed sentence is skipped, not sent
+                    self.parts.append(ready)
+                self._next += 1
+            self.progress.notify_all()
+
+    def frames(self, timeout: float = 120.0):
+        """Yield each sentence's OGG as it becomes ready, then stop."""
+        sent = 0
+        deadline = time.time() + timeout
+        while True:
+            with self.progress:
+                while len(self.parts) == sent and not self.done.is_set():
+                    if not self.progress.wait(max(0.0, deadline - time.time())):
+                        return
+                ready = self.parts[sent:]
+                sent += len(ready)
+            for frame in ready:
+                yield frame
+            if not ready and self.done.is_set():
+                return
 
 
 # ---- shaping a Response for the wire -------------------------------------
@@ -694,6 +885,35 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream(self, content_type: str):
+        """Open a chunked response and hand back a `write(bytes)`.
+
+        Chunked rather than `Connection: close` — which is what `h_events`
+        does — because unlike the event stream this runs once per turn, and
+        making the phone redo a TLS handshake for every answer would spend part
+        of the latency this endpoint exists to remove.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-V-Device", self._peer_cn())
+        self.end_headers()
+
+        def write(data: bytes) -> None:
+            if not data:
+                return
+            self.wfile.write(f"{len(data):x}\r\n".encode())
+            self.wfile.write(data)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+
+        def close() -> None:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+        return write, close
+
     def _json(self, obj: dict, status: int = 200) -> None:
         self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
@@ -744,6 +964,60 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": message, "status": status}, status=status)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+
+    # ---- finishing a turn ---------------------------------------------
+    def _speech(self, out: dict, query: dict) -> None:
+        """Start synthesizing this answer *now*, if the caller wants it spoken.
+
+        Opt-in on `?speak=1` rather than always: the widgets and the terminal
+        call these same endpoints and have no speaker, and warming Piper for
+        an answer nobody will hear is work done for nothing.
+
+        The spool is started here — on the request thread, before the JSON is
+        written — so sentence one is already being made while the response is
+        still travelling. The phone then reads `/v1/say?turn=<id>` and usually
+        finds the first frame waiting for it.
+        """
+        if (query.get("speak") or ["0"])[0] not in ("1", "true", "yes"):
+            return
+        words = out.get("spoken") or out.get("text") or ""
+        if not words.strip():
+            return
+        turn = uuid.uuid4().hex[:16]
+        try:
+            self.app.bridge.spool(turn, words)
+        except Exception:               # noqa: BLE001
+            return                      # no voice is not a failed turn
+        out["turn"] = turn
+
+    def _answer(self, text: str, query: dict, *,
+                message_type: str = "voice") -> None:
+        """Run a turn from a transcript and write the response.
+
+        Shared by `/v1/voice` and `/v1/voice/chunk` so the two paths cannot
+        drift: the streaming one is an optimisation of how the audio arrives,
+        not a different kind of turn, and every field the app renders — files,
+        transcript, the spooled voice — has to be identical either way.
+        """
+        if not text:
+            # Not an error: a held button with nothing said into it is an
+            # ordinary thing to do, and an error dialog for it trains you to
+            # dismiss dialogs.
+            self._json({"transcript": "", "text": "", "spoken": "",
+                        "state": "unsure", "empty": True,
+                        "buttons": [], "citations": []})
+            return
+
+        def _work(engine):
+            return (engine.handle(text, message_type=message_type),
+                    take_queued_files(engine))
+
+        resp, queued = self.app.bridge.call(_work)
+        out = payload(resp, self.app.s)
+        out["files"] = out["files"] + queued
+        out["transcript"] = text
+        self._speech(out, query)
+        self._json(out)
 
     # ---- endpoints ----------------------------------------------------
     def h_hello(self, query: dict) -> None:
@@ -815,6 +1089,7 @@ class _Handler(BaseHTTPRequestHandler):
         resp, queued = self.app.bridge.call(_work)
         out = payload(resp, self.app.s)
         out["files"] = out["files"] + queued
+        self._speech(out, query)
         self._json(out)
 
     def h_attach(self, query: dict) -> None:
@@ -927,23 +1202,63 @@ class _Handler(BaseHTTPRequestHandler):
                 detail = detail.decode("utf-8", "replace")
             raise ApiError(500, f"transcription failed: {_scrub(exc)}"
                                 f"{' — ' + detail.strip()[:200] if detail else ''}")
-        if not transcript:
-            # Not an error: a held button with nothing said into it is an
-            # ordinary thing to do, and an error dialog for it trains you to
-            # dismiss dialogs.
-            self._json({"transcript": "", "text": "", "spoken": "",
-                        "state": "unsure", "empty": True,
-                        "buttons": [], "citations": []})
-            return
-        def _work(engine):
-            return (engine.handle(transcript, message_type="voice"),
-                    take_queued_files(engine))
+        self._answer(transcript, query)
 
-        resp, queued = self.app.bridge.call(_work)
-        out = payload(resp, self.app.s)
-        out["files"] = out["files"] + queued
-        out["transcript"] = transcript
-        self._json(out)
+    def h_voice_chunk(self, query: dict) -> None:
+        """One piece of an utterance that is still being spoken.
+
+        The phone posts raw PCM16LE at 16kHz — what `AudioRecord` already hands
+        it — cut at a silence its VAD found. Everything but the last piece has
+        been through Whisper before the finger leaves the button, so the wait
+        at the end is one pass over the tail rather than one pass over all of
+        it. See `stt.Stream` for why the cuts have to be at silences and why
+        short utterances deliberately stay a single pass.
+
+        Non-final chunks return only the transcript so far. The final one runs
+        the turn, so the answer comes back on the same request that ended the
+        sentence — no extra round trip to start thinking.
+        """
+        utt = (query.get("utt") or [""])[0].strip()
+        if not utt or len(utt) > 64 or not utt.replace("-", "").isalnum():
+            raise ApiError(400, "utt must be a short alphanumeric id")
+        final = (query.get("final") or ["0"])[0] in ("1", "true", "yes")
+        pcm = self._body(limit=8 * 1024 * 1024)
+        if not pcm and not final:
+            raise ApiError(400, "empty chunk")
+        try:
+            transcript = self.app.bridge.push_chunk(utt, pcm, final=final)
+        except ImportError as exc:
+            raise ApiError(503, f"no speech engine installed: {_scrub(exc)}")
+        except Exception as exc:            # noqa: BLE001
+            from . import stt
+            if isinstance(exc, stt.Unavailable):
+                raise ApiError(503, f"no speech engine available: {_scrub(exc)}")
+            raise ApiError(500, f"transcription failed: {_scrub(exc)}")
+
+        if not final:
+            self._json({"transcript": transcript, "final": False})
+            return
+        self._answer(transcript, query)
+
+    def h_say(self, query: dict) -> None:
+        """The answer, one sentence of OGG at a time, as they are made.
+
+        Frames are length-prefixed rather than concatenated: OGG pages are
+        self-delimiting in theory and a phone would still have to demux them to
+        know when to hand one to a `MediaPlayer`, so four bytes of length is
+        both simpler and what the player actually wants.
+        """
+        turn = (query.get("turn") or [""])[0].strip()
+        spool = self.app.bridge.spooled(turn) if turn else None
+        if spool is None:
+            raise ApiError(404, "no such turn, or its audio has expired")
+        write, close = self._stream("application/octet-stream")
+        try:
+            for frame in spool.frames():
+                write(len(frame).to_bytes(4, "big") + frame)
+            close()
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+            pass                # he hung up, or hushed it; not worth a line
 
     def h_speak(self, query: dict) -> None:
         body = self._json_body()
@@ -971,6 +1286,7 @@ class _Handler(BaseHTTPRequestHandler):
         resp, queued = self.app.bridge.call(_work)
         out = payload(resp, self.app.s)
         out["files"] = out["files"] + queued
+        self._speech(out, query)
         self._json(out)
 
     def h_session_new(self, query: dict) -> None:
@@ -1125,6 +1441,8 @@ _ROUTES = {
     ("POST", "/v1/attach"): _Handler.h_attach,
     ("GET", "/v1/file"): _Handler.h_file,
     ("POST", "/v1/voice"): _Handler.h_voice,
+    ("POST", "/v1/voice/chunk"): _Handler.h_voice_chunk,
+    ("GET", "/v1/say"): _Handler.h_say,
     ("POST", "/v1/speak"): _Handler.h_speak,
     ("POST", "/v1/act"): _Handler.h_act,
     ("POST", "/v1/session/new"): _Handler.h_session_new,

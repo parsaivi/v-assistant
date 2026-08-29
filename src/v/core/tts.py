@@ -32,6 +32,7 @@ import io
 import json
 import re
 import subprocess
+import threading
 import tempfile
 import urllib.error
 import urllib.request
@@ -80,6 +81,15 @@ class Unavailable(RuntimeError):
 
 class Synthesizer:
     """Lazily loads the model — importing this module must stay cheap."""
+
+    #: How many sentences of one answer may be synthesized at once.
+    #:
+    #: One, here: Piper is a loaded ONNX session with mutable state and
+    #: `PiperVoice` makes no thread-safety promise. `httpapi._Bridge.speak`
+    #: reads this and keeps its lock held for anything that says 1, which is
+    #: what the lock was always for — the hosted voice is the case that
+    #: benefits from being let go of, and it says so itself below.
+    concurrency = 1
 
     def __init__(self, settings: Settings | None = None, voice: str | None = None):
         self.s = settings or default_settings
@@ -147,6 +157,9 @@ class MixedSynthesizer:
     at a time. Both voices share the config's sample rate (22050 Hz for
     every Piper "medium" model), so the runs' raw PCM frames concatenate
     directly with no resampling step."""
+
+    #: Two Piper voices behind one interface — still Piper, still one.
+    concurrency = 1
 
     def __init__(self, settings: Settings | None = None):
         self.s = settings or default_settings
@@ -275,6 +288,21 @@ class RemoteSynthesizer:
     `httpapi.py` both warm their synthesizer at startup and expect
     `Unavailable` there rather than on the first reply.
     """
+
+    #: Four at a time.
+    #:
+    #: This is a network call, not a model on this machine, and its cost is a
+    #: fixed round trip rather than work per character — measured, ~4.4s for a
+    #: sentence and ~5.0s for three words. Synthesizing an answer's sentences
+    #: one after another therefore pays that toll once per sentence: a
+    #: three-sentence answer measured 10.9s serial against 7.0s for the same
+    #: text in a single call, which would make streaming *slower overall* than
+    #: what it replaced while only slightly improving the first word.
+    #:
+    #: Overlapping them pays it once. Four rather than unbounded because the
+    #: answers are short and an unbounded fan-out is a way to get rate limited
+    #: by a provider for no gain past the first few.
+    concurrency = 4
 
     def __init__(self, settings: Settings | None = None,
                  model: str | None = None, voice: str | None = None):
@@ -433,11 +461,32 @@ class Fallback:
     warm up would turn a recoverable one into a dead voice path.
     """
 
+    @property
+    def concurrency(self) -> int:
+        """The *primary's*, because the backup protects itself.
+
+        The obvious answer is the lower of the two, and it is wrong: with Piper
+        installed — which is the normal state, it is the whole point of this
+        class — the floor is always 1, so the hosted voice would never overlap
+        its round trips and the thing this number exists to enable would never
+        happen on the machine it was written for.
+
+        What made the floor tempting is real, though: `synthesize` can degrade
+        to Piper at any sentence, and four workers told "go" on the strength of
+        the remote voice would then be four threads inside one ONNX session. So
+        the backup call takes a lock of its own below. That is a smaller and
+        more honest guarantee than lying about the primary's capacity.
+        """
+        return getattr(self.primary, "concurrency", 1)
+
     def __init__(self, primary, backup, *, on_fallback=None):
         self.primary = primary
         self.backup = backup
         self.on_fallback = on_fallback
         self.last_error = ""
+        # Held only around the backup. The primary may be running four wide at
+        # the same moment; these are different objects with different rules.
+        self._backup_lock = threading.Lock()
 
     @property
     def available(self) -> bool:
@@ -462,7 +511,8 @@ class Fallback:
             self.last_error = f"{type(exc).__name__}: {exc}"   # not a mute V
         if self.on_fallback:
             self.on_fallback(self.last_error)
-        return self.backup.synthesize(text)
+        with self._backup_lock:
+            return self.backup.synthesize(text)
 
 
 def synthesizer(settings: Settings | None = None, *, on_fallback=None):
@@ -520,3 +570,74 @@ def to_ogg_opus(wav_bytes: bytes) -> bytes:
             check=True, capture_output=True,
         )
         return dst.read_bytes()
+
+
+# ---- speaking before the sentence after it exists --------------------------
+# The phone used to wait for the whole answer to be synthesized before a word
+# of it played: `POST /v1/voice` returned text, the app then called
+# `POST /v1/speak`, and that call took ~4.4s against the hosted voice for a
+# two-sentence answer. Measured on Parsa's laptop, the whole phone turn was
+# ~35-46s and this was the last 4.4 of it, spent entirely after V already knew
+# what it was going to say.
+#
+# Splitting into sentences turns that from a wait into a pipeline: sentence one
+# is ~40 chars, synthesizes in a fraction of the time the whole answer takes,
+# and plays while the rest is still being made. What the ear hears is the time
+# to the *first* sentence, which is the number that actually matters.
+
+#: Sentence-final punctuation in both scripts the vault uses. `؟` and `،` are
+#: the Persian question mark and comma — the comma is deliberately absent, it
+#: does not end a sentence any more than the Latin one does.
+_SENTENCE_END = re.compile(r"(?<=[.!?؟…])[\s‌]+")
+
+#: Below this a chunk is a fragment, not a sentence — "Yes." or "Right." — and
+#: is glued to the next one. Above it, chunks stand alone. The exception is the
+#: first chunk of an answer, which is allowed to be short: that one is the
+#: whole point, and "Three up now." arriving in 300ms beats a rounder sentence
+#: arriving in two seconds.
+MIN_CHUNK_CHARS = 45
+
+#: A ceiling, so a sentence nobody punctuated cannot become one enormous
+#: synthesis call that defeats the purpose. Split on a space near the limit
+#: rather than mid-word.
+MAX_CHUNK_CHARS = 320
+
+
+def sentences(text: str) -> list[str]:
+    """Split an answer into speakable chunks, first one deliberately short.
+
+    Not a general sentence tokenizer and must not become one: it is fed V's own
+    answers, it never sees an abbreviation-dense legal document, and the cost
+    of a wrong split is one slightly odd pause rather than a wrong word. The
+    rule that earns its keep is the *first* chunk standing alone even when
+    short, because time-to-first-audio is the only latency the ear can hear.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    raw = [p.strip() for p in _SENTENCE_END.split(text) if p.strip()]
+    if not raw:
+        return []
+
+    # Long chunks get broken at a space rather than left to become one big
+    # synthesis call.
+    split: list[str] = []
+    for chunk in raw:
+        while len(chunk) > MAX_CHUNK_CHARS:
+            cut = chunk.rfind(" ", 0, MAX_CHUNK_CHARS)
+            if cut <= 0:
+                cut = MAX_CHUNK_CHARS
+            split.append(chunk[:cut].strip())
+            chunk = chunk[cut:].strip()
+        if chunk:
+            split.append(chunk)
+
+    # Glue fragments forward — but never the first one, which is allowed to be
+    # as short as it likes.
+    out: list[str] = []
+    for i, chunk in enumerate(split):
+        if out and i > 1 and len(out[-1]) < MIN_CHUNK_CHARS:
+            out[-1] = f"{out[-1]} {chunk}"
+        else:
+            out.append(chunk)
+    return out
