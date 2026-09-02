@@ -894,11 +894,85 @@ def vault_map(category: str | None = None, min_rating: int | None = None,
                        "category": r.get("category"), "rating": r.get("rating")})
     if not points:
         return "No places with a recorded location matched."
-    page = render.map_html(points, title="Places")
+    # Live tiles when there's a web key, the offline SVG scatter when there
+    # isn't — the second is worse to look at but works with no network, so
+    # it stays the fallback rather than being deleted.
+    if S.neshan_web_key:
+        page = render.place_html(points, web_key=S.neshan_web_key, title="Places")
+    else:
+        page = render.map_html(points, title="Places")
     path = render.save(page, slug="places-map", settings=S)
     render.open_file(path)
     sent = _send_to_telegram(path, caption="Places")
     return (f"Opened a map of {len(points)} places in your browser ({path})."
+           + (" Sent it to Telegram too." if sent else ""))
+
+
+@mcp.tool(
+    description=(
+        "How long it takes to get from one place to another, and a map of "
+        "the route, opened in the browser. `origin` and `destination` are "
+        "each a place note's name ('Divar', 'Home', 'Rooberoo Mansion "
+        "Tajrish') or a raw 'lat,lng' — same resolution as vault_query's "
+        "`near`. Returns the distance and time as text AND opens the drawn "
+        "route, so give the numbers in your reply and say the map is open; "
+        "don't describe the route's shape.\n\n"
+        "`mode` is 'car' or 'motorcycle'. THERE IS NO TRANSIT OR WALKING "
+        "MODE — Neshan does not offer one. If Parsa asks how long by metro "
+        "or on foot, say plainly that you can't route it and that the number "
+        "you're giving is an estimate; never pass it off as a routing "
+        "result. Tehran's طرح ترافیک and زوج/فرد restrictions are avoided by "
+        "default, so the route returned is one he can actually drive.\n\n"
+        "If this reports no API key configured, say the distance is an "
+        "estimate rather than quietly guessing a number that looks measured."
+    )
+)
+def vault_route(origin: str, destination: str, mode: str = "car") -> str:
+    a = E().q.resolve_anchor(origin)
+    if a is None:
+        return _err(f"don't know where {origin!r} is — no place note by that "
+                    "name and it doesn't parse as \"lat,lng\" either.")
+    b = E().q.resolve_anchor(destination)
+    if b is None:
+        return _err(f"don't know where {destination!r} is — no place note by "
+                    "that name and it doesn't parse as \"lat,lng\" either.")
+    o_lat, o_lng, o_label = a
+    d_lat, d_lng, d_label = b
+    try:
+        route = mapsearch.route((o_lat, o_lng), (d_lat, d_lng),
+                                origin_label=o_label, dest_label=d_label,
+                                mode=mode, settings=S)
+    except mapsearch.MapSearchError as exc:
+        return _err(str(exc))
+    if route is None:
+        return (f"Routing isn't configured (no NESHAN_API_KEY), so there is "
+                f"no measured time from {o_label} to {d_label}. Say any "
+                f"number you give is an estimate, and don't call it a "
+                f"routing result.")
+
+    # Three surfaces, three artifacts, because no single one serves all of
+    # them. The browser gets a real interactive map (Google's — neshan.org
+    # cannot be deep-linked, see `mapsearch.directions_url`). Telegram gets a
+    # PNG, which it shows inline where an .html would arrive as a download.
+    slug = f"route-{o_label}-{d_label}"
+    render.open_url(mapsearch.directions_url((o_lat, o_lng), (d_lat, d_lng),
+                                             mode=mode))
+    try:
+        png = render.route_png(route, settings=S)
+    except mapsearch.MapSearchError:
+        png = None                      # static-map service not on the key
+    sent = False
+    if png:
+        png_path = render.save_bytes(png, slug=slug, settings=S)
+        sent = _send_to_telegram(
+            png_path, caption=f"{o_label} → {d_label} · {route.distance_km} km, "
+                              f"{route.duration_min} min")
+
+    via = f" via {route.summary}" if route.summary else ""
+    return (f"{o_label} → {d_label}: {route.distance_km} km, "
+            f"{route.duration_min} min by {route.mode}{via} (current "
+            f"traffic, avoiding طرح ترافیک and زوج/فرد). Opened it on the "
+            f"map."
            + (" Sent it to Telegram too." if sent else ""))
 
 
@@ -1477,6 +1551,148 @@ def vault_rewrite(rel: str, content: str, summary: str | None = None) -> str:
         return _err(str(exc))
     return (f"rewrote {rel}\ncommit: {change.commit or '(git off)'}"
             f"\nundo with: vault_undo(commit='{change.commit}')")
+
+
+# --- Quera ------------------------------------------------------------------
+# University deadlines were the one capability that existed everywhere except
+# here: `cli.py` has `v quera sync`, `scheduler.py` runs it at 06:45 nightly,
+# and the assignment notes it writes are queryable through `vault_query`. What
+# was missing was any way for the *agent* to find that out, so every question
+# about whether the deadlines were current was answered by guessing — and it
+# guessed wrong in both directions on record, once inventing "no Quera access
+# is set up for me" while the notes it was about to be asked for had been
+# synced five days earlier, and once reporting the sync unverifiable because
+# Quera is not listed in `Authenticated Sites`. It isn't listed there because
+# it does not need a browser: it has a saved cookie and a module of its own.
+#
+# Split in two rather than given an `action` parameter, because the halves have
+# different postures: status reads Quera and reports the diff, and belongs on
+# every run; sync creates notes, and belongs behind the write flag with the
+# other mutations.
+
+
+def _quera():
+    from ..core import quera as quera_mod
+    return quera_mod.Quera(S, _vault)
+
+
+def _quera_lines(q, deadlines) -> list[str]:
+    """The live list, each line said against what the vault already holds.
+
+    `q._assignment_note` rather than a path built here on purpose: the note's
+    filename is the sync's own identity rule, and a second copy of it in this
+    file is a second copy that drifts.
+    """
+    from ..core.quera import _s
+
+    out = []
+    for a in deadlines:
+        rel, _, _ = q._assignment_note(a)
+        due = a.due_at.date().isoformat() if a.due_at else "no date"
+        if not _vault.exists(rel):
+            state = "NOT IN THE VAULT"
+        else:
+            meta = _vault.read(rel).meta
+            have, status = _s(meta.get("due-date")), _s(meta.get("status")) or "?"
+            state = (f"in the vault · status {status}"
+                     + ("" if have == due else f" · due-date says {have}"))
+        out.append(f"- {a.course} — {a.title} · due {due} · {state}")
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Quera deadline sync: whether it is configured, when the nightly job "
+        "last ran, what Quera lists right now, and whether the vault matches. "
+        "Reads only — it never writes a note.\n\n"
+        "Call this before saying ANYTHING about whether Parsa's university "
+        "deadlines are up to date. The sync runs on its own at 06:45 daily, so "
+        "the default assumption is that they ARE current; never tell him you "
+        "have no Quera access without calling this first and reading what it "
+        "says. Assignment notes themselves are read with "
+        "vault_query(kind='assignments').\n\n"
+        "Note what Quera can and cannot tell you: the payload behind this is "
+        "the site's own deadline widget, which carries only deadlines still "
+        "open. An assignment already submitted, or one whose deadline has "
+        "passed, is simply absent — so 'not in this list' means 'not "
+        "outstanding on Quera', never 'does not exist'. Those have to be added "
+        "by hand."
+    )
+)
+def vault_quera_status() -> str:
+    from ..core import scheduler as scheduler_mod
+    from ..core import quera as quera_mod
+
+    q = _quera()
+    last = scheduler_mod.last_run(scheduler_mod.QUERA_JOB, S)
+    head = [
+        f"cookie configured: {'yes' if q.configured() else 'no'}",
+        f"nightly job (06:45): "
+        + (last.strftime("last ran %Y-%m-%d %H:%M") if last else "no record"),
+    ]
+    if not q.configured():
+        return "\n".join(head + [
+            "", "No saved session, so nothing has been pulled. Parsa "
+            "re-authorises it himself with `v quera auth --cookie '...'` — "
+            "you cannot do it for him, and there is no browser login here."])
+    try:
+        deadlines = q.fetch_deadlines()
+    except quera_mod.NotAuthorised as exc:
+        return "\n".join(head + ["", _err(
+            f"{exc}\nOnly Parsa can fix this: `v quera auth --cookie '...'`.")])
+    except quera_mod.QueraError as exc:
+        return "\n".join(head + ["", _err(str(exc))])
+
+    if not deadlines:
+        return "\n".join(head + [
+            "", "Quera lists no open deadlines at all. That is a real "
+            "outcome — everything submitted or past — not a failure."])
+    body = _quera_lines(q, deadlines)
+    drift = [l for l in body if "NOT IN THE VAULT" in l or "due-date says" in l]
+    tail = ("in sync — every open Quera deadline already has its note"
+            if not drift else
+            f"{len(drift)} of {len(body)} out of sync; vault_quera_sync writes them")
+    return "\n".join(head + ["", f"Quera lists {len(deadlines)} open deadline(s):"]
+                      + body + ["", tail])
+
+
+@mcp.tool(
+    description=(
+        "Run the Quera deadline sync now: create the assignment notes Quera "
+        "lists that the vault is missing, and correct a `due-date` that has "
+        "moved. Never touches a note's body or its `status`, so work Parsa "
+        "has already written down is safe.\n\n"
+        "Call vault_quera_status first — usually it reports everything already "
+        "in sync, because the nightly job at 06:45 has done it, and then this "
+        "is not needed. Marking an assignment done is NOT this tool's job: "
+        "that is a frontmatter change and only EDITH can make it."
+    )
+)
+def vault_quera_sync() -> str:
+    from ..core import quera as quera_mod
+
+    q = _quera()
+    if not q.configured():
+        return _err("no Quera session saved — Parsa runs "
+                    "`v quera auth --cookie '...'` himself.")
+    try:
+        report = q.sync(dry_run=False)
+    except quera_mod.QueraError as exc:
+        return _err(str(exc))
+    if report.get("error"):
+        return _err(report["error"])
+    created, updated = report["created"], report["updated"]
+    if not created and not updated:
+        return (f"Already in sync — {report['skipped']} deadline(s) checked, "
+                "nothing to write.")
+    lines = []
+    if created:
+        lines += [f"created {len(created)}:"] + [f"- {r}" for r in created]
+    if updated:
+        lines += [f"updated {len(updated)}:"] + [
+            f"- {u['rel']} — {u['changes']}" for u in updated]
+    lines.append(f"({report['skipped']} already current)")
+    return "\n".join(lines)
 
 
 def main() -> None:

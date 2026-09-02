@@ -378,6 +378,20 @@ class Settings:
     # or Neshan's own site instead of failing outright.
     neshan_api_key: str = field(
         default_factory=lambda: os.environ.get("NESHAN_API_KEY", ""))
+    # The *other* Neshan key, and it is genuinely a different string from the
+    # same panel: `neshan_api_key` is the service key sent as an `Api-Key`
+    # header by `/v1/search` and `/v4/direction`, while this one is the web
+    # key the map SDK takes as a `key` option. `render.route_html` embeds it
+    # in the page it writes, so it is only ever as private as that file.
+    # Empty means the map pages still get written but load blank tiles — the
+    # route and the pins draw, the streets under them don't.
+    neshan_web_key: str = field(
+        default_factory=lambda: os.environ.get("NESHAN_WEB_KEY", ""))
+    # Which map vendor `mapsearch` talks to. One value today; it exists so
+    # that adding a second (Google's Places/Routes, which need a billing
+    # account Parsa doesn't have) is a new branch in `mapsearch` rather than
+    # an edit to every tool that calls it.
+    maps_provider: str = "neshan"
 
     # --- who V is ----------------------------------------------------------
     # The character V wears: how it speaks, and which voice reads the replies

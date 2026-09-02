@@ -367,9 +367,24 @@ READ_TOOLS = [
     # file rather than returning anything the model has to reformat — see
     # `mcp/server.py`'s module docstring and `core/render.py`.
     "mcp__vault__vault_chart", "mcp__vault__vault_trend", "mcp__vault__vault_map",
+    # Directions between two places, plus the drawn route. Read-only in the
+    # same way the charts are — it opens a page and returns a sentence. Here
+    # rather than behind the write flag because the failure this prevents is
+    # the one on record: asked how long Divar → Tajrish takes with no routing
+    # tool in reach, V estimated "20-35 minutes" and correctly labelled it a
+    # guess. A guess was the best answer available; it shouldn't have been.
+    "mcp__vault__vault_route",
     # Live POI search (Neshan), for places not yet in the vault. Read-only —
     # nothing is saved without going through vault_create separately.
     "mcp__vault__vault_places_search",
+    # Whether the university deadlines are current. Read-only: it fetches
+    # Quera's open-deadline list and diffs it against the assignment notes,
+    # writing nothing. On every run rather than behind the write flag for the
+    # same reason `gcal_events` is — without a tool to reach for, "are my
+    # deadlines synced?" gets answered by guessing, and the two guesses on
+    # record were "no Quera access is set up for me" and "I cannot verify the
+    # live Quera sync", both said about a sync that had run that morning.
+    "mcp__vault__vault_quera_status",
     "Read", "Grep", "Glob",
 ] + BROWSER_TOOLS
 WRITE_TOOLS = [
@@ -399,6 +414,11 @@ WRITE_TOOLS = [
     # they cannot override after them, so the worst a bad write does is spend
     # one of eight slots until Parsa drops it.
     "mcp__vault__vault_voice_learn", "mcp__vault__vault_voice_forget",
+    # Running the deadline sync on demand. It creates assignment notes, so it
+    # is a write like any other — append-only, committed, undoable. Rarely
+    # needed: the 06:45 job usually got there first, which is what
+    # `vault_quera_status` is for saying.
+    "mcp__vault__vault_quera_sync",
     # Pushing a vault file out to Telegram. It writes nothing, but it is the
     # only tool here that puts note content on someone else's server, and
     # there is no recalling a sent message — so it sits behind the write flag

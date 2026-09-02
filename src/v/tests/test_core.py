@@ -358,6 +358,295 @@ def mapsearch_parses_hits_and_ranks_by_distance():
         shutil.rmtree(root)
 
 
+@test
+def polyline_decoding_matches_the_published_reference_vector():
+    """Google's own worked example from the encoded-polyline spec, which is
+    the format Neshan emits and OpenLayers reads. Pinned to the reference
+    rather than to a Neshan response so a vendor outage can't quietly turn
+    this into a test of nothing."""
+    pts = mapsearch.decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@")
+    eq([(round(a, 5), round(b, 5)) for a, b in pts],
+       [(38.5, -120.2), (40.7, -120.95), (43.252, -126.453)])
+    eq(mapsearch.decode_polyline(""), [], "an empty polyline is not a crash")
+    # A truncated payload is what a clipped response looks like; keep the
+    # prefix that parsed rather than losing the whole route to a ValueError.
+    ok(len(mapsearch.decode_polyline("_p~iF~ps|U_ulLnnqC_mqN")) >= 2)
+
+
+@test
+def route_returns_none_without_an_api_key():
+    root, s = make_vault()
+    try:
+        eq(s.neshan_api_key, "", "fixture settings must not pick up a real key")
+        ok(mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s) is None,
+           "no key means 'not available', which the tool turns into 'say it "
+           "is an estimate' — not a silently fabricated duration")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def route_sums_legs_and_avoids_tehrans_restricted_zones():
+    """Two things at once, because they fail the same way — silently, with a
+    number that looks right. A waypointed route reports per leg, so reading
+    `legs[0]` answers a question nobody asked; and a route through طرح ترافیک
+    is one Parsa cannot legally drive, which is the single capability no
+    other vendor offers and the reason Neshan stays primary."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        payload = {"routes": [{
+            "overview_polyline": {"points": "_p~iF~ps|U_ulLnnqC"},
+            "legs": [
+                {"summary": "ولیعصر", "distance": {"value": 4000.0},
+                 "duration": {"value": 600.0}},
+                {"summary": "تجریش", "distance": {"value": 2500.0},
+                 "duration": {"value": 450.0}},
+            ]}]}
+        resp = mock.Mock()
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        with mock.patch("httpx.get", return_value=resp) as got:
+            r = mapsearch.route((35.6997, 51.3376), (35.8044, 51.4337),
+                                origin_label="Divar", dest_label="Rooberoo",
+                                settings=s)
+        params = got.call_args.kwargs["params"]
+        eq(got.call_args.kwargs["headers"]["Api-Key"], "test-key")
+        eq(params["avoidTrafficZone"], "true", "طرح ترافیک must be avoided")
+        eq(params["avoidOddEvenZone"], "true", "زوج/فرد must be avoided")
+        eq(params["origin"], "35.6997,51.3376")
+        eq(r.distance_m, 6500.0, "both legs, not just the first")
+        eq(r.duration_s, 1050.0)
+        eq(r.distance_km, 6.5)
+        eq(r.duration_min, 18)
+        eq(r.summary, "ولیعصر · تجریش")
+        eq(r.polyline, "_p~iF~ps|U_ulLnnqC",
+           "the encoded string is kept verbatim — OpenLayers decodes it")
+        ok(len(r.points) == 2, "and decoded too, for centring the map")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def route_refuses_the_modes_neshan_cannot_do():
+    """The failure this prevents is a metro question answered with a car
+    route wearing the authority of a measurement. Neshan has no transit mode
+    at any tier, so the honest move is to refuse rather than substitute."""
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        for mode in ("transit", "walking", "bicycle"):
+            try:
+                mapsearch.route((35.7, 51.4), (35.8, 51.4), mode=mode,
+                                settings=s)
+                raise AssertionError(f"{mode} should not have been routed")
+            except mapsearch.MapSearchError as exc:
+                ok(mode in str(exc), "the error must name the mode refused")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_place_name_cannot_break_out_of_the_map_pages_javascript():
+    """Place labels are vault prose and land inside a <script>. An apostrophe
+    in "Sam's Cafe" is the benign version; `</script>` is the other one."""
+    points = [{"label": "Sam's Cafe </script><img onerror=x>", "lat": 35.7,
+               "lng": 51.4, "category": "cafe"},
+              {"label": 'He said "hi"', "lat": 35.8, "lng": 51.5}]
+    page = render.place_html(points, web_key="web-key-123")
+    tail = page.split("<script>")[-1]
+    ok("</script><img" not in tail, "the closing tag must be escaped in JS")
+    ok("web-key-123" in page, "the web key is embedded — it has to be")
+
+
+@test
+def route_prefers_step_geometry_over_the_coarse_overview():
+    """`overview_polyline` is a simplification — 22 points for a 7km Tehran
+    route, which visibly cuts corners when drawn over real streets, where the
+    per-step polylines give 210. Drawing the summary shape and calling it the
+    route is the kind of wrong that looks fine until you follow it."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        payload = {"routes": [{
+            "overview_polyline": {"points": "_p~iF~ps|U"},          # 1 point
+            "legs": [{"distance": {"value": 100.0}, "duration": {"value": 60.0},
+                      "steps": [{"polyline": "_p~iF~ps|U_ulLnnqC"},   # 2
+                                {"polyline": "_p~iF~ps|U_ulLnnqC_mqNvxq`@"}]}]}]}
+        resp = mock.Mock()
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        with mock.patch("httpx.get", return_value=resp):
+            r = mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s)
+        eq(len(r.points), 5, "every step's geometry, concatenated")
+        eq(r.polyline, "_p~iF~ps|U",
+           "the overview is still carried, just not what gets drawn")
+
+        # A response with legs but no steps must still draw something.
+        payload["routes"][0]["legs"][0]["steps"] = []
+        with mock.patch("httpx.get", return_value=resp):
+            r2 = mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s)
+        eq(len(r2.points), 1, "falls back to the overview rather than nothing")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def the_route_png_lands_on_the_tiles_it_asked_for():
+    """The PNG is a composite: Neshan draws the streets, this draws the route
+    on top, and nothing checks they agree. They agree only if the Mercator
+    maths here matches the tiles' own — so pin the projection, and pin that
+    the centre of the fetched image is the centre of the route's bounding box.
+    """
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        # Zoom 0 is one 256px tile of the whole world; (0,0) sits dead centre.
+        x, y = mapsearch.mercator_px(0.0, 0.0, 0)
+        eq((round(x, 6), round(y, 6)), (128.0, 128.0))
+        # Doubling the zoom doubles the world.
+        x1, _ = mapsearch.mercator_px(0.0, 180.0, 1)
+        eq(round(x1, 6), 512.0)
+
+        pts = [(35.76, 51.41), (35.80, 51.43)]
+        r = mapsearch.Route("A", "B", "car", 1000.0, 600.0, "", "", pts)
+        asked = {}
+
+        def fake_static(lat, lng, zoom, width, height, settings=None):
+            asked.update(lat=lat, lng=lng, zoom=zoom, w=width, h=height)
+            from PIL import Image
+            import io
+            buf = io.BytesIO()
+            Image.new("RGBA", (width, height), (200, 200, 200, 255)).save(buf, "PNG")
+            return buf.getvalue()
+
+        with mock.patch.object(mapsearch, "static_map", fake_static):
+            png = render.route_png(r, settings=s)
+        ok(png.startswith(b"\x89PNG"), "a PNG, not an HTML error page")
+        eq(round(asked["lat"], 4), 35.78, "centred on the route, not an endpoint")
+        eq(round(asked["lng"], 4), 51.42)
+        ok(5 <= asked["zoom"] <= 19, "Neshan rejects zoom outside 5-19")
+
+        # No key means no tiles means no picture — never a broken one.
+        s.neshan_api_key = ""
+        ok(render.route_png(r, settings=s) is None)
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def directions_open_a_real_map_because_neshan_cannot_be_deep_linked():
+    """neshan.org rewrites its own URL and then ignores it on a cold load —
+    both `/routing/car/origin/<latlng>/destination/<latlng>` and a bare
+    `#c<lat>-<lng>-<zoom>z` reset to Tehran centre, verified in a browser on
+    2026-09-02. Google's documented `api=1` form is what's left, and it needs
+    no key. Pinned so a "tidy-up" back to the path form gets caught."""
+    url = mapsearch.directions_url((35.6997, 51.3376), (35.8044, 51.4337))
+    ok(url.startswith("https://www.google.com/maps/dir/?api=1"), url)
+    ok("origin=35.6997,51.3376" in url and "destination=35.8044,51.4337" in url)
+    ok("travelmode=driving" in url)
+    ok("walking" in mapsearch.directions_url((0, 0), (1, 1), mode="walking"))
+    # Motorcycle has no Google equivalent; it must not silently vanish.
+    ok("driving" in mapsearch.directions_url((0, 0), (1, 1), mode="motorcycle"))
+
+
+@test
+def route_prefers_step_geometry_over_the_coarse_overview():
+    """`overview_polyline` is a simplification — 22 points for a 7km Tehran
+    route, which visibly cuts corners when drawn over real streets, where the
+    per-step polylines give 210. Drawing the summary shape and calling it the
+    route is the kind of wrong that looks fine until you follow it."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        payload = {"routes": [{
+            "overview_polyline": {"points": "_p~iF~ps|U"},          # 1 point
+            "legs": [{"distance": {"value": 100.0}, "duration": {"value": 60.0},
+                      "steps": [{"polyline": "_p~iF~ps|U_ulLnnqC"},   # 2
+                                {"polyline": "_p~iF~ps|U_ulLnnqC_mqNvxq`@"}]}]}]}
+        resp = mock.Mock()
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        with mock.patch("httpx.get", return_value=resp):
+            r = mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s)
+        eq(len(r.points), 5, "every step's geometry, concatenated")
+        eq(r.polyline, "_p~iF~ps|U",
+           "the overview is still carried, just not what gets drawn")
+
+        # A response with legs but no steps must still draw something.
+        payload["routes"][0]["legs"][0]["steps"] = []
+        with mock.patch("httpx.get", return_value=resp):
+            r2 = mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s)
+        eq(len(r2.points), 1, "falls back to the overview rather than nothing")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def the_route_png_lands_on_the_tiles_it_asked_for():
+    """The PNG is a composite: Neshan draws the streets, this draws the route
+    on top, and nothing checks they agree. They agree only if the Mercator
+    maths here matches the tiles' own — so pin the projection, and pin that
+    the centre of the fetched image is the centre of the route's bounding box.
+    """
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        # Zoom 0 is one 256px tile of the whole world; (0,0) sits dead centre.
+        x, y = mapsearch.mercator_px(0.0, 0.0, 0)
+        eq((round(x, 6), round(y, 6)), (128.0, 128.0))
+        # Doubling the zoom doubles the world.
+        x1, _ = mapsearch.mercator_px(0.0, 180.0, 1)
+        eq(round(x1, 6), 512.0)
+
+        pts = [(35.76, 51.41), (35.80, 51.43)]
+        r = mapsearch.Route("A", "B", "car", 1000.0, 600.0, "", "", pts)
+        asked = {}
+
+        def fake_static(lat, lng, zoom, width, height, settings=None):
+            asked.update(lat=lat, lng=lng, zoom=zoom, w=width, h=height)
+            from PIL import Image
+            import io
+            buf = io.BytesIO()
+            Image.new("RGBA", (width, height), (200, 200, 200, 255)).save(buf, "PNG")
+            return buf.getvalue()
+
+        with mock.patch.object(mapsearch, "static_map", fake_static):
+            png = render.route_png(r, settings=s)
+        ok(png.startswith(b"\x89PNG"), "a PNG, not an HTML error page")
+        eq(round(asked["lat"], 4), 35.78, "centred on the route, not an endpoint")
+        eq(round(asked["lng"], 4), 51.42)
+        ok(5 <= asked["zoom"] <= 19, "Neshan rejects zoom outside 5-19")
+
+        # No key means no tiles means no picture — never a broken one.
+        s.neshan_api_key = ""
+        ok(render.route_png(r, settings=s) is None)
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def directions_open_a_real_map_because_neshan_cannot_be_deep_linked():
+    """neshan.org rewrites its own URL and then ignores it on a cold load —
+    both `/routing/car/origin/<latlng>/destination/<latlng>` and a bare
+    `#c<lat>-<lng>-<zoom>z` reset to Tehran centre, verified in a browser on
+    2026-09-02. Google's documented `api=1` form is what's left, and it needs
+    no key. Pinned so a "tidy-up" back to the path form gets caught."""
+    url = mapsearch.directions_url((35.6997, 51.3376), (35.8044, 51.4337))
+    ok(url.startswith("https://www.google.com/maps/dir/?api=1"), url)
+    ok("origin=35.6997,51.3376" in url and "destination=35.8044,51.4337" in url)
+    ok("travelmode=driving" in url)
+    ok("walking" in mapsearch.directions_url((0, 0), (1, 1), mode="walking"))
+    # Motorcycle has no Google equivalent; it must not silently vanish.
+    ok("driving" in mapsearch.directions_url((0, 0), (1, 1), mode="motorcycle"))
+
+
+
 # --- gmail -------------------------------------------------------------
 class _FakeHTTPResponse:
     """Stands in for what `urllib.request.urlopen(...)` returns when used as
@@ -1675,6 +1964,29 @@ def a_session_records_both_halves_and_files_itself_on_close():
 
         eq(e.end_session("quit", now=dt.datetime(2026, 8, 1, 9, 6)), None,
            "closing twice must not file a second copy")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_new_session_does_not_inherit_the_previous_thread():
+    """`hermes._sticky` suspends the cold-thread expiry while *a* session is
+    open, not while the session that opened the thread is. Without a reset at
+    `start_session`, a thread nothing ever closed — a Telegram message, a
+    crashed repl — is adopted by the next session however old it is, and the
+    real one grew to 240K tokens across two days and two surfaces before the
+    persona washed out of it.
+    """
+    root, s = make_vault()
+    try:
+        e = Engine(s)
+        # A thread left behind by something that never ended cleanly.
+        e.hermes._save({"session_id": "39abbf9e",
+                        "last_used": "2026-09-01T20:28:42"})
+
+        e.start_session(now=dt.datetime(2026, 9, 2, 13, 46))
+        eq(e.hermes.current_session(dt.datetime(2026, 9, 2, 13, 46)), None,
+           "a new session starts a new thread, not yesterday's")
     finally:
         shutil.rmtree(root)
 
