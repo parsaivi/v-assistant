@@ -257,11 +257,32 @@ class Engine:
     def start_session(self, now: dt.datetime | None = None) -> list:
         """Begin a conversation. Returns recaps of any left open by a previous
         run — flushed first, so they land in their own day's log rather than
-        being folded into this one."""
+        being folded into this one.
+
+        Dropping the thread here is the other half of `end_session`'s, and it
+        is the half that holds when nothing was ended cleanly. `hermes._sticky`
+        suspends the cold-thread expiry for as long as *a* session is open —
+        not for as long as the session that opened the thread is open — so any
+        thread still named in `state/hermes.json` when a session starts is
+        adopted by it, however old and whoever created it. Measured: a Telegram
+        message at 20:28 opened thread `39abbf9e`; no session was open, so
+        nothing ever ended and nothing reset it; `v repl` seventeen hours later
+        resumed that thread and grew it to 240K tokens, at which point the
+        persona had washed out of the far end of the context and V answered in
+        the CLI's own voice, from beliefs formed on a different surface the
+        previous day.
+
+        With this, a thread can only ever be extended past the expiry by the
+        session it was created in, which is what `_sticky` was always meant to
+        say. The cost is one cold prefix per session — the same cost `/new`
+        already pays, and much less than re-reading a day-old transcript on
+        every turn.
+        """
         filed = []
         for orphan in self.sessions.orphans(now):
             self.journal.session(orphan)
             filed.append(orphan)
+        self.hermes.reset()
         self.sessions.start(now)
         return filed
 

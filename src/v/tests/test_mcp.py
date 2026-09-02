@@ -11,12 +11,16 @@ catches it — the model just quietly gets more than it should.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import json
 import os
 # Never let a test spend plan allowance or 9s on a model call. The
 # decider ships enabled, and every fixture here builds a real
 # Settings, so this has to be set before v.core is imported.
 os.environ["BRAIN_NO_MODEL"] = "1"
+import shutil
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
@@ -45,6 +49,15 @@ def test(fn):
 def ok(cond, msg=""):
     if not cond:
         raise AssertionError(msg or "assertion failed")
+
+
+def _tmp_settings():
+    """A throwaway state dir. Only the state-file readers need one — every
+    other test here runs against the real vault on purpose, because the MCP
+    server binds its settings at import."""
+    root = Path(tempfile.mkdtemp(prefix="v-mcp-test-"))
+    s = config.Settings(vault=root, state_dir=root / "state")
+    return root, s
 
 
 def call(name: str, **kw) -> str:
@@ -432,6 +445,105 @@ def engines_are_per_thread():
     t1.start(); t2.start(); t1.join(); t2.join()
     ok(seen["a"] != seen["b"], "threads shared one sqlite connection")
     ok(id(srv.E().conn) == id(srv.E().conn), "same thread must reuse its bundle")
+
+
+# --- Quera ------------------------------------------------------------
+@test
+def quera_status_reads_and_never_writes():
+    """The whole point of the read/write split. `vault_quera_status` must be
+    able to answer "are my deadlines current?" on a read-only run, which means
+    it may not create a note as a side effect of looking."""
+    written = []
+
+    class FakeVault:
+        def exists(self, rel):
+            return False
+
+        def create(self, *a, **kw):
+            written.append(a[0] if a else "?")
+
+    class FakeQuera:
+        def configured(self):
+            return True
+
+        def fetch_deadlines(self):
+            from v.core.quera import QueraAssignment
+            return [QueraAssignment(course="DSD", title="Lab 9",
+                                    due_at=dt.datetime(2026, 9, 6, 8, 0),
+                                    url="https://quera.org/x")]
+
+        def _assignment_note(self, a):
+            return f"03 - University/Assignments/{a.title}.md", {}, ""
+
+    real_q, real_v = srv._quera, srv._vault
+    srv._quera, srv._vault = (lambda: FakeQuera()), FakeVault()
+    try:
+        out = call("vault_quera_status")
+    finally:
+        srv._quera, srv._vault = real_q, real_v
+
+    ok(not written, f"status wrote notes: {written}")
+    ok("Lab 9" in out, f"the live deadline should be listed: {out[:200]}")
+    ok("NOT IN THE VAULT" in out,
+       "a deadline with no note must be called out, not silently counted")
+    ok("out of sync" in out, "and the summary line must say so")
+
+
+@test
+def quera_status_says_who_can_fix_an_expired_session():
+    """V cannot re-authorise Quera — there is no browser login here, only a
+    cookie Parsa pastes. Saying "I have no access" and stopping is the failure
+    this tool was added to end; naming the one command that fixes it is the
+    behaviour that replaces it."""
+    class NoCookie:
+        def configured(self):
+            return False
+
+    real = srv._quera
+    srv._quera = lambda: NoCookie()
+    try:
+        out = call("vault_quera_status")
+    finally:
+        srv._quera = real
+    ok("quera auth" in out, f"the fix must be named: {out[:200]}")
+    ok("nightly job" in out, "and the automatic job still reported")
+
+
+@test
+def quera_descriptions_carry_the_two_things_v_got_wrong():
+    """Both failures on record were the model reasoning from an absence: it
+    had no tool, so it invented "no Quera access is set up for me"; and it read
+    an empty widget as a broken sync. Neither is fixable by a tool that does
+    not say so in its own description."""
+    tools = {t.name: (t.description or "")
+             for t in asyncio.run(srv.mcp.list_tools())}
+    st = tools["vault_quera_status"]
+    ok("06:45" in st, "the description must state the sync is automatic")
+    ok("only deadlines still open" in st,
+       "and that an absent assignment is not a failed sync")
+    ok("EDITH" in tools["vault_quera_sync"],
+       "sync must not be mistaken for a way to mark something done")
+
+
+@test
+def the_scheduler_last_run_is_readable_without_an_engine():
+    """`vault_quera_status` reports when the nightly job fired, and it runs in
+    the MCP process, which has no Engine and has no business building one."""
+    from v.core import scheduler as sched
+    root, s = _tmp_settings()
+    try:
+        eq_none = sched.last_run(sched.QUERA_JOB, s)
+        ok(eq_none is None, "no state file must read as 'never', not crash")
+        (s.state_dir).mkdir(parents=True, exist_ok=True)
+        (s.state_dir / "scheduler.json").write_text(
+            json.dumps({sched.QUERA_JOB: "2026-09-02T11:09:21"}))
+        got = sched.last_run(sched.QUERA_JOB, s)
+        ok(got == dt.datetime(2026, 9, 2, 11, 9, 21), f"got {got!r}")
+        (s.state_dir / "scheduler.json").write_text("{not json")
+        ok(sched.last_run(sched.QUERA_JOB, s) is None,
+           "a corrupt state file must not take the tool down with it")
+    finally:
+        shutil.rmtree(root)
 
 
 # ---------------------------------------------------------------------

@@ -20,6 +20,29 @@ from . import briefing
 from .config import Settings, settings as default_settings
 
 
+# The scheduler's own record of when each job last fired, readable without
+# building one. `Scheduler.__init__` takes an `Engine`, which the MCP server
+# has no business constructing on a tool call — but "when did the nightly
+# Quera sync last run?" is exactly the question an agent needs answered before
+# it tells Parsa anything about whether his deadlines are current. Reading the
+# state file it already writes is cheaper and truer than a second store.
+QUERA_JOB = "quera-sync"
+
+
+def last_run(name: str, settings: Settings | None = None) -> dt.datetime | None:
+    """When job `name` last completed, or None if it never has."""
+    s = settings or default_settings
+    try:
+        raw = json.loads((s.state_dir / "scheduler.json").read_text(
+            encoding="utf-8")).get(name)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    try:
+        return dt.datetime.fromisoformat(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class Job:
     name: str
