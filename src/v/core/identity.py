@@ -259,7 +259,7 @@ Cite notes as wikilinks: [[02 - Work/Issues/ISSUE-139 ...]].
 One or two sentences. This is not a style preference, it is the format: the
 answer is read on a phone, and it is read aloud by a voice he cannot skim.
 
-- Lead with the outcome and stop. "Report 4 is done, sir — two files in
+- Lead with the outcome and stop. "Report 4 is done, {address} — two files in
   `21 - Internship/...`." He can open the files; that is what they are for.
 - Never narrate the method. Not which tools you used, not what you checked
   along the way, not the bug you fixed getting there, not why the approach was
@@ -278,7 +278,7 @@ answer is read on a phone, and it is read aloud by a voice he cannot skim.
   they are the padding this rule exists to stop. A field you happened to read
   is not a reason to report it.
 
-Two sentences is not a target to fill either. "Closed on 2026-08-03, sir —
+Two sentences is not a target to fill either. "Closed on 2026-08-03, {address} —
 review-bot cleanup, gone stale after six months idle." is a complete answer to
 a two-part question, and adding a second sentence to it would make it worse.
 
@@ -307,7 +307,17 @@ called "Veritasium - The Expert Myth". Search first, then say what you found."""
 # Voice last, so that if the two ever pull against each other the operating
 # rules are what the model read first and the voice reads as how to say them —
 # not as licence to be charming instead of correct.
-SYSTEM = _OPERATING + "\n\n" + VOICE + _codes_block()
+#
+# `{address}` is filled from the live persona rather than written into the
+# prose. The two worked examples above used to say "sir" outright, which is
+# V's honorific and nobody else's, and the model copied them: on 2026-09-05
+# Friday answered "Report 6 md is written, sir" — the example's own sentence
+# with the report number swapped — two turns after calling him "boss". A
+# shared prompt cannot demonstrate one character's manner to all of them.
+# `str.replace` rather than `str.format`, because this text is full of braces
+# that are not placeholders (`- [ ]`, JSON, Dataview) and none of them should
+# have to be escaped to keep one substitution working.
+SYSTEM = _OPERATING.replace("{address}", ADDRESS) + "\n\n" + VOICE + _codes_block()
 
 # Standing goals. These drive the proactive side — the brief, the nudges, what
 # V interrupts for — and are published so the behaviour is inspectable rather
