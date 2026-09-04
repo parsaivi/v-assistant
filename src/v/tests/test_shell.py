@@ -82,11 +82,12 @@ class FakeShell(shells.Shell):
         return not self.fail
 
     def run(self, prompt, *, session_id=None, allow_writes=False, timeout=None,
-            model=None, effort=None, memory="", agent="v", on_event=None):
+            model=None, effort=None, memory="", agent="v", tier_floor=None,
+            on_event=None):
         self.calls.append({"prompt": prompt, "session_id": session_id,
                            "allow_writes": allow_writes, "model": model,
                            "effort": effort, "memory": memory, "agent": agent,
-                           "on_event": on_event})
+                           "tier_floor": tier_floor, "on_event": on_event})
         if self.fail:
             raise ShellUnavailable("nope")
         # Surfaces are entitled to progress from any shell, so a double that
@@ -417,6 +418,45 @@ def tiers_pick_model_and_effort_from_the_question():
         eq(tier_settings(LIGHT, s), ("haiku", "low"))
         eq(tier_settings(NORMAL, s), ("sonnet", "medium"))
         eq(tier_settings(HEAVY, s), ("sonnet", "high"))
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_lookup_opener_has_to_be_a_whole_word():
+    """"do it" starts with "do i". Matched as a prefix it was tiered `light`,
+    which on 2026-09-05 handed "carry on writing my internship report" to haiku
+    with a 90-second ceiling; it timed out with nothing written."""
+    from v.core.shells import LIGHT, NORMAL, weigh
+    eq(weigh("do it"), NORMAL, "a follow-up instruction is not a lookup")
+    eq(weigh("do it now"), NORMAL)
+    eq(weigh("next one"), LIGHT, "the real openers must still match")
+    eq(weigh("do I have anything due?"), LIGHT)
+
+
+@test
+def a_resumed_thread_never_tiers_below_what_it_is_continuing():
+    """A follow-up is the shortest message in a conversation and carries none
+    of the weight of the work it continues — and resuming costs *more* than
+    starting fresh, because the transcript is re-sent first. Tiering "do it"
+    on its own two words is how a report-writing thread ended up on haiku."""
+    from v.core.shells import HEAVY, NORMAL, heavier
+    eq(heavier("light", NORMAL), NORMAL, "the floor raises")
+    eq(heavier(HEAVY, NORMAL), HEAVY, "and never discounts an escalation")
+    eq(heavier("light", None), "light", "no thread, no floor")
+    eq(heavier("light", "nonsense"), "light", "an unknown floor is ignored")
+
+    root, s = make_vault()
+    try:
+        fake = FakeShell(ShellResult("done", "fake", session_id="s1",
+                                     tier=HEAVY))
+        h = Hermes(s, shell=fake)
+        t0 = dt.datetime(2026, 9, 5, 1, 0)
+        h.ask("audit every note for schema errors", now=t0)
+        h.ask("do it", continue_=True, now=t0 + dt.timedelta(minutes=2))
+        eq(fake.calls[1]["session_id"], "s1", "same thread")
+        eq(fake.calls[1]["tier_floor"], HEAVY,
+           "the follow-up inherits the tier of the work it continues")
     finally:
         shutil.rmtree(root)
 
