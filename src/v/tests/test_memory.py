@@ -676,9 +676,13 @@ def the_voice_reaches_the_prompt_and_the_free_paths():
     try:
         e = Engine(s)
         try:
+            # The engine's own persona, not `identity.ADDRESS` — that one is
+            # snapshotted at import from the *live* config, so once Parsa
+            # switched his own to Friday this asserted "boss" against a
+            # fixture vault answering as V, and failed on his machine only.
             for line in ("hi", "thanks", "good night", "how are you"):
                 said = e.handle(line).text
-                ok(identity.ADDRESS in said.lower(),
+                ok(e.persona.address.lower() in said.lower(),
                    f"{line!r} answered out of voice: {said!r}")
                 ok("!" not in said, f"{line!r} used an exclamation mark")
         finally:

@@ -202,6 +202,65 @@ def v_is_reachable_everywhere_because_everything_falls_back_to_it():
     eq(persona.get(persona.DEFAULT).key, "v")
 
 
+@test
+def a_summons_off_the_terminal_never_becomes_the_stored_default():
+    """Saying "Friday" to the phone is a wake word, not a preference. It used
+    to write `persona: friday` into `state/config.json`, so one utterance to
+    the Android client silently re-cast the TUI, Telegram and the scheduler."""
+    eq(persona.PERSISTS_FROM, (persona.TUI,))
+    for surface in (persona.CLI, persona.TELEGRAM, persona.PHONE,
+                    persona.SCHEDULER):
+        ok(surface not in persona.PERSISTS_FROM,
+           f"a summons from {surface} would rewrite the config")
+
+
+@test
+def summoning_from_the_phone_holds_for_the_session_and_no_longer():
+    """The behaviour, not just the constant: the switch must still take effect
+    on the surface that asked for it, and must not follow him home."""
+    from v.core.engine import Engine
+    from v.tests.test_core import make_vault
+    root, s = make_vault()
+    cfg = s.state_dir / "config.json"
+    try:
+        e = Engine(s, surface=persona.PHONE)
+        try:
+            switched, refusal = e.switch_agent("friday")
+            ok(switched and not refusal, f"the phone refused Friday: {refusal!r}")
+            eq(e.persona.key, "friday", "the summons must hold for the session")
+            ok("friday" not in (cfg.read_text() if cfg.exists() else ""),
+               "a phone summons wrote itself into the stored default")
+        finally:
+            e.close()
+        e = Engine(s, surface=persona.TUI)
+        try:
+            eq(e.persona.key, "v", "the phone's summons leaked to the terminal")
+            e.switch_agent("friday")
+            ok("friday" in cfg.read_text(),
+               "a summons typed at the terminal must still persist")
+        finally:
+            e.close()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def the_shared_prompt_teaches_no_honorific_of_its_own():
+    """`_OPERATING` goes to every agent, so an address written into its worked
+    examples is one character's manner demonstrated to all of them. Friday
+    answered "Report 6 md is written, sir" — the example's own sentence with
+    the number swapped — two turns after calling him "boss"."""
+    from v.core import identity
+    body = identity._OPERATING.lower()
+    ok("{address}" in identity._OPERATING,
+       "the shared prompt no longer takes the persona's address")
+    for honorific in ("sir", "boss"):
+        ok(f", {honorific}" not in body,
+           f"the shared operating rules address him as {honorific!r}")
+    ok(f", {identity.ADDRESS.lower()} " in identity.SYSTEM.lower(),
+       "the built prompt lost the live address")
+
+
 # --- naming ----------------------------------------------------------------
 @test
 def calling_a_name_summons_it_and_talking_about_one_does_not():

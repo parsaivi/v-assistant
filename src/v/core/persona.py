@@ -65,6 +65,17 @@ PHONE = "phone"        # the Android client over mutual TLS
 SCHEDULER = "scheduler"  # nobody is present at all
 SURFACES = (TUI, CLI, TELEGRAM, PHONE, SCHEDULER)
 
+# Where a summons outlives the session. Only the terminal, and the asymmetry is
+# the point: on the phone the summons *is* the wake word, and the wake word
+# names who you want on every single utterance, so persisting it buys nothing.
+# What it cost was real — saying "Friday" once to the Android client wrote
+# `persona: friday` into `state/config.json`, and the TUI, Telegram and the
+# scheduler all came up as Friday afterwards, none of them having been asked.
+# The terminal has no wake word, so a name typed there is the deliberate
+# choice; `v persona --use` is the other one, and it writes the config itself
+# from anywhere.
+PERSISTS_FROM = (TUI,)
+
 # What an agent may do with the vault when it writes.
 CONFIRM = "confirm"    # show it, wait to be told to go ahead
 DIRECT = "direct"      # write, then say what was written

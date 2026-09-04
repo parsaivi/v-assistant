@@ -174,15 +174,31 @@ class Engine:
             return want, ""
         return persona.get(persona.DEFAULT), want.key
 
+    def _summons_persist(self, target: persona.Persona) -> bool:
+        """Does summoning `target` here outlive the session?
+
+        Two conditions, and both are about not writing a preference nobody
+        expressed. An agent that is not reachable everywhere may not be the
+        stored default anywhere: `edith` in the config would leave the next
+        Telegram message resolving to an agent it may not use, and falling
+        back on every single message — she is summoned for the session and
+        lapses when it ends, which is the honest reading of "only accessible
+        through the TUI".
+
+        And a summons only persists from the terminal. Elsewhere the name is a
+        wake word, said fresh on every utterance, so storing it buys nothing —
+        and it silently reached surfaces that were never asked: one "Friday"
+        to the phone rewrote `state/config.json`, and the TUI came up as
+        Friday for days afterwards. `v persona --use` is still the way to
+        change the default deliberately, from anywhere.
+        """
+        return not target.surfaces and self.surface in persona.PERSISTS_FROM
+
     def switch_agent(self, key: str) -> tuple[bool, str]:
         """Summon an agent by name. Returns (switched, message).
 
-        Persisted for the agents that are reachable everywhere, and *not*
-        persisted for one that is not: writing `edith` into the config from
-        the terminal would leave the next Telegram message resolving to an
-        agent it may not use, and falling back on every single message. She is
-        summoned for the session and lapses when it ends, which is also the
-        honest reading of "only accessible through the TUI".
+        Whether the switch is written to the config is `_summons_persist`;
+        either way it holds for the rest of this session.
         """
         target = persona.get(key)
         if target.key != persona.ALIASES.get(key.strip().lower(), key.strip().lower()):
@@ -209,7 +225,7 @@ class Engine:
             self.hermes.reset()
         except Exception:
             pass
-        if target.surfaces:
+        if not self._summons_persist(target):
             return True, ""      # session-only; nothing written to config
         try:
             path = self.s.state_dir / "config.json"
@@ -380,7 +396,7 @@ class Engine:
                         "anything leaving the vault still does not.")
         return Response(" ".join(bits), route=f"summon:{p.key}",
                         data={"agent": p.key, "surface": self.surface,
-                              "session_only": bool(p.surfaces)})
+                              "session_only": not self._summons_persist(p)})
 
     def _smalltalk(self, route: router.Route) -> Response:
         """Answer a greeting without a model.
