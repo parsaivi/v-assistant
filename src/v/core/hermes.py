@@ -125,13 +125,24 @@ class Hermes:
             # asking to book time "with him" were two unrelated conversations.
             continue_ = self.s.shell_continue_by_default or self._sticky
         thread = self.current_session(now) if continue_ else None
+        # A thread carries its weight forward. `shells.weigh` reads one message
+        # and a follow-up is usually the shortest thing in the conversation —
+        # "do it", "yes", "carry on" — so weighed alone it lands cheap however
+        # heavy the work it is continuing. Resuming also *costs* more than
+        # starting fresh, because the whole transcript is re-sent before the
+        # first token comes back, so the tier that most needs the headroom is
+        # the one this used to discount. The floor only ever raises: a
+        # follow-up that is genuinely harder still escalates.
+        floor = self._load().get("tier") if thread else None
         result = self.shell.run(prompt, session_id=thread,
                                 allow_writes=allow_writes,
                                 model=model, effort=effort, memory=memory,
-                                agent=agent, on_event=on_event)
+                                agent=agent, tier_floor=floor,
+                                on_event=on_event)
         if result.session_id:
             self._save({"session_id": result.session_id,
-                        "last_used": now.isoformat(timespec="seconds")})
+                        "last_used": now.isoformat(timespec="seconds"),
+                        "tier": result.tier or ""})
         self._log(prompt, result, now, continued=bool(thread))
         return result
 

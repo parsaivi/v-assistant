@@ -152,6 +152,14 @@ _LIGHT_HINTS = (
     "how many", "how much", "where is", "where's", "which", "did i", "do i",
     "is there", "are there", "last time", "next",
 )
+# Matched as whole words rather than as a bare prefix. `"do it".startswith(
+# "do i")` is true, and that is not hypothetical: on 2026-09-05 "do it" — the
+# shortest possible "carry on with what you were doing" — was tiered `light`,
+# handed to haiku with a 90-second ceiling, and timed out having produced
+# nothing, in the middle of writing an internship report. A trailing `\b`
+# costs nothing and makes the tuple mean what it reads as.
+_LIGHT_OPENER = re.compile(
+    r"^(?:" + "|".join(re.escape(h) for h in _LIGHT_HINTS) + r")\b")
 # A question that wants prose rather than a fact is at least `normal`, however
 # short it is: "summarise my week" is six words and not a lookup. So is
 # anything asking *why* — a reason has to be assembled, not looked up.
@@ -191,12 +199,28 @@ def weigh(prompt: str) -> str:
     # Light needs a lookup *opener*, not just brevity. Judging on length alone
     # sent "what did I decide about pricing and why?" — eight words, and pure
     # synthesis — to haiku.
-    if len(words) <= 14 and low.startswith(_LIGHT_HINTS):
+    if len(words) <= 14 and _LIGHT_OPENER.match(low):
         return LIGHT
     return NORMAL
 
 
 TIERS = (TRIVIAL, LIGHT, NORMAL, HEAVY)
+
+
+def heavier(tier: str, floor: str | None) -> str:
+    """The heavier of two tiers; unknown floors are ignored.
+
+    `weigh` reads one message, and a follow-up carries none of the weight of
+    what it follows: "do it", "yes", "go on" are two words each and mean
+    whatever the previous turn was in the middle of. Weighed alone they are
+    cheap; weighed as the continuation of "write my internship report" they
+    are not. So a resumed thread carries its tier forward as a floor — the
+    follow-up may escalate it, never discount it.
+    """
+    order = {t: i for i, t in enumerate(TIERS)}
+    if floor not in order:
+        return tier
+    return tier if order.get(tier, 0) >= order[floor] else floor
 
 
 def tier_settings(tier: str, s: Settings) -> tuple[str, str]:
@@ -287,7 +311,7 @@ class Shell(ABC):
     def run(self, prompt: str, *, session_id: str | None = None,
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
-            memory: str = "", agent: str = "v",
+            memory: str = "", agent: str = "v", tier_floor: str | None = None,
             on_event: Progress = None) -> ShellResult: ...
 
 
@@ -652,13 +676,13 @@ class ClaudeCodeShell(Shell):
     def run(self, prompt: str, *, session_id: str | None = None,
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
-            memory: str = "", agent: str = "v",
+            memory: str = "", agent: str = "v", tier_floor: str | None = None,
             on_event: Progress = None) -> ShellResult:
         if not self.available:
             raise ShellUnavailable(
                 "the `claude` CLI is not on PATH — install Claude Code first")
 
-        tier = weigh(prompt)
+        tier = heavier(weigh(prompt), tier_floor)
         default_model, default_effort = tier_settings(tier, self.s)
         model = model or default_model
         effort = effort or default_effort
@@ -971,7 +995,7 @@ class HermesShell(Shell):
     def run(self, prompt: str, *, session_id: str | None = None,
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
-            memory: str = "", agent: str = "v",
+            memory: str = "", agent: str = "v", tier_floor: str | None = None,
             on_event: Progress = None) -> ShellResult:
         del memory, on_event  # unverified sketch; see the class docstring
         if not self.available:
@@ -982,7 +1006,7 @@ class HermesShell(Shell):
                 "needs Claude Max + usage credits; on Pro, configure an API "
                 "key or another provider instead."
             )
-        tier = weigh(prompt)
+        tier = heavier(weigh(prompt), tier_floor)
         model = model or self.s.hermes_model
         cmd = [self.bin, "chat", "--provider", self.s.hermes_provider,
                "--model", model, prompt]
