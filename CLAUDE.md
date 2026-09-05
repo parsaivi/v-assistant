@@ -18,8 +18,9 @@ imported as `v.*`. Anything referring to the old layout is out of date.
 
 ```
 src/v/
-  cli.py        33 subcommands + the REPL; entry point for the `v` console script
-  core/         47 modules — see the table in README.md
+  cli.py        34 subcommands + the REPL; entry point for the `v` console script
+  core/         48 modules — see the table in README.md
+  core/hud/     the desktop surface's page, stylesheet and script (package data)
   mcp/          the MCP server (40 tools) + the privacy guard
   tests/        472 tests, plain asserts, no pytest
 android/        Kotlin + Compose client for the phone transport, plus two
@@ -38,6 +39,7 @@ docs/           the voice-interface design brief
 
 ```bash
 ./.venv/bin/v repl                      # or just `v` if the venv is on PATH
+./.venv/bin/v hud                       # the desktop surface, on 127.0.0.1
 ./.venv/bin/python -m v.tests.test_core  # one suite at a time; no runner
 ```
 
@@ -48,7 +50,7 @@ and prints its own summary. The full suite:
 test_core 90 · test_shell 33 · test_mcp 20 · test_tasks 51 · test_memory 31
 test_briefing 15 · test_telegram 31 · test_tts 12 · test_httpapi 39
 test_traits 11 · test_agents 19 · test_graph 95 ·
-test_ui_animation 25                                         (472 total)
+test_ui_animation 25 · test_hud 50                           (522 total)
 ```
 
 Two tests are sensitive to the pinned clock — `config.py` forces
@@ -79,7 +81,11 @@ and easy to break by accident:
   nothing writes across a boundary, including supersession, which is a write.
 - A surface gate guards answering, not just switching. If the config names an
   agent that cannot be reached from this surface, `Engine._agent_for` falls
-  back to V and says so.
+  back to V and says so. **A new surface is a new entry in
+  `persona.SURFACES`, never a reuse of `TUI`** — `TUI` means a keyboard on
+  this machine, and it is the only thing standing between EDITH's edit tools
+  and anything that can open a socket. `v hud` is loopback-only and still gets
+  its own `HUD`; `test_hud` asserts EDITH stays out of it.
 - The agent reaches the MCP subprocess through `V_AGENT` in its environment.
   That is the seam where isolation is easiest to lose, because `mcp/server.py`
   is a different process and cannot see `engine.persona`.

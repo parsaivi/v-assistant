@@ -1522,6 +1522,43 @@ def cmd_serve(args, engine: Engine) -> int:
     return 0
 
 
+def cmd_hud(args, engine: Engine) -> int:
+    """The wide desktop surface, in a browser on this machine.
+
+    `repl` draws one conversation in a window. This draws the day: the same
+    conversation next to the agenda, the ranked tasks, the deadlines, what V
+    has learned and what it wrote — which is a layout problem, and a terminal
+    has nowhere to put it.
+    """
+    from v.core import hud as hud_mod
+
+    s = engine.s
+    # Same reason as `cmd_serve`: the engine that answers is the one
+    # `hud._Bridge` opens on its own thread, so this one is a second idle
+    # sqlite connection for however long the HUD is left open.
+    engine.close()
+    try:
+        port = args.port if args.port else hud_mod.free_port()
+    except hud_mod.HudError as exc:
+        print(ui.error(exc.message))
+        return 1
+
+    def ready(url, _srv):
+        print(ui.hint(f"HUD on {url}"))
+        print(ui.hint("loopback only · Ctrl-C to stop"))
+
+    try:
+        code = hud_mod.serve(s, port=port, open_browser=not args.no_open,
+                             verbose=args.verbose, on_ready=ready)
+    except OSError as exc:
+        # A `finally` here would print "stopped" under the error too, which
+        # reads as though it had been running.
+        print(ui.error(f"could not listen on 127.0.0.1:{port}: {exc}"))
+        return 1
+    print("\nstopped")
+    return code
+
+
 def cmd_stt(args, engine: Engine) -> int:
     t = stt.Transcriber(engine.s, model_size=args.model)
     if args.benchmark:
@@ -2042,6 +2079,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="don't run reminders/brief/nudges from this process")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("hud", help="the wide desktop surface — the day on one "
+                       "screen, in a browser on this machine")
+    s.add_argument("--port", type=int, default=None,
+                   help=f"port on 127.0.0.1 (default: {7717} or the next free one)")
+    s.add_argument("--no-open", action="store_true",
+                   help="don't open a browser window")
+    s.add_argument("-v", "--verbose", action="store_true",
+                   help="log every request")
+    s.set_defaults(fn=cmd_hud)
 
     s = sub.add_parser("phone", help="certificates for the phone surface")
     s.add_argument("action", nargs="?", default="status",

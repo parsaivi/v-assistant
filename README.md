@@ -30,6 +30,7 @@ echo '{"vault": "/path/to/your/vault"}' > ~/.config/v/config.json
 ```bash
 v index --embed          # build both indexes (once)
 v repl                   # talk to it
+v hud                    # the day on one screen — see The HUD below
 v brief                  # the morning brief, on demand
 v briefing --status      # the standing 10:00 push
 v brag                   # entries drafted from closed work
@@ -103,6 +104,7 @@ notes, and that is all.
 | `files.py` | attachments in and out — where they land, and the outbox between processes | $0 |
 | `ui.py` | the design tokens: colour, glyphs, markdown, cost lines, the aperture | $0 |
 | `tui.py` | **the window** — frame, panes, palette, key handling, ambient state | $0 |
+| `hud.py` | **the desktop surface** — the whole day on one screen, over loopback | $0 |
 | `engine.py` | the single entry point | — |
 
 ## The terminal
@@ -827,6 +829,65 @@ Everything here is a no-op with no cost and no network call when
 `telegram_bot_token` is unset — `send_message` returns `False` before it ever
 opens a connection, which is what lets `briefing.py` default the channel on
 without breaking a vault that has never heard of Telegram.
+
+## The HUD
+
+```bash
+v hud                    # opens http://127.0.0.1:7717 in a browser
+v hud --port 8080 --no-open
+```
+
+`repl` draws one conversation in a window. `hud` draws the *day*: the same
+conversation next to the agenda, the ranked tasks, the deadlines, what V has
+learned, what it wrote this session and which of the fifteen nudges fired —
+plus the aperture, the route the last answer actually took, and a tool bus
+showing every call with its latency. That is a layout problem before it is
+anything else, and at 80×24 there is no layout.
+
+Four rules it inherits rather than invents:
+
+**It is free.** Every panel is SQL and Markdown, the same paths `glance()`
+uses for the phone widget, and `test_hud` asserts the snapshot costs `0.0`. A
+dashboard that redraws every four seconds and bills for it is a dashboard you
+turn off. The one exception is the inbox, which is a real Gmail round trip and
+is therefore cached — and it calls `search`, never `unseen`, because `unseen`
+marks what it returns and would quietly eat the queue `scheduler.py` uses to
+decide what it has already pushed you.
+
+**It is loopback, and it is its own surface.** The socket binds `127.0.0.1`
+with no flag to widen it: unlike the phone transport there is no mutual TLS
+underneath to make a wider bind survivable. It is `persona.HUD` rather than
+`persona.TUI` for the same reason — a TTY is held by the person sitting at it,
+a loopback port is reachable by every process on the machine. **EDITH is not
+reachable here**; summoned, `_agent_for` falls back to V and says so.
+
+**The ambient state is derived, not picked.** There is no microphone on a
+browser tab, so nothing pretends there is: typing is `listening`, a turn in
+flight is `thinking`, the seconds after an answer are `speaking`, a turn that
+committed is `writing`, one that raised is `fault`. `tui.py` maps the same
+states onto the same real input, and the state list on the left is an
+indicator rather than a control.
+
+**Nothing on the page is markup.** The client builds every node with
+`textContent`; there is no `innerHTML` path at all, which is what makes it
+safe to render a note title, an email subject or a scraped Quera page. The
+markdown in an answer is rendered to DOM by the same grammar `ui.py` renders
+to ANSI — `**bold**`, `` `code` ``, `[[wikilinks]]`, bullets, fences — so the
+browser does not repeat the bug the terminal already fixed.
+
+Two things the page is careful about because this vault is half Persian: text
+copied out of the vault gets `unicode-bidi: plaintext` so each row picks its
+own direction, while sentences V composed in English do not — a nudge reading
+`'آزمایش هشتم' was due 12 days ago.` starts with a strong RTL character and
+would otherwise move its full stop to the far end. Paths stay LTR throughout,
+because a path is structure and reordering its segments makes a correct string
+unreadable.
+
+The clock in the header runs on **V's** clock. `config.py` pins the process to
+`TZ=Asia/Tehran`, routinely hours off the machine's own zone; left on the
+browser's time the header read 04:14 while the tool bus under it stamped the
+same calls 23:40 and the agenda was headed with yesterday.
+
 
 ## The phone
 

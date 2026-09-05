@@ -384,6 +384,43 @@ def is_stale(settings: Settings | None = None,
             conn.close()
 
 
+def drift(settings: Settings | None = None,
+          conn: sqlite3.Connection | None = None) -> list[str]:
+    """Which notes a rebuild would touch — the same comparison `is_stale`
+    makes, counted instead of short-circuited.
+
+    Separate from `is_stale` rather than expressed as `bool(drift())`, because
+    the short-circuit is the point of that one: it stops at the first changed
+    note and is run on every startup. This one always walks the whole vault,
+    so it is for a surface that wants to *show* the number (`v hud`'s index
+    gauge) and is cached by its caller, never for a hot path.
+    """
+    s = settings or default_settings
+    own = conn is None
+    conn = conn or connect(s)
+    try:
+        known = {r["rel"]: r["mtime"] for r in
+                 conn.execute("SELECT rel, mtime FROM notes")}
+        out, seen = [], set()
+        for path in notes.iter_notes(s.vault):
+            rel = str(path.relative_to(s.vault)).replace("\\", "/")
+            seen.add(rel)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            prev = known.get(rel)
+            if prev is None or abs(prev - mtime) >= 1e-6:
+                out.append(rel)
+        # A deleted note drifts too: it is still in the index and a rebuild
+        # would remove it.
+        out.extend(sorted(set(known) - seen))
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
 def refresh_if_stale(settings: Settings | None = None,
                      conn: sqlite3.Connection | None = None) -> IndexStats | None:
     """Re-index only when the vault moved. Returns None when nothing was done."""

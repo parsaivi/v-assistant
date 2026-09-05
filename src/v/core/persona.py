@@ -62,8 +62,15 @@ TUI = "tui"            # `v repl`, fancy or plain — a keyboard on this machine
 CLI = "cli"            # one-shot `v ask` / `v send`
 TELEGRAM = "telegram"  # a chat that anyone holding the account could send to
 PHONE = "phone"        # the Android client over mutual TLS
+# `v hud`, in a browser on this machine. Loopback-only, and still not `tui`:
+# a TTY is held by the person sitting at it, while a port on 127.0.0.1 is
+# reachable by every process on the box — a stray script, a page in another
+# tab. EDITH's whole justification is "physically at the terminal", so she is
+# refused here and V answers instead, which is exactly what `_agent_for`
+# already does for Telegram.
+HUD = "hud"
 SCHEDULER = "scheduler"  # nobody is present at all
-SURFACES = (TUI, CLI, TELEGRAM, PHONE, SCHEDULER)
+SURFACES = (TUI, CLI, TELEGRAM, PHONE, HUD, SCHEDULER)
 
 # Where a summons outlives the session. Only the terminal, and the asymmetry is
 # the point: on the phone the summons *is* the wake word, and the wake word
