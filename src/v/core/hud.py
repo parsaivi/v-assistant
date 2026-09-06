@@ -68,7 +68,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import index, persona as persona_mod
+from . import commands as commands_mod, index, persona as persona_mod
 from .config import Settings, settings as default_settings
 from .engine import Engine
 
@@ -339,6 +339,32 @@ class Session:
                                        is not None else 1.0, "committed",
                                        time.time()))
                 del self.writes[6:]
+        self.publish()
+
+    def reset(self) -> None:
+        """`/new`. The *conversation* ends, not the surface.
+
+        So the transcript, the route and the writes attributed to "this
+        session" all go — they belong to the recap V just filed — and the
+        money does not. `spent` and the turn counts are what the budget gauge
+        draws, and a gauge that zeroes whenever you change subject is a gauge
+        that tells you the day was free. The uptime and session id in the
+        footer are the HUD's own, and the HUD did not restart.
+        """
+        with self.lock:
+            self.turns.clear()
+            self.calls.clear()
+            self.inflight.clear()
+            self.writes.clear()
+            self.fault = ""
+            self.step = ""
+        self.publish()
+
+    def clear_log(self) -> None:
+        """`/clear` — the screen, and nothing else. The conversation V is
+        holding is untouched; this is the terminal's `\x1b[2J`, not `/new`."""
+        with self.lock:
+            self.turns.clear()
         self.publish()
 
     def failed(self, why: str) -> None:
@@ -826,6 +852,13 @@ class Hud:
         except Exception as exc:                       # noqa: BLE001
             self.session.failed(f"{type(exc).__name__}: {exc}")
             raise
+        return self._land(resp)
+
+    def _land(self, resp) -> dict:
+        """A `Response` onto the transcript. Shared by chat and the commands
+        that are engine methods, so a `/brief` renders with the same cost line
+        an answer does — because it *is* one, and hiding that would make the
+        cheapest surface look like the free one."""
         data = resp.data or {}
         turn = Turn(
             role="v", text=resp.render(), at=time.time(),
@@ -841,6 +874,115 @@ class Hud:
                             if data.get("commit") else "",
                             confidence=data.get("confidence"))
         return {"turn": turn.json(), "live": self.session.live()}
+
+    def _say(self, text: str, *, state: str = "speaking",
+             route: str = "local") -> dict:
+        """A line from the surface itself rather than from the engine. `$0`,
+        and it says so — these are the commands that never reach a model."""
+        turn = Turn(role="v", text=text, at=time.time(), route=route,
+                    state=state)
+        self.session.landed(turn)
+        return {"turn": turn.json(), "live": self.session.live()}
+
+    def command(self, line: str) -> dict:
+        """A slash command, run for real instead of sent to a model.
+
+        Without this the HUD had no notion of commands at all: `/new` went to
+        the router as a sentence, Sonnet said "Ready, sir.", it cost $0.10 and
+        the session it was supposed to end ran on. Everything below is either
+        an `Engine` method — the same one `cli._repl_command` calls — or a
+        surface concern the browser owns and never reaches here.
+
+        `/why`, `/help`, `/clear` and `/copy` are handled in the page: the
+        trace is already on screen, the palette is a keystroke, and the
+        clipboard belongs to the browser.
+        """
+        parsed = commands_mod.split(line)
+        if parsed is None:
+            raise HudError(400, "not a command")
+        cmd, rest = parsed
+        known = {c[0] for c in commands_mod.COMMANDS}
+
+        if cmd in ("new", "quit", "exit"):
+            # The escape hatch for the cost of remembering: a session that has
+            # run all day re-sends all day on every turn. It files what you
+            # are leaving rather than discarding it — same as the REPL, which
+            # is why it is `end_session` and not a list being cleared.
+            def work(engine):
+                engine.end_session("new")
+                engine.start_session()
+                return True
+            self.bridge.call(work, timeout=120)
+            self.session.reset()
+            return self._say("Fresh thread — nothing before this point "
+                             "carries over.")
+
+        if cmd == "undo":
+            return self._land(self.bridge.call(
+                lambda e: e.undo(rest or None), timeout=120))
+        if cmd == "status":
+            return self._land(self.bridge.call(lambda e: e.status(), timeout=120))
+        if cmd == "brief":
+            return self._land(self.bridge.call(lambda e: e.brief(),
+                                               timeout=CHAT_TIMEOUT))
+        if cmd == "evening":
+            return self._land(self.bridge.call(lambda e: e.evening(),
+                                               timeout=CHAT_TIMEOUT))
+        if cmd == "nudges":
+            return self._land(self.bridge.call(lambda e: e.nudge_digest(),
+                                               timeout=120))
+        if cmd in ("tasks", "mem"):
+            # Both are model turns in the REPL and stay model turns here; the
+            # point of the shortcut is the phrasing, not a different engine.
+            said = ("what should I do today" if cmd == "tasks"
+                    else (f"what do you know about {rest}" if rest
+                          else "what do you remember"))
+            return self.chat(said)
+
+        if cmd == "quiet":
+            def work(engine):
+                hour = engine.s.quiet_hours[1]
+                until = (dt.datetime.now() + dt.timedelta(days=1)).replace(
+                    hour=hour, minute=0, second=0, microsecond=0)
+                commands_mod.save_prefs(
+                    engine.s.state_dir,
+                    quiet_until=until.isoformat(timespec="seconds"))
+                return until
+            until = self.bridge.call(work, timeout=60)
+            return self._say(f"Nothing unprompted until {until:%a %H:%M}. "
+                             f"Reminders you set yourself still fire.")
+
+        if cmd == "local":
+            def work(engine):
+                on = not commands_mod.prefs(engine.s.state_dir).get("local_only")
+                commands_mod.save_prefs(engine.s.state_dir, local_only=on)
+                engine.s.shell_auto_escalate = not on
+                engine.router.agentic = not on
+                return on
+            on = self.bridge.call(work, timeout=60)
+            self.caches.pop("state", None)
+            return self._say("Local only — nothing will leave this machine."
+                             if on else "Escalation back on.")
+
+        if cmd == "clear":
+            self.session.clear_log()
+            return {"turn": None, "live": self.session.live()}
+
+        if cmd == "cost":
+            live = self.session.live()["session"]
+            cap = float(getattr(self.s, "daily_budget_usd", 2.0)) or 2.0
+            return self._say(
+                f"**${live['spent']:.4f}** this session over {live['turns']} "
+                f"turn{'s' if live['turns'] != 1 else ''}, "
+                f"{live['local']} of them free. Cap is ${cap:.2f} a day.\n\n"
+                f"The gauges on the left are the same numbers, live.")
+
+        if f"/{cmd}" in known:
+            # In the table, handled in the page. Reaching here means the
+            # client sent something it should have kept.
+            raise HudError(400, f"/{cmd} is handled in the page")
+        return self._say(f"Unknown command `/{cmd}` — press `/` for the list.",
+                         state="refused", route="—")
 
     def task(self, task_id: int, state: str) -> dict:
         """The design's checkbox, wired to the real one.
@@ -993,6 +1135,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(self.app.snapshot(force="force=1" in query))
             if path == "/api/live":
                 return self._json(self.app.session.live())
+            if path == "/api/commands":
+                # Static, so it is fetched once at boot rather than riding on
+                # every four-second poll.
+                return self._json({"commands": [
+                    {"cmd": c, "what": what, "said": said}
+                    for c, what, said in commands_mod.COMMANDS
+                    if c not in commands_mod.NOT_ON_HUD]})
             if path == "/api/search":
                 from urllib.parse import parse_qs, unquote
                 q = (parse_qs(query).get("q") or [""])[0]
@@ -1019,6 +1168,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/task":
                 return self._json(self.app.task(int(body.get("id") or 0),
                                                 body.get("state") or "done"))
+            if path == "/api/command":
+                text = (body.get("text") or "").strip()
+                if not text.startswith("/"):
+                    raise HudError(400, "not a command")
+                return self._json(self.app.command(text))
             if path == "/api/agent":
                 return self._json(self.app.agent(body.get("key") or "v"))
             if path == "/api/typing":

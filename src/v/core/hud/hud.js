@@ -51,16 +51,16 @@ const VIEWS = [
   { id: 'vault',   idx: '04', label: 'VAULT',   title: 'VAULT SEARCH' },
 ];
 
-/* Every one of these is a real thing V already understands in plain language;
- * the palette is a shortcut, never a second language. (Design brief §03.) */
-const QUICK = [
-  { label: '/why',    act: () => toggleTrace() },
-  { label: '/brief',  act: () => send('brief me') },
-  { label: '/tasks',  act: () => go('agenda') },
-  { label: '/memory', act: () => go('memory') },
-  { label: '/search', act: () => go('vault') },
-  { label: '/undo',   act: () => send('/undo') },
-];
+/* The quick row is a shortcut to the palette's own entries, so every chip
+ * here is a command that really exists. It used to hold `/memory` and
+ * `/search`, which are not commands at all — they were nav buttons wearing a
+ * slash, and `/undo` next to them sent the literal string to the model. */
+const QUICK = ['/why', '/brief', '/status', '/nudges', '/cost', '/new'];
+
+/* Handled in the page rather than at the server: the trace is already on
+ * screen, the palette is a keystroke, and the clipboard belongs to the
+ * browser. Everything else in the table is an engine call. */
+const CLIENT_ONLY = new Set(['why', 'help', 'copy']);
 
 /* ---- tiny DOM builder --------------------------------------------------
  * `el('div.card', {title: x}, [child, 'text'])`. Strings become text nodes,
@@ -313,9 +313,44 @@ function buildArcs() {
 }
 
 function buildQuick() {
-  fill($('quick'), QUICK.map((q) =>
-    el('button', { type: 'button', text: q.label, onclick: q.act })));
+  fill($('quick'), QUICK.map((cmd) =>
+    el('button', { type: 'button', text: cmd, onclick: () => run(cmd) })));
 }
+
+/* ---- the slash palette ------------------------------------------------- */
+let COMMANDS = [];          // filled once at boot from /api/commands
+let picked = 0;             // which row Enter would run
+
+function paletteRows() {
+  const v = $('input').value.trim();
+  if (!v.startsWith('/')) return null;
+  const q = v.split(' ')[0].toLowerCase();
+  return COMMANDS.filter((c) => c.cmd.startsWith(q));
+}
+
+function drawPalette() {
+  const node = $('palette');
+  const rows = paletteRows();
+  if (rows === null) { node.hidden = true; picked = 0; return; }
+  node.hidden = false;
+  if (picked >= rows.length) picked = 0;
+  if (!rows.length) {
+    fill(node, [el('div.none', {
+      text: 'no command matches — press enter to send as plain language' })]);
+    return;
+  }
+  fill(node, rows.map((c, i) => {
+    const row = el('div.row', { role: 'option', onclick: () => run(c.cmd) }, [
+      el('span.cmd', { text: c.cmd }),
+      el('span.what', { text: c.what }),
+      el('span.said', { text: c.said ? `“${c.said}”` : '' }),
+    ]);
+    row.setAttribute('aria-selected', String(i === picked));
+    return row;
+  }));
+}
+
+function hidePalette() { $('palette').hidden = true; picked = 0; }
 
 /* ---- ambient state ----------------------------------------------------- */
 function paintState(name, detail, tools) {
@@ -876,9 +911,60 @@ async function toggleTask(t, button) {
   }
 }
 
+/** Run a slash command. Client-side ones never leave the page. */
+async function run(line) {
+  const parsed = /^\/(\w*)\s*(.*)$/.exec(line.trim());
+  if (!parsed) return;
+  const [, cmd, rest] = parsed;
+  hidePalette();
+  $('input').value = '';
+  $('blink').hidden = false;
+
+  if (cmd === '' || cmd === 'help') { $('input').value = '/'; drawPalette(); return; }
+  if (cmd === 'why') return toggleTrace();
+  if (cmd === 'copy') {
+    const turns = (app.live && app.live.turns) || [];
+    const last = [...turns].reverse().find((t) => t.role === 'v');
+    if (!last) return;
+    try { await navigator.clipboard.writeText(last.text); } catch (e) { /* denied */ }
+    return;
+  }
+
+  app.busy = true;
+  $('send').disabled = true;
+  try {
+    await post('/api/command', { text: '/' + cmd + (rest ? ' ' + rest : '') });
+    refresh(true);
+  } catch (err) {
+    if (app.live) {
+      app.live.turns.push({ role: 'v', text: String(err.message || err), time: '',
+        route: 'error', cites: [], cost: 0, ms: 0, model: '', confidence: null,
+        state: 'refused' });
+      memo.pane = null;
+      paintPane();
+    }
+  } finally {
+    app.busy = false;
+    $('send').disabled = false;
+    $('input').focus();
+  }
+}
+
 async function send(text) {
   const value = (text === undefined ? $('input').value : text).trim();
   if (!value || app.busy) return;
+  /* A command is a command in every view. Searching for "/new" is not what
+   * anyone meant by typing it. */
+  if (value.startsWith('/')) {
+    const rows = paletteRows();
+    /* An unknown slash still goes to the server, which answers "unknown
+     * command" for free rather than paying a model to guess. */
+    if (rows && rows.length && !COMMANDS.some((c) => c.cmd === value.split(' ')[0])) {
+      return run(rows[picked].cmd + (value.includes(' ')
+        ? ' ' + value.split(' ').slice(1).join(' ') : ''));
+    }
+    return run(value);
+  }
   if (app.view === 'vault') return runSearch(value);
   app.busy = true;
   $('send').disabled = true;
@@ -1016,12 +1102,30 @@ function boot() {
 
   $('form').addEventListener('submit', (e) => { e.preventDefault(); send(); });
   $('why').addEventListener('click', toggleTrace);
+
+  fetch('/api/commands').then((r) => r.json())
+    .then((d) => { COMMANDS = d.commands || []; })
+    .catch(() => { COMMANDS = []; });
+
+  $('input').addEventListener('keydown', (e) => {
+    const rows = paletteRows();
+    if (!rows || !rows.length) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); picked = (picked + 1) % rows.length; drawPalette(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); picked = (picked - 1 + rows.length) % rows.length; drawPalette(); }
+    else if (e.key === 'Tab') { e.preventDefault(); $('input').value = rows[picked].cmd + ' '; drawPalette(); }
+    else if (e.key === 'Escape') { hidePalette(); }
+  });
+  $('input').addEventListener('blur', () => setTimeout(hidePalette, 140));
+
   $('input').addEventListener('input', () => {
     $('blink').hidden = $('input').value.length > 0;
+    drawPalette();
     /* Throttled hard: this is the `listening` state's only evidence, and it is
      * a timestamp — never the text. Nothing typed leaves the tab until Enter. */
     const now = Date.now();
-    if (now - typingSent > 1200) { typingSent = now; post('/api/typing').catch(() => {}); }
+    if ($('input').value && now - typingSent > 1200) {
+      typingSent = now; post('/api/typing').catch(() => {});
+    }
   });
   window.addEventListener('scroll', hideProbe, true);
 

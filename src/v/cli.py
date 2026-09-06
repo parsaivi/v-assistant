@@ -34,6 +34,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from v.core import calendar as calendar_mod  # noqa: E402
+from v.core import commands as commands_mod  # noqa: E402
 from v.core import config, index, schema, shells, stt, ui  # noqa: E402
 from v.core import notes as notes_mod  # noqa: E402
 from v.core import persona  # noqa: E402
@@ -137,33 +138,12 @@ def _print(resp, animate: bool = False) -> None:
 # is the contract: a command may not exist here unless V already understands it
 # spoken, because the moment the shortcut is the only way in, the assistant has
 # quietly become a CLI with a chat prompt attached.
-COMMANDS: list[tuple[str, str, str]] = [
-    ("/why", "the route, cost and notes behind the last answer", "why did you say that"),
-    ("/cost", "today, this session, and where it went", "what have you cost me"),
-    ("/undo", "revert the last thing written to the vault", "no, take that back"),
-    ("/mem", "what I hold about a person or a project", "what do you know about x"),
-    ("/quiet", "no unprompted messages until tomorrow", "leave me alone"),
-    ("/local", "local answers only until further notice", "stay offline"),
-    ("/brief", "the morning brief", "what does my day look like"),
-    ("/tasks", "what is actually on your plate", "what should I do today"),
-    ("/nudges", "what the vault says you have let slip", "anything I am forgetting"),
-    ("/evening", "the close-out draft for today", "what did I get done"),
-    ("/status", "the vault, the indexes, the shell", "how are you doing"),
-    ("/new", "end this conversation, write it up, start fresh", "that's it for now"),
-    ("/copy", "put the last answer on the clipboard", ""),
-    ("/clear", "clear the screen", ""),
-    ("/help", "this", "what can you do"),
-    ("/quit", "or Ctrl-D", "goodbye"),
-]
-
-REPL_HELP = """Anything that is not a command is a message to V — and every
-command below is a shortcut for something you could have just said.
-
-Tab completes, ↑/↓ walk the history, ←/→ and Ctrl-A/E/W edit the line.
-In the window the wheel scrolls the transcript and dragging over it
-copies what you dragged across — the text alone, without the frame
-around it. Shift-drag is your terminal's own selection, and `/mouse`
-hands the mouse back for good."""
+# The table itself lives in `core/commands.py` — `v hud` has a prompt too, and
+# a command list only the terminal can see is a command that becomes a paid
+# model turn everywhere else. Re-exported here because this module's own name
+# for it is what `setup_readline` and `tui` are handed.
+COMMANDS = commands_mod.COMMANDS
+REPL_HELP = commands_mod.REPL_HELP
 
 _COMPLETIONS = [c for c, _, _ in COMMANDS] + ["/exit"]
 
@@ -486,33 +466,14 @@ def _thinking(fn, *a, engine=None, **kw):
                 engine.progress = None
 
 
-def _prefs_path(engine: Engine) -> Path:
-    return engine.s.state_dir / "surface.json"
-
-
+# `/quiet` and `/local` are read by the scheduler and written by whichever
+# prompt you typed into, so they live in `core/commands.py` next to the table.
 def _prefs(engine: Engine) -> dict:
-    """`/quiet` and `/local`, on disk.
-
-    On disk rather than in the process because the two things they govern —
-    proactive messages and escalation — are decided by the scheduler, which is
-    a different process. A quiet switch that only quiets the window you typed
-    it into is not a quiet switch.
-    """
-    try:
-        return json.loads(_prefs_path(engine).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return commands_mod.prefs(engine.s.state_dir)
 
 
 def _save_prefs(engine: Engine, **kw) -> dict:
-    data = _prefs(engine)
-    data.update(kw)
-    try:
-        _prefs_path(engine).write_text(json.dumps(data, indent=2),
-                                       encoding="utf-8")
-    except OSError:
-        pass
-    return data
+    return commands_mod.save_prefs(engine.s.state_dir, **kw)
 
 
 def _why(engine: Engine) -> None:

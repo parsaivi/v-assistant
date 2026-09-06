@@ -461,6 +461,27 @@ input { font-family: inherit; }
   font-size: 12.5px; letter-spacing: .2em; color: #C7F3FF; cursor: pointer; }
 .prompt button:hover { background: rgba(111,227,255,.22); }
 .prompt button:disabled { opacity: .45; cursor: default; }
+/* The slash palette, §03 of the brief. It exists because a command list you
+ * cannot see is a command list you type blind: `/new` was typed into this
+ * prompt, went to the router as a sentence, and cost $0.10 to be told
+ * "Ready, sir." while the session it was meant to end carried on. The third
+ * column is what you could have said instead — the brief's rule is that slash
+ * is a hint, not a language, and nothing goes in the table without one. */
+.palette { margin-bottom: 9px; padding: 6px; border: 1px solid rgba(111,227,255,.26);
+  background: rgba(6,18,26,.96); backdrop-filter: blur(10px);
+  box-shadow: 0 26px 50px -20px rgba(0,0,0,.95); max-height: 232px; overflow-y: auto;
+  clip-path: polygon(0 0, calc(100% - 11px) 0, 100% 11px, 100% 100%, 11px 100%, 0 calc(100% - 11px));
+  animation: hRise .14s ease-out both; }
+.palette[hidden] { display: none; }
+.palette .row { display: grid; grid-template-columns: 92px minmax(0,1fr) auto;
+  align-items: baseline; gap: 10px; padding: 6px 9px; cursor: pointer;
+  font-size: 11.5px; }
+.palette .row:hover, .palette .row[aria-selected="true"] { background: rgba(111,227,255,.1); }
+.palette .cmd { color: var(--cyan); }
+.palette .what { color: #8A8A9A; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette .said { color: var(--label-2); font-size: 10px; white-space: nowrap; }
+.palette .none { padding: 7px 9px; font-size: 11px; color: var(--label-2); }
+
 .quick { display: flex; gap: 7px; padding-top: 9px; flex-wrap: wrap; }
 .quick button { padding: 4px 9px; border: 1px solid var(--line); background: transparent;
   font: inherit; font-size: 9.5px; letter-spacing: .1em; color: #5E8C9C; cursor: pointer; }

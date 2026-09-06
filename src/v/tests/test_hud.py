@@ -38,7 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from v.core import hud, index, persona
+from v.core import commands as commands_mod, hud, index, persona
 from v.tests.test_core import make_vault
 
 PASS, FAIL = [], []
@@ -830,6 +830,193 @@ def test_alarm_label_keeps_persian_whole():
             engine.close()
     finally:
         shutil.rmtree(root)
+
+
+# --------------------------------------------------------------------------
+# slash commands
+#
+# The bug these are written against: the HUD had no notion of commands, so
+# `/new` went to the router as a sentence, Sonnet answered "Ready, sir.", it
+# cost $0.10 and the session it was meant to end carried on underneath.
+
+
+@test
+def test_the_command_table_is_shared_with_the_terminal():
+    """One table, or `/new` works in one prompt and is a paid model turn in
+    the other — which is exactly what happened."""
+    from v import cli
+    ok(cli.COMMANDS is commands_mod.COMMANDS,
+       "cli must re-export the shared table, not keep its own")
+    eq(cli.REPL_HELP, commands_mod.REPL_HELP)
+
+
+@test
+def test_every_command_has_a_spoken_equivalent():
+    """The brief's rule: slash is a hint, not a language. A command nobody can
+    say is a feature that only exists for people who read the source."""
+    silent = [c for c, _, said in commands_mod.COMMANDS
+              if not said and c not in ("/copy", "/clear", "/help")]
+    eq(silent, [], "these need a spoken form")
+
+
+@test
+def test_split_separates_command_from_argument():
+    eq(commands_mod.split("/undo abc"), ("undo", "abc"))
+    eq(commands_mod.split("/new"), ("new", ""))
+    eq(commands_mod.split("/"), ("", ""))
+    eq(commands_mod.split("hello"), None)
+    eq(commands_mod.split("what is 1/2"), None)
+
+
+@test
+def test_suggest_is_prefix_on_the_name_only():
+    """Matching the description too makes the list jump around under you as
+    you type a word that happens to appear in one."""
+    eq([c[0] for c in commands_mod.suggest("/n")], ["/nudges", "/new"])
+    eq(commands_mod.suggest("/zzz"), [])
+    eq(commands_mod.suggest("brief"), [], "not a command line at all")
+    ok(any(c[0] == "/why" for c in commands_mod.suggest("/")))
+
+
+@test
+def test_prefs_round_trip():
+    root, s = make_vault()
+    try:
+        eq(commands_mod.prefs(s.state_dir), {})
+        commands_mod.save_prefs(s.state_dir, local_only=True)
+        eq(commands_mod.prefs(s.state_dir)["local_only"], True)
+        commands_mod.save_prefs(s.state_dir, quiet_until="2026-09-07T08:00:00")
+        got = commands_mod.prefs(s.state_dir)
+        eq(got["local_only"], True, "save must merge, not replace")
+        eq(got["quiet_until"], "2026-09-07T08:00:00")
+    finally:
+        shutil.rmtree(root)
+
+
+class NewSessionBridge:
+    """Records that the engine's session was actually cycled."""
+
+    def __init__(self):
+        self.ended = []
+        self.started = 0
+
+    def call(self, fn, timeout=None):
+        outer = self
+
+        class FakeEngine:
+            def end_session(self, reason="quit"):
+                outer.ended.append(reason)
+            def start_session(self):
+                outer.started += 1
+                return []
+        return fn(FakeEngine())
+
+    def stop(self):
+        pass
+
+
+@test
+def test_new_ends_the_session_without_reaching_a_model():
+    app = BareHud()
+    app.bridge = NewSessionBridge()
+    app.session.turns.append(hud.Turn("operator", "brief me", time.time()))
+    app.session.turns.append(hud.Turn("v", "…", time.time(), model="sonnet-5",
+                                      cost=0.11))
+    out = app.command("/new")
+    eq(app.bridge.ended, ["new"], "the conversation must be filed, not dropped")
+    eq(app.bridge.started, 1, "…and a fresh one opened")
+    eq(out["turn"]["cost"], 0.0, "/new is not a model turn")
+    eq(out["turn"]["model"], "")
+    # The transcript belongs to the conversation that just ended; only the
+    # confirmation survives.
+    eq(len(out["live"]["turns"]), 1)
+    eq(out["live"]["turns"][0]["role"], "v")
+
+
+@test
+def test_new_keeps_the_money_it_already_spent():
+    """A budget gauge that zeroes whenever you change subject is a gauge that
+    tells you the day was free."""
+    app = BareHud()
+    app.bridge = NewSessionBridge()
+    app.session.landed(hud.Turn("v", "x", time.time(), model="sonnet-5",
+                                cost=0.42))
+    before = app.session.live()["session"]
+    app.command("/new")
+    after = app.session.live()["session"]
+    eq(after["spent"], 0.42)
+    eq(after["turns"], before["turns"] + 1, "the confirmation is itself a turn")
+    eq(after["id"], before["id"], "the HUD did not restart")
+
+
+@test
+def test_clear_empties_the_screen_but_not_the_conversation():
+    app = BareHud()
+    app.bridge = NewSessionBridge()
+    app.session.turns.append(hud.Turn("v", "x", time.time()))
+    out = app.command("/clear")
+    eq(out["turn"], None, "clearing the screen is not something V says")
+    eq(out["live"]["turns"], [])
+    eq(app.bridge.ended, [], "the session must not be filed by /clear")
+
+
+@test
+def test_unknown_command_is_refused_for_free():
+    """The whole point: an unrecognised slash must not become a paid guess."""
+    app = BareHud()
+    app.bridge = StubBridge()
+    out = app.command("/bogus")
+    eq(app.bridge.calls, 0, "it must not reach the engine at all")
+    eq(out["turn"]["cost"], 0.0)
+    eq(out["turn"]["state"], "refused")
+    ok("/bogus" in out["turn"]["text"])
+
+
+@test
+def test_client_side_commands_are_refused_at_the_server():
+    """`/why`, `/help` and `/copy` are the page's. Reaching the server means
+    the client sent something it should have kept."""
+    app = BareHud()
+    app.bridge = StubBridge()
+    for cmd in ("/why", "/help", "/copy"):
+        try:
+            app.command(cmd)
+            raise AssertionError(f"{cmd} should have been refused")
+        except hud.HudError as exc:
+            eq(exc.status, 400)
+    eq(app.bridge.calls, 0)
+
+
+@test
+def test_command_endpoint_rejects_a_plain_sentence():
+    app = BareHud()
+    srv, port = stand_up(app)
+    try:
+        status, _, _ = request(port, "POST", "/api/command",
+                               {"text": "what is on today"})
+        eq(status, 400)
+        eq(app.bridge.calls, 0)
+    finally:
+        srv.shutdown(); srv.server_close()
+
+
+@test
+def test_commands_endpoint_hides_what_the_hud_cannot_do():
+    """`/quit` is a terminal idea; a browser tab has a close button. Listing
+    it would be offering something that does nothing."""
+    app = BareHud()
+    srv, port = stand_up(app)
+    try:
+        status, body, _ = request(port, "GET", "/api/commands")
+        eq(status, 200)
+        names = [c["cmd"] for c in json.loads(body)["commands"]]
+        ok("/new" in names)
+        ok("/quit" not in names)
+        eq(len(names), len(commands_mod.COMMANDS) - len(commands_mod.NOT_ON_HUD))
+        for row in json.loads(body)["commands"]:
+            ok(set(row) == {"cmd", "what", "said"}, row)
+    finally:
+        srv.shutdown(); srv.server_close()
 
 
 def main() -> int:
