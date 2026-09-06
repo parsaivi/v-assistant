@@ -87,6 +87,25 @@ function el(spec, attrs, kids) {
 const $ = (id) => document.getElementById(id);
 function fill(node, kids) { node.replaceChildren(...kids.filter(Boolean)); }
 
+/* ---- render only what changed ------------------------------------------
+ * The panels poll every four seconds and the live stream fires on every tool
+ * call. Re-running `fill()` on that cadence rebuilt the whole transcript from
+ * scratch: the arrival animation replayed on every turn, the scroll position
+ * snapped, an open probe lost the node it was pointing at, and text you were
+ * halfway through selecting was replaced under the cursor.
+ *
+ * So every render is gated on a signature of the data behind it. The cost is
+ * a `JSON.stringify` of a few small arrays; what it buys is a page that only
+ * moves when something actually happened, which is the whole point of a
+ * surface you leave open on a second monitor. */
+const memo = {};
+
+function changed(key, sig) {
+  if (memo[key] === sig) return false;
+  memo[key] = sig;
+  return true;
+}
+
 function rgba(hex, a) {
   const n = parseInt(hex.replace('#', ''), 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
@@ -372,6 +391,8 @@ function gauge(k, value, frac, tone, kind, title, rows) {
 
 function paintGauges(snap, live) {
   const g = snap.gauges, s = live.session;
+  if (!changed('gauges', JSON.stringify([g, s.spent, s.turns, s.local,
+                                         s.latency_ms, snap.header.model]))) return;
   const cap = g.budget.cap || 2;
   const used = s.spent;
   const drift = g.drift.files;
@@ -525,17 +546,47 @@ function paintPaneHead(snap) {
   $('pane-r').textContent = right ? right() : '';
 }
 
-function paintPane() {
-  const pane = $('pane');
-  pane.dataset.stale = app.snap && app.snap.stale ? '1' : '0';
-  if (app.view === 'console') return paintConsole(pane);
-  if (app.view === 'agenda') return paintAgenda(pane);
-  if (app.view === 'memory') return paintMemory(pane);
-  if (app.view === 'vault') return paintVault(pane);
+/** Render the pane, but only if its own data moved. `key` is the signature. */
+function renderPane(key, draw) {
+  const node = $('pane');
+  node.dataset.stale = app.snap && app.snap.stale ? '1' : '0';
+  if (!changed('pane', app.view + '|' + key)) return;
+  hideProbe();
+  const top = node.scrollTop;
+  draw(node);
+  node.scrollTop = top;
 }
 
-function paintConsole(pane) {
+function paintPane() {
+  if (app.view === 'console') return paintConsole();
+  if (app.view === 'agenda') return paintAgenda();
+  if (app.view === 'memory') return paintMemory();
+  if (app.view === 'vault') return paintVault();
+}
+
+let lastTurns = 0;
+
+function paintConsole() {
   const turns = (app.live && app.live.turns) || [];
+  const node = $('pane');
+  node.dataset.stale = app.snap && app.snap.stale ? '1' : '0';
+  /* A landed turn is immutable, so its count and the length of the last one
+   * are enough to say whether the log moved. */
+  const sig = turns.length + ':' + (turns.length ? turns[turns.length - 1].text.length : 0);
+  if (!changed('pane', 'console|' + sig)) return;
+  /* Follow the log only when you are already at the end of it. Reading back
+   * through an answer while V is still working should not be interrupted by
+   * the next frame — the same rule a terminal follows. */
+  const atEnd = node.scrollHeight - node.scrollTop - node.clientHeight < 48;
+  const grew = turns.length > lastTurns;
+  const top = node.scrollTop;
+  lastTurns = turns.length;
+  hideProbe();
+  paintTurns(node, turns);
+  node.scrollTop = (grew || atEnd) ? node.scrollHeight : top;
+}
+
+function paintTurns(pane, turns) {
   if (!turns.length) {
     /* The brief's `empty` state: no greeting, no tour, no sample questions.
      * V does not introduce himself to the person who wrote him. */
@@ -577,11 +628,14 @@ function paintConsole(pane) {
                           ['OPEN', 'obsidian://open?file=' + encodeURIComponent(c)]]))) : null,
     ]);
   }))]);
-  pane.scrollTop = pane.scrollHeight;
 }
 
-function paintAgenda(pane) {
+function paintAgenda() {
   const items = (app.snap && app.snap.day_events) || [];
+  renderPane(JSON.stringify(items), (node) => paintAgendaInto(node, items));
+}
+
+function paintAgendaInto(pane, items) {
   if (!items.length) { fill(pane, [el('div.empty', { text: 'NOTHING ON THE CALENDAR TODAY.' })]); return; }
   fill(pane, [el('div.day', {}, items.map((d) => {
     const tone = d.kind === 'v' ? C.violet : (d.past ? C.dim : C.cyan);
@@ -601,8 +655,12 @@ function paintAgenda(pane) {
   }))]);
 }
 
-function paintMemory(pane) {
+function paintMemory() {
   const mems = (app.snap && app.snap.mems) || [];
+  renderPane(JSON.stringify(mems), (node) => paintMemoryInto(node, mems));
+}
+
+function paintMemoryInto(pane, mems) {
   if (!mems.length) { fill(pane, [el('div.empty', { text: 'NOTHING LEARNED YET.' })]); return; }
   fill(pane, [el('div.mems', {}, mems.map((m) => {
     const tone = m.score >= 0.7 ? C.green : (m.score >= 0.35 ? C.cyan : (m.score >= 0.2 ? C.amber : C.red));
@@ -629,7 +687,11 @@ function paintMemory(pane) {
   }))]);
 }
 
-function paintVault(pane) {
+function paintVault() {
+  renderPane(app.query + '|' + JSON.stringify(app.hits), (node) => paintVaultInto(node));
+}
+
+function paintVaultInto(pane) {
   if (!app.query) {
     fill(pane, [el('div.empty', { text: 'TYPE BELOW TO SEARCH THE VAULT. ENTER RUNS IT.' })]);
     return;
@@ -669,6 +731,10 @@ function paintVault(pane) {
 
 /* ---- right rail --------------------------------------------------------- */
 function paintPanels(snap, live) {
+  if (!changed('panels', JSON.stringify([snap.day_events, snap.tasks,
+      snap.deadlines, snap.mail, snap.nudges, live.pending,
+      snap.vault.tasks_open]))) return;
+  hideProbe();
   /* TODAY */
   const events = snap.day_events.slice(0, 4);
   $('tag-today').textContent = `M-01 · ${snap.day_events.length} EV`;
@@ -771,6 +837,9 @@ function paintPanels(snap, live) {
 /* ---- actions ------------------------------------------------------------ */
 function go(view) {
   app.view = view;
+  /* The pane holds whichever view drew last, so a signature that happens to
+   * match is not evidence the right thing is on screen. */
+  memo.pane = null;
   for (const b of $('nav').children) {
     b.setAttribute('aria-current', String(b.dataset.view === view));
   }
@@ -856,7 +925,7 @@ function applyLive(live) {
     paintPanels(app.snap, live);
     paintPaneHead(app.snap);
   }
-  if (app.view === 'console') paintPane();
+  paintPane();
 }
 
 async function refresh(force) {

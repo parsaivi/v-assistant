@@ -295,10 +295,20 @@ input { font-family: inherit; }
   -webkit-mask: radial-gradient(circle, transparent 44.5%, #000 45.5%, #000 49%, transparent 50%);
   mask: radial-gradient(circle, transparent 44.5%, #000 45.5%, #000 49%, transparent 50%); }
 .arc[data-on="1"] { opacity: 1; }
+/* Addressed by attribute, not by class, and that is not a style preference.
+ * `<div class="arclabel mem">` also matched `.mem` — the memory card in the
+ * pane — and `.arclabel msg` matched `.msg`, the inbox row. Both panel rules
+ * are defined further down this file, so at equal specificity they won: the
+ * MEM label picked up `position:relative`, a border, padding and a clip-path,
+ * fell out of its corner into the middle of the aperture and drew a box
+ * around itself. `data-label` is what the script already queries on, and a
+ * one-word class in a file this size is a collision waiting to happen. */
 .arclabel { position: absolute; font-size: 8px; letter-spacing: .16em; color: var(--ghost);
   transition: color .3s ease; }
-.arclabel.vault { left: 2%; top: 17%; } .arclabel.cal { right: 2%; top: 17%; }
-.arclabel.msg { right: 2%; bottom: 17%; } .arclabel.mem { left: 2%; bottom: 17%; }
+.arclabel[data-label="vault"] { left: 2%; top: 17%; }
+.arclabel[data-label="cal"]   { right: 2%; top: 17%; }
+.arclabel[data-label="msg"]   { right: 2%; bottom: 17%; }
+.arclabel[data-label="mem"]   { left: 2%; bottom: 17%; }
 .aperture .gyro { position: absolute; inset: 17%; border-radius: 50%;
   border: 1px dashed rgba(111,227,255,.22); animation: hSpinR 26s linear infinite; }
 .aperture .inner { position: absolute; inset: 25%; border-radius: 50%; border: 1px solid rgba(111,227,255,.12); }
