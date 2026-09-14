@@ -717,7 +717,7 @@ class Engine:
             voice_block = self.traits.block()
             if voice_block:
                 context = (context + "\n\n" if context else "") + voice_block
-            if self.persona.edits:
+            if self.persona.may_edit(self.surface):
                 # The system prompt tells every agent that writes are
                 # append-only and that nothing may touch existing prose. For
                 # this one agent that is no longer true, and the correction
@@ -727,9 +727,12 @@ class Engine:
                 context = (context + "\n\n" if context else "") + (
                     "Editing: you have `vault_edit`, `vault_set_meta` and "
                     "`vault_rewrite`, which the system prompt above says do "
-                    "not exist. They do, for you, because you only ever run "
-                    "at Parsa's own terminal. That paragraph is otherwise "
-                    "still correct — it is describing every other agent.\n"
+                    "not exist. They do, for you, on this surface "
+                    f"(`{self.surface}`), because Parsa is at the machine. "
+                    "That paragraph is otherwise still correct — it describes "
+                    "every other agent, and it describes you everywhere "
+                    "else: the same tools are absent when the question "
+                    "arrives over Telegram or the phone.\n"
                     "Read a note with `vault_read` in this same turn before "
                     "you edit it; never edit from what you remember of it "
                     "earlier in the conversation. Prefer `vault_set_meta` for "
@@ -779,6 +782,10 @@ class Engine:
             r = self.hermes.ask(question, memory=context,
                                 allow_writes=allow_writes,
                                 continue_=continue_,
+                                # Where the words came from, so the shell can
+                                # decide whether this agent gets the edit
+                                # tools here. See `Persona.may_edit`.
+                                surface=self.surface,
                                 # A floor, not a preference: an agent reached
                                 # deliberately and rarely should not be tiered
                                 # down to haiku for a question that merely

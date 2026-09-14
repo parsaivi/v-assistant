@@ -375,10 +375,32 @@ def the_engine_tells_the_shell_which_agent_is_asking():
 
 # --- editing ---------------------------------------------------------------
 @test
-def only_edith_may_modify_an_existing_note():
+def editing_is_gated_on_the_surface_not_just_the_agent():
+    """V edits where Parsa is sitting, and nowhere else.
+
+    The property worth protecting was never "only EDITH edits" — it was that
+    nothing arriving over a network he does not control end to end can change
+    a line he already wrote. V answers on Telegram and the phone, so `edits`
+    alone would have given those two surfaces `vault_rewrite`.
+    """
     eq(persona.EDITH.edits, True)
-    for p in (persona.V, persona.FRIDAY):
-        eq(p.edits, False, f"{p.key} can modify notes:")
+    eq(persona.FRIDAY.edits, False, "Friday can modify notes:")
+    eq(persona.V.edits, True, "V may edit somewhere")
+
+    for surface in (persona.TUI, persona.HUD):
+        ok(persona.V.may_edit(surface), f"V must edit on {surface}")
+    for surface in (persona.TELEGRAM, persona.PHONE, persona.CLI,
+                    persona.SCHEDULER):
+        ok(not persona.V.may_edit(surface), f"V must NOT edit on {surface}")
+
+    # EDITH names no edit surfaces because `surfaces=(TUI,)` already says it.
+    ok(persona.EDITH.may_edit(persona.TUI))
+    for surface in persona.SURFACES:
+        ok(not persona.FRIDAY.may_edit(surface), "Friday edits nowhere")
+
+    # An unknown surface fails closed, so a new front-end inherits nothing.
+    ok(not persona.V.may_edit("watch"), "unknown surfaces must fail closed")
+    ok(not persona.V.may_edit(""), "and so must an unset one")
 
 
 @test

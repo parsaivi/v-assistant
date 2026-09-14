@@ -32,12 +32,15 @@ from v.tests.test_core import make_vault
 
 # The real checked-in settings file, not a fixture: the deny rules in it are
 # half of what makes granting Write/Edit safe, so the test has to read the one
-# the CLI actually passes with `--setting-sources project,local`.
-# Resolved from the configured vault, not from this file's location.
-# V no longer lives inside the vault, so `parents[2]` is the package
-# root and not the notes — the same coupling `config.resolve_vault()`
-# exists to break.
-VAULT_SETTINGS = config.settings.vault / ".claude" / "settings.json"
+# the CLI actually passes.
+#
+# That is no longer the vault's `.claude/settings.json`. The append-only rules
+# moved into V's own `guard.settings.json` on 2026-09-13 and ride in on
+# `--settings`, because the vault file binds every Claude Code session opened
+# here — Parsa's included — and these rules are about V. Nothing else changed:
+# the patterns are still vault-relative, and `ClaudeCodeShell` still runs with
+# the vault as cwd.
+VAULT_SETTINGS = shells.GUARD_SETTINGS
 
 PASS, FAIL = [], []
 
@@ -83,11 +86,12 @@ class FakeShell(shells.Shell):
 
     def run(self, prompt, *, session_id=None, allow_writes=False, timeout=None,
             model=None, effort=None, memory="", agent="v", tier_floor=None,
-            on_event=None):
+            surface="", on_event=None):
         self.calls.append({"prompt": prompt, "session_id": session_id,
                            "allow_writes": allow_writes, "model": model,
                            "effort": effort, "memory": memory, "agent": agent,
-                           "tier_floor": tier_floor, "on_event": on_event})
+                           "tier_floor": tier_floor, "surface": surface,
+                           "on_event": on_event})
         if self.fail:
             raise ShellUnavailable("nope")
         # Surfaces are entitled to progress from any shell, so a double that

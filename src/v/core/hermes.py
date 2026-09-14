@@ -115,7 +115,8 @@ class Hermes:
     def ask(self, prompt: str, *, allow_writes: bool = False,
             continue_: bool | None = None, now: dt.datetime | None = None,
             model: str | None = None, effort: str | None = None,
-            memory: str = "", agent: str = "v", on_event=None) -> ShellResult:
+            memory: str = "", agent: str = "v", surface: str = "",
+            on_event=None) -> ShellResult:
         now = now or dt.datetime.now()
         if continue_ is None:
             # An open session is a standing "keep this thread" — and it has to
@@ -138,7 +139,7 @@ class Hermes:
                                 allow_writes=allow_writes,
                                 model=model, effort=effort, memory=memory,
                                 agent=agent, tier_floor=floor,
-                                on_event=on_event)
+                                surface=surface, on_event=on_event)
         if result.session_id:
             self._save({"session_id": result.session_id,
                         "last_used": now.isoformat(timespec="seconds"),

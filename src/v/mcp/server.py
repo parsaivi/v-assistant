@@ -1455,10 +1455,28 @@ def vault_voice_forget(trait_id: int, reason: str = "") -> str:
 
 
 def _may_edit() -> str:
-    """"" when the running agent may modify notes, else why not."""
-    agent = persona_mod.get(os.environ.get("V_AGENT", ""))
-    if agent.edits:
+    """"" when the running agent may modify notes here, else why not.
+
+    Two facts, not one: *who* is asking and *where from*. V edits at the
+    terminal and in the HUD and is append-only on Telegram and the phone, so a
+    gate that only knew the agent would read "this is V" and wave through a
+    rewrite requested by a chat message.
+    """
+    named = os.environ.get("V_AGENT", "").strip()
+    agent = persona_mod.get(named)
+    where = os.environ.get("V_SURFACE", "").strip()
+    # An unset `V_AGENT` means the server was started by something that did not
+    # say who was asking — `.mcp.json` launching it for a bare editor session,
+    # say. `persona.get("")` answers V, which is the right default for reading
+    # and the wrong one for editing, so an unnamed caller edits nothing.
+    if named and agent.may_edit(where):
         return ""
+    if agent.edits and where:
+        allowed = ", ".join(agent.edit_surfaces) or "nowhere"
+        return _err(
+            f"{agent.key} is append-only on {where}. Modifying a note that "
+            f"already exists is allowed from {allowed} only. Append with "
+            "vault_append, or ask Parsa to do it from the terminal.")
     return _err(
         f"{agent.key} is append-only. Modifying a note that already exists is "
         "EDITH's alone, and EDITH answers only at the terminal. Append to the "

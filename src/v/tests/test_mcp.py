@@ -122,7 +122,7 @@ def there_is_no_raw_write_tool():
 
 
 @test
-def the_edit_tools_refuse_every_agent_but_edith():
+def the_edit_tools_refuse_by_agent_and_by_surface():
     """The second of the two gates, and the one that catches the day somebody
     changes the first. `shells.EDIT_TOOLS` normally keeps these out of the
     allowlist so they are not even visible — but the MCP server can be started
@@ -130,24 +130,42 @@ def the_edit_tools_refuse_every_agent_but_edith():
     note is this check.
     """
     import os
-    was = os.environ.get("V_AGENT")
+    was = (os.environ.get("V_AGENT"), os.environ.get("V_SURFACE"))
+    cases = [
+        # agent,   surface,      may edit
+        ("edith",  "tui",        True),
+        ("v",      "tui",        True),
+        ("v",      "hud",        True),
+        ("v",      "telegram",   False),
+        ("v",      "phone",      False),
+        ("v",      "cli",        False),
+        ("v",      "scheduler",  False),
+        ("v",      "",           False),   # surface unset: fail closed
+        ("friday", "tui",        False),
+        # Nobody said who is asking, so nobody may edit — whatever surface is
+        # claimed. `persona.get("")` answers V, and that default is right for
+        # reading and wrong here.
+        ("",       "tui",        False),
+        ("",       "",           False),
+    ]
     try:
-        for agent, may in (("v", False), ("friday", False), ("", False),
-                           ("edith", True)):
+        for agent, surface, may in cases:
             os.environ["V_AGENT"] = agent
+            os.environ["V_SURFACE"] = surface
             denied = srv._may_edit()
+            where = f"{agent or '(unset)'} on {surface or '(unset)'}"
             if may:
-                ok(not denied,
-                   f"{agent!r} was refused but should be allowed: {denied}")
+                ok(not denied, f"{where} was refused but should be allowed: {denied}")
             else:
-                ok(denied, f"{agent or '(unset)'} was allowed to edit")
+                ok(denied, f"{where} was allowed to edit")
                 ok("append-only" in denied,
                    "the refusal should say what the agent may do instead")
     finally:
-        if was is None:
-            os.environ.pop("V_AGENT", None)
-        else:
-            os.environ["V_AGENT"] = was
+        for key, value in zip(("V_AGENT", "V_SURFACE"), was):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @test
@@ -160,6 +178,32 @@ def the_edit_tools_are_absent_from_a_non_editing_allowlist():
         ok(name not in shells.READ_TOOLS, f"{name} is on the read list")
         ok(name not in shells.WRITE_TOOLS,
            f"{name} is in WRITE_TOOLS, so every writing agent gets it")
+
+
+@test
+def the_allowlist_grants_edit_tools_by_surface():
+    """The first gate, now that it has two inputs instead of one.
+
+    V edits at the terminal and in the HUD. On Telegram and the phone the
+    names are not in `--allowed-tools` at all, so the tools do not exist for
+    that run however the message is worded — which is the difference between
+    a rule and a guarantee.
+    """
+    from v.core import persona, shells
+    edit = set(shells.EDIT_TOOLS)
+
+    def granted(agent: str, surface: str) -> bool:
+        p = persona.get(agent)
+        return bool(edit) and p.may_edit(surface)
+
+    ok(granted("v", persona.TUI) and granted("v", persona.HUD),
+       "V must edit where Parsa is at the machine")
+    for surface in (persona.TELEGRAM, persona.PHONE, persona.CLI,
+                    persona.SCHEDULER, ""):
+        ok(not granted("v", surface),
+           f"V must not get the edit tools on {surface or '(unset)'}")
+    ok(not any(granted("friday", s) for s in persona.SURFACES),
+       "Friday edits nowhere")
 
 
 @test
@@ -308,13 +352,24 @@ def markdown_writes_are_denied_to_the_native_tools():
     vault folders. What must not change is that a shell cannot write a note
     without going through vaultfs, so this checks coverage folder by folder
     and will fail if a narrowing ever leaves one exposed.
+
+    The rules live in V's own `guard.settings.json`, not the vault's
+    `.claude/settings.json`, since 2026-09-13: the vault file is read by every
+    Claude Code session opened here, and this half is about V. The patterns
+    are still written relative to the vault, because `--settings` is evaluated
+    against the run's cwd, which `ClaudeCodeShell` sets to the vault.
     """
     import fnmatch
     import json
 
+    from ..core import shells
+
     vault = config.settings.vault
+    ok(shells.GUARD_SETTINGS.exists(),
+       f"{shells.GUARD_SETTINGS} is missing — Write/Edit would reach notes "
+       f"unguarded on any writing run")
     deny = json.loads(
-        (vault / ".claude" / "settings.json").read_text()
+        shells.GUARD_SETTINGS.read_text()
     )["permissions"]["deny"]
 
     def denied(rel: str) -> bool:

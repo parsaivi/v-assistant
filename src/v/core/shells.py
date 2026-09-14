@@ -47,6 +47,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .config import Settings, settings as default_settings
 
@@ -318,7 +319,7 @@ class Shell(ABC):
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
             memory: str = "", agent: str = "v", tier_floor: str | None = None,
-            on_event: Progress = None) -> ShellResult: ...
+            surface: str = "", on_event: Progress = None) -> ShellResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +461,9 @@ WRITE_TOOLS = [
 # `WRITE_TOOLS` on purpose: every other agent is append-only *by construction*
 # rather than by instruction — these names never enter its allowlist, so no
 # prompt and no misread instruction can produce a modification. Added only for
-# an agent whose `Persona.edits` is true, which today is EDITH and only at the
-# terminal.
+# an agent whose `Persona.may_edit(surface)` is true: EDITH, who only ever runs
+# at the terminal, and V when the words arrived at the terminal or the HUD.
+# Telegram and the phone never see these names, whoever is asking.
 EDIT_TOOLS = [
     "mcp__vault__vault_edit",       # one exact, unique string
     "mcp__vault__vault_set_meta",   # frontmatter only, body untouched
@@ -494,6 +496,16 @@ HOST_TOOLS = [
 # rules on `NN - Folder/**/*.md`, so these reach the scripts and configs at the
 # vault root but not a single note — vault prose stays on the vaultfs path.
 HOST_WRITE_TOOLS = ["Write", "Edit", "NotebookEdit"]
+
+# Where those deny rules now live. They sat in the vault's
+# `.claude/settings.json` until 2026-09-13, which meant every Claude Code
+# session opened in the vault inherited them — Parsa's own interactive ones
+# included, where they were never the point. `ClaudeCodeShell` passes this
+# file with `--settings` so the fence binds V and nothing else; the privacy
+# half stays in the vault settings, because *that* half should bind everyone.
+# `tests/test_shell.py` and `tests/test_mcp.py` assert this file still covers
+# every granted file writer and every numbered folder on disk.
+GUARD_SETTINGS = Path(__file__).with_name("guard.settings.json")
 
 
 def _emit(on_event: Progress, event: ShellEvent) -> None:
@@ -683,7 +695,7 @@ class ClaudeCodeShell(Shell):
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
             memory: str = "", agent: str = "v", tier_floor: str | None = None,
-            on_event: Progress = None) -> ShellResult:
+            surface: str = "", on_event: Progress = None) -> ShellResult:
         if not self.available:
             raise ShellUnavailable(
                 "the `claude` CLI is not on PATH — install Claude Code first")
@@ -721,10 +733,13 @@ class ClaudeCodeShell(Shell):
         turn = f"{memory.strip()}\n\n---\n\n{prompt}" if memory.strip() else prompt
         tools = READ_TOOLS + HOST_TOOLS + (
             WRITE_TOOLS + HOST_WRITE_TOOLS if allow_writes else [])
-        # Editing is a capability of the agent, not of the run. A read-only run
-        # gets none of it either way; a writing run gets it only if whoever is
-        # asking is allowed to modify existing notes.
-        if allow_writes and persona.get(agent).edits:
+        # Editing is a capability of the agent *on a surface*. A read-only run
+        # gets none of it either way; a writing run gets it only if this agent
+        # may modify existing notes **and** the words arrived somewhere it is
+        # trusted to. `surface` defaults to empty, which no persona lists, so a
+        # caller that forgets to pass it gets the append-only toolset rather
+        # than the permissive one — the safe direction to fail in.
+        if allow_writes and persona.get(agent).may_edit(surface):
             tools += EDIT_TOOLS
         sid = session_id or str(uuid.uuid4())
         cmd = [
@@ -738,6 +753,19 @@ class ClaudeCodeShell(Shell):
             "--allowed-tools", *tools,
             "--append-system-prompt", system,
             "--setting-sources", "project,local",
+            # The append-only half of the guard, and the reason it is passed
+            # here rather than left in the vault's `.claude/settings.json`
+            # beside the privacy half: that file is read by *every* Claude Code
+            # session opened in the vault, Parsa's own included, and the rules
+            # are about V, not about a human at the keyboard.
+            #
+            # It cannot be split by setting source. The line above loads
+            # `project,local`; an interactive session loads `user,project,
+            # local`. V's sources are a strict subset of his, so no source
+            # exists that V reads and he does not. `--settings` is the seam
+            # that does separate them — an additional file, highest
+            # precedence, named only here.
+            "--settings", str(GUARD_SETTINGS),
             # This account also has claude.ai's own generic Google
             # Calendar/Gmail/Drive connectors attached (`claude mcp list`),
             # unrelated to the vault and gated by their own OAuth. Without
@@ -792,8 +820,13 @@ class ClaudeCodeShell(Shell):
         # without this it would open its memory store at the default scope and
         # every tool call EDITH made would write into V's beliefs, quietly
         # undoing the isolation one level below where it is enforced.
+        # …and where it is being asked from, for the same reason: the second
+        # edit gate in `mcp/server.py` re-checks the persona in its own
+        # process, and since V now edits on some surfaces and not others, that
+        # check needs the surface or it degrades to "is this V?" — which is
+        # true on Telegram too.
         env = dict(os.environ, CLAUDE_CONFIG_DIR=self.s.claude_config_dir,
-                   V_AGENT=agent or "v")
+                   V_AGENT=agent or "v", V_SURFACE=surface or "")
 
         streaming = self.s.shell_stream
         if streaming:
@@ -1016,8 +1049,8 @@ class HermesShell(Shell):
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
             memory: str = "", agent: str = "v", tier_floor: str | None = None,
-            on_event: Progress = None) -> ShellResult:
-        del memory, on_event  # unverified sketch; see the class docstring
+            surface: str = "", on_event: Progress = None) -> ShellResult:
+        del memory, surface, on_event  # unverified sketch; see the docstring
         if not self.available:
             raise ShellUnavailable(
                 "the `hermes` CLI is not installed. Install it with:\n"
