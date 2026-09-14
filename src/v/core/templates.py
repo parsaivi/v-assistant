@@ -73,6 +73,14 @@ HEADINGS = {
 }
 
 TEMPLATER = re.compile(r"<%\s*(.*?)\s*%>", re.DOTALL)
+# `<%* … %>` is Templater's *execution* block: JavaScript that runs for its
+# side effects and outputs nothing unless it appends to `tR`. It is code, not
+# a token, so the only correct rendering of one here is the empty string.
+# Before this, the weekly template — which opens with a block computing the
+# week's Saturday — had its `tp.date.now("d")` plucked out of the middle of the
+# JavaScript and rendered as a bare `6`, leaving that digit above a second,
+# unrendered frontmatter block in every weekly note V scaffolded.
+TEMPLATER_EXEC = re.compile(r"<%\*.*?-?%>\n?", re.DOTALL)
 OBSIDIAN = re.compile(r"\{\{\s*([^}]*?)\s*\}\}")
 TP_DATE_NOW = re.compile(r'tp\.date\.now\(\s*"([^"]*)"(?:\s*,\s*(-?\d+))?')
 
@@ -154,7 +162,8 @@ def render_text(raw: str, *, title: str = "", when: dt.date | None = None,
             return moment_format(dt.datetime.now(), fmt.strip() or "HH:mm")
         return _lookup(ctx, key)
 
-    return OBSIDIAN.sub(obsidian, TEMPLATER.sub(templater, raw))
+    return OBSIDIAN.sub(obsidian, TEMPLATER.sub(templater,
+                                                TEMPLATER_EXEC.sub("", raw)))
 
 
 def heading_for(kind: str, body: str) -> str:
