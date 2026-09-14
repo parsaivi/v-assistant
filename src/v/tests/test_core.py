@@ -1520,6 +1520,102 @@ def nudges_are_free_and_survive_failures():
         shutil.rmtree(root)
 
 
+@test
+def a_silenced_check_disappears_from_every_list_and_comes_back_whole():
+    """"Stop telling me this" has to mean everywhere — the brief, the digest,
+    the HUD panel and the Telegram push are all `NudgeEngine.all()`."""
+    root, s = make_vault()
+    try:
+        ne = nudges.NudgeEngine(s)
+        before = ne.all()
+        victim = next(n for n in before if n.id == "crm.overdue")
+
+        key = ne.silence(victim, reason="not this month")
+        eq(key, "crm.overdue")
+        after = ne.all()
+        ok(all(n.key != key for n in after), "a silenced check must not fire")
+        eq(len(after), len(before) - 1, "and nothing else may vanish with it")
+
+        # The one screen whose job is to show what is hidden still sees it.
+        shown = ne.all(include_silenced=True)
+        ok(any(n.key == key for n in shown))
+        listed = ne.silenced()
+        eq([x.key for x in listed], [key])
+        eq(listed[0].reason, "not this month")
+        ok(listed[0].text, "the words that prompted the decision are kept")
+
+        # …including when the caller only had the key. Every surface but the
+        # `⊗` button silences by key — a raw `uni.overdue:03 - University/…`
+        # in the list a month later is a decision you cannot re-read.
+        ne.restore(key)
+        ne.silence(key)
+        eq(ne.silenced()[0].text, victim.text,
+           "the sentence that was on screen must be recovered from the key")
+
+        ok(ne.restore(key), "restore reports that something was hidden")
+        ok(not ne.restore(key), "…and that the second call found nothing")
+        eq(len(ne.all()), len(before), "restored whole, not approximately")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_silence_survives_the_text_it_was_made_from_changing():
+    """The reason this keys on `Nudge.key` and not on the words: a nudge's
+    text is a number the vault recomputes. "No workout logged in 5 days" is
+    six days tomorrow, and a text-keyed silence would evaporate overnight —
+    which is the opposite of the `task_ignores` decision next door, and for
+    the opposite reason. Both key on the thing that holds still."""
+    root, s = make_vault()
+    try:
+        ne = nudges.NudgeEngine(s)
+        ne.silence(nudges.Nudge("gym.gap", nudges.NOTIFY, 1,
+                                "No workout logged in 5 days."))
+        # Tomorrow, same check, different sentence.
+        later = nudges.Nudge("gym.gap", nudges.NOTIFY, 2,
+                             "No workout logged in 6 days.")
+        ok(later.key in ne.silenced_keys(), "still silenced the next morning")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def one_birthday_can_be_silenced_without_silencing_birthdays():
+    """Three checks emit one nudge per *thing* under a single id. Without a
+    discriminator, dismissing one person's birthday would dismiss everyone's,
+    which is a silence far wider than the click that asked for it."""
+    root, s = make_vault()
+    try:
+        ne = nudges.NudgeEngine(s)
+        a = nudges.Nudge("crm.birthday", nudges.NOTIFY, 1, "Ali's birthday",
+                         subject="10 - Personal CRM/Ali.md")
+        b = nudges.Nudge("crm.birthday", nudges.NOTIFY, 1, "Sara's birthday",
+                         subject="10 - Personal CRM/Sara.md")
+        ok(a.key != b.key, "same check, different subject, different key")
+        ne.silence(a)
+        off = ne.silenced_keys()
+        ok(a.key in off and b.key not in off)
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_crashing_check_cannot_be_silenced():
+    """A check that is raising is a bug report, not a preference — and its key
+    carries the exception text, so it would come back under a different key
+    the moment the traceback changed. Silencing it is a promise V can't keep."""
+    root, s = make_vault()
+    try:
+        ne = nudges.NudgeEngine(s)
+        try:
+            ne.silence("error.gym_gap")
+            ok(False, "silencing a failing check must be refused")
+        except ValueError as exc:
+            ok("fix it" in str(exc), str(exc))
+    finally:
+        shutil.rmtree(root)
+
+
 # --- engine ----------------------------------------------------------
 @test
 def engine_never_spends_money():

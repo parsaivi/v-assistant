@@ -1390,8 +1390,47 @@ class Engine:
 
     def nudge_digest(self) -> Response:
         items = self.nudges.all()
-        return Response(nudges.digest(items, max_items=12),
-                        data={"count": len(items)}, route="nudges")
+        off = self.nudges.silenced()
+        text = nudges.digest(items, max_items=12)
+        if off:
+            # Said every time, not just when the list is empty. A silence list
+            # nobody is reminded of is how "nothing needs you" quietly becomes
+            # a lie — the whole reason this is cheap to undo is that you can
+            # see it is there.
+            text += (f"\n\n_{len(off)} check{'s' if len(off) != 1 else ''} "
+                     f"silenced — `/nudges off` lists them, "
+                     f"`/nudges on <key>` brings one back._")
+        return Response(text, data={"count": len(items),
+                                    "silenced": len(off)}, route="nudges")
+
+    def nudge_silence(self, key: str, *, reason: str = "") -> Response:
+        """Stop volunteering one check. Touches no note, so there is nothing
+        for `v undo` to revert — `nudge_restore` is the undo."""
+        try:
+            self.nudges.silence(key, reason=reason)
+        except ValueError as exc:
+            return Response(str(exc), route="nudges", decision="refused")
+        return Response(f"Silenced `{key}`. I won't raise it again until you "
+                        f"restore it.", route="nudges")
+
+    def nudge_restore(self, key: str) -> Response:
+        if self.nudges.restore(key):
+            return Response(f"`{key}` is back in every list I build.",
+                            route="nudges")
+        return Response(f"`{key}` wasn't silenced.", route="nudges",
+                        decision="no-op")
+
+    def nudges_silenced(self) -> Response:
+        off = self.nudges.silenced()
+        if not off:
+            return Response("Nothing silenced. Every check is live.",
+                            data={"silenced": 0}, route="nudges")
+        lines = [f"⊗ `{s.key}`" + (f" — {s.text}" if s.text else "")
+                 + f"\n   silenced {s.at[:10]}"
+                 + (f" · {s.reason}" if s.reason else "")
+                 for s in off]
+        return Response("\n".join(lines), data={"silenced": len(off)},
+                        route="nudges")
 
     def evening(self, now: dt.datetime | None = None) -> Response:
         """Draft today's daily note from what actually happened. Confirm to write."""

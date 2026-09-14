@@ -627,7 +627,22 @@ def _repl_command(line: str, engine: Engine) -> bool:
     elif cmd == "evening":
         _print(_thinking(engine.evening), animate=True)
     elif cmd == "nudges":
-        _print(_thinking(engine.nudge_digest), animate=True)
+        # `/nudges` is the digest; `/nudges off` is what it is not telling
+        # you, and `/nudges off <key>` / `/nudges on <key>` move things
+        # between the two. Positional rather than flags because this is a
+        # prompt, not a shell.
+        verb, _, key = rest.partition(" ")
+        verb, key = verb.strip(), key.strip()
+        if verb == "off" and key:
+            _print(engine.nudge_silence(key))
+        elif verb == "off":
+            _print(engine.nudges_silenced())
+        elif verb == "on" and key:
+            _print(engine.nudge_restore(key))
+        elif verb:
+            print(ui.error("/nudges · /nudges off [key] · /nudges on <key>"))
+        else:
+            _print(_thinking(engine.nudge_digest), animate=True)
     elif cmd == "tasks":
         _print(_thinking(engine.handle, "what should I do today",
                          engine=engine), animate=True)
@@ -779,7 +794,21 @@ def cmd_evening(args, engine: Engine) -> int:
 
 
 def cmd_nudges(args, engine: Engine) -> int:
-    _print(_thinking(engine.nudge_digest), animate=True)
+    """The digest, and the three verbs that decide what is in it.
+
+    Silencing lives here rather than only on the HUD because the HUD is a
+    surface you have to be sitting in front of, and "stop telling me this" is
+    most often said in the second after being told — which is as likely to be
+    in the terminal or over Telegram.
+    """
+    if args.silence:
+        _print(engine.nudge_silence(args.silence, reason=args.reason or ""))
+    elif args.restore:
+        _print(engine.nudge_restore(args.restore))
+    elif args.silenced:
+        _print(engine.nudges_silenced())
+    else:
+        _print(_thinking(engine.nudge_digest), animate=True)
     return 0
 
 
@@ -882,6 +911,60 @@ def cmd_tasks(args, engine: Engine) -> int:
             return 1
         print(ui.ok(engine._complete(
             hits[0][0], _dt.datetime.combine(day, _dt.time())).text))
+        return 0
+
+    if args.ignore:
+        hits = engine.q.find_task(args.ignore)
+        if not hits:
+            print(ui.error(f"no open task matching {args.ignore!r}"))
+            return 1
+        if len(hits) > 1 and hits[0][1] - hits[1][1] < 0.15:
+            print(ui.note(f"ambiguous — {args.ignore!r} matches:"))
+            for t, sc in hits[:5]:
+                print(f"{ui.INDENT}  {ui.DIM}[{t.id}] {sc:.2f}{ui.RESET} "
+                      f"{t.render()}")
+            return 1
+        t = hits[0][0]
+        engine.q.tasks.ignore(t, reason="cli")
+        print(ui.ok(f"Ignored **{t.text}**. The note is untouched — it just "
+                    f"stops showing up in priorities, overdue and the "
+                    f"backlog. `v tasks --unignore` brings it back."))
+        return 0
+
+    if args.unignore:
+        if engine.q.tasks.unignore(args.unignore):
+            print(ui.ok(f"**{args.unignore}** is back in the lists."))
+            return 0
+        # `--ignore` matched fuzzily to get here, so `--unignore` has to as
+        # well. Exact-only made this a one-way door: a task silenced by typing
+        # four of its words could not be brought back by typing the same four.
+        hits = engine.q.tasks.find_ignored(args.unignore)
+        if not hits:
+            print(ui.error(f"nothing ignored matching {args.unignore!r} — "
+                           "`v tasks --ignored` lists them"))
+            return 1
+        if len(hits) > 1 and hits[0][1] - hits[1][1] < 0.15:
+            print(ui.note(f"ambiguous — {args.unignore!r} matches:"))
+            for i, sc in hits[:5]:
+                print(f"{ui.INDENT}  {ui.DIM}{sc:.2f}{ui.RESET} {i.text}")
+            return 1
+        engine.q.tasks.unignore(hits[0][0].norm)
+        print(ui.ok(f"**{hits[0][0].text}** is back in the lists."))
+        return 0
+
+    if args.ignored:
+        rows = engine.q.tasks.ignored()
+        if not rows:
+            print(ui.note("nothing ignored — V is tracking every task."))
+            return 0
+        print(ui.markdown(f"{len(rows)} ignored task"
+                          f"{'s' if len(rows) != 1 else ''}"))
+        print()
+        for i in rows:
+            live = (f"hiding {i.live} open" if i.live else "no live copy left")
+            print(f"{ui.INDENT}{ui.DIM}⊗{ui.RESET} {i.text}")
+            print(f"{ui.INDENT}  {ui.DIM}{i.age_days()}d ago · {live}"
+                  f"{' · ' + i.rel if i.rel else ''}{ui.RESET}")
         return 0
 
     if args.backlog:
@@ -1933,7 +2016,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("brief").set_defaults(fn=cmd_brief)
     sub.add_parser("evening").set_defaults(fn=cmd_evening)
-    sub.add_parser("nudges").set_defaults(fn=cmd_nudges)
+    s = sub.add_parser("nudges", help="what the vault knows that you don't")
+    # The key, not the text: a nudge's words are a number the vault recomputes
+    # ("in 5 days" is 6 tomorrow), so the check's id is the only stable handle.
+    # `v nudges --silenced` prints them.
+    s.add_argument("--silence", metavar="KEY",
+                   help="stop raising this check until it is restored")
+    s.add_argument("--restore", metavar="KEY",
+                   help="put a silenced check back in every list")
+    s.add_argument("--silenced", action="store_true",
+                   help="what is currently hidden, and since when")
+    s.add_argument("--reason", default="",
+                   help="a note to your future self, shown with --silenced")
+    s.set_defaults(fn=cmd_nudges)
 
     s = sub.add_parser("briefing", help="the standing 10:00 morning push")
     s.add_argument("--push", action="store_true",
@@ -1965,6 +2060,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--overdue", action="store_true")
     s.add_argument("--backlog", action="store_true", help="how far behind")
     s.add_argument("--done", metavar="TEXT", help="tick a task off by name")
+    # The third answer to a task, next to the one that ticks it. Writes
+    # nothing to the vault — see `tasks.IGNORES_SCHEMA` for why that is the
+    # point rather than a shortcut.
+    s.add_argument("--ignore", metavar="TEXT",
+                   help="stop V bringing a task up, without touching the note")
+    s.add_argument("--unignore", metavar="TEXT", help="undo an --ignore")
+    s.add_argument("--ignored", action="store_true",
+                   help="list what V has been told to stop bringing up")
     s.add_argument("--area", help="Work / University / Life")
     s.add_argument("--day", help="YYYY-MM-DD (default today)")
     s.add_argument("--limit", type=int, default=12)

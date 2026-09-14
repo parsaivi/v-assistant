@@ -228,6 +228,11 @@ def rebuild(settings: Settings | None = None, *, full: bool = False,
     # Recurring-vs-real is a whole-vault judgement (does this checkbox appear in
     # many notes?), so it can only run once every note has been seen.
     tasks.classify_recurring(conn)
+    # And the silence list is re-stamped onto the rows it applies to. The
+    # record lives in `task_ignores`, which this rebuild does not touch; this
+    # is what puts the user's decision back onto Markdown that was just
+    # re-read and knows nothing about it. See `tasks.apply_ignores`.
+    tasks.apply_ignores(conn)
     stats.tasks = conn.execute(
         "SELECT COUNT(*) FROM tasks WHERE kind='task'").fetchone()[0]
     conn.execute("INSERT OR REPLACE INTO meta_kv VALUES ('last_index', ?)",
@@ -303,6 +308,20 @@ def resync_note(conn: sqlite3.Connection, rel: str,
     _upsert(conn, notes.parse(path, s.vault), s, stats)
     conn.commit()
     return stats.tasks
+
+
+def open_task_count(conn: sqlite3.Connection) -> int:
+    """Unticked commitments the user has not silenced.
+
+    Not `COUNT(*) WHERE state IN ('open','doing')`, which is what this used to
+    be and which counted every square bracket in the vault — the MR review
+    checklists, the lesson rules, `- [ ] Trained today` in every daily note —
+    and reported ~800 things owed. `kind`, `recurring` and `ignored` are the
+    three columns that turn that into a number worth showing.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE state IN ('open','doing')"
+        " AND kind='task' AND recurring=0 AND ignored=0").fetchone()[0]
 
 
 def _delete(conn: sqlite3.Connection, rel: str, fts: bool) -> None:
@@ -438,7 +457,8 @@ def stats(settings: Settings | None = None) -> dict:
         "words": q("SELECT COALESCE(SUM(words),0) FROM notes"),
         "chunks": q("SELECT COUNT(*) FROM chunks"),
         "tasks": q("SELECT COUNT(*) FROM tasks"),
-        "tasks_open": q("SELECT COUNT(*) FROM tasks WHERE state IN ('open','doing')"),
+        "tasks_open": open_task_count(conn),
+        "tasks_ignored": q("SELECT COUNT(*) FROM tasks WHERE ignored=1"),
         "links": q("SELECT COUNT(*) FROM links"),
         "tags": q("SELECT COUNT(DISTINCT tag) FROM tags"),
         "types": {r["type"] or "(none)": r["n"] for r in conn.execute(

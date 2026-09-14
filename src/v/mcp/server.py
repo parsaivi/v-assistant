@@ -360,11 +360,15 @@ def vault_standup() -> str:
         "  open       — all open commitments\n"
         "  overdue    — past their date\n"
         "  backlog    — the counts behind 'how far behind am I'\n"
-        "  search     — find a task by text (pass `text`)\n\n"
+        "  search     — find a task by text (pass `text`)\n"
+        "  ignored    — what Parsa has told V to stop bringing up\n\n"
         "Only real commitments are returned. Template checklists (MR review "
         "boxes), lesson-note bullets, and rituals repeated in every daily note "
         "are classified out; a task copied across several days is collapsed to "
-        "one. `day` is YYYY-MM-DD and defaults to today."
+        "one. Tasks Parsa has ignored are left out of every view except "
+        "`ignored` and `search` — that is deliberate, not a gap, and their "
+        "`- [ ]` lines are still in the notes. `day` is YYYY-MM-DD and "
+        "defaults to today."
     )
 )
 def vault_tasks(view: str = "priorities", text: str | None = None,
@@ -375,6 +379,18 @@ def vault_tasks(view: str = "priorities", text: str | None = None,
     if view == "backlog":
         r = e.q.backlog(when)
         return r.answer + "\n\n" + r.table(20)
+    if view == "ignored":
+        rows = e.q.tasks.ignored()
+        if not rows:
+            return "Nothing is ignored — V is tracking every task."
+        lines = [f"{len(rows)} ignored task{'s' if len(rows) != 1 else ''} — "
+                 "left out of every other view on purpose. "
+                 "vault_task_done(state='unignored') brings one back.", ""]
+        for i in rows:
+            live = f"hiding {i.live} open" if i.live else "no live copy left"
+            where = f" — {i.link()}" if i.rel else ""
+            lines.append(f"- {i.text} ({i.age_days()}d ago · {live}){where}")
+        return "\n".join(lines)
     if view == "search":
         if not text:
             return _err("view='search' needs `text`")
@@ -389,7 +405,7 @@ def vault_tasks(view: str = "priorities", text: str | None = None,
              "overdue": lambda: e.q.overdue_tasks(when, limit=limit)}
     if view not in kinds:
         return _err(f"unknown view {view!r}. Valid: "
-                    "priorities, open, overdue, backlog, search")
+                    "priorities, open, overdue, backlog, search, ignored")
     r = kinds[view]()
     if not r.rows:
         return r.answer
@@ -1149,20 +1165,40 @@ def vault_create(rel: str, frontmatter: str, body: str = "") -> str:
         "vault_undo. This is the only way to close a task; Write and Edit are "
         "denied.\n\n"
         "state: done (default) · dropped (abandoned — struck through, not "
-        "deleted, so the record of having decided survives) · doing · open."
+        "deleted, so the record of having decided survives) · doing · open · "
+        "ignored · unignored.\n\n"
+        "`ignored` is the one that writes nothing to the vault: the checkbox "
+        "stays exactly as Parsa typed it and V stops counting, ranking or "
+        "mentioning it anywhere. Use it when he says a task is no longer "
+        "worth talking about, is stale, or should stop being brought up — "
+        "never `done`, which claims he did it, and prefer it over `dropped` "
+        "unless he wants the note itself to record that he gave up. "
+        "`unignored` undoes it."
     )
 )
 def vault_task_done(task_id: int, state: str = "done") -> str:
     import v.core.tasks as tasks_mod
     valid = {"done": tasks_mod.DONE, "dropped": tasks_mod.DROPPED,
              "doing": tasks_mod.DOING, "open": tasks_mod.OPEN}
-    if state not in valid:
-        return _err(f"unknown state {state!r}. Valid: {', '.join(valid)}")
+    if state not in valid and state not in ("ignored", "unignored"):
+        return _err(f"unknown state {state!r}. Valid: "
+                    f"{', '.join(list(valid) + ['ignored', 'unignored'])}")
     e = E()
     t = e.q.tasks.get(task_id)
     if not t:
         return _err(f"no task with id {task_id}. Use vault_tasks(view='search') "
                     "to find it — ids come from there.")
+    if state == "ignored":
+        if e.q.tasks.is_ignored(t):
+            return f"Already ignored: {t.text} — {t.link()}"
+        e.q.tasks.ignore(t, reason="asked")
+        return (f"Ignored: {t.text} — {t.link()}. The note is unchanged; it "
+                f"just stops appearing in priorities, overdue and the "
+                f"backlog. Say the words again to bring it back.")
+    if state == "unignored":
+        if not e.q.tasks.unignore(t.norm_key):
+            return f"Wasn't ignored: {t.text} — {t.link()}"
+        return f"Back in the lists: {t.text} — {t.link()}"
     if t.state == valid[state]:
         return f"Already {state}: {t.text} — {t.link()}"
     try:

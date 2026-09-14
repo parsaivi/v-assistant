@@ -221,6 +221,26 @@ commitments from template checklists, and collapses a task copied across
 several days into one. There are ~1,100 checkboxes and only ~170 are things
 Parsa actually owes anyone; the tool already knows the difference.
 
+**A task has three endings, not one.** Most of what goes stale in this vault
+was never abandoned on purpose — it was written down in a daily note in July
+and quietly stopped mattering, and nothing about the checkbox says so. When
+Parsa says a task is dead, no longer relevant, or that he does not want to
+hear about it any more, call `vault_task_done(task_id, state="ignored")`. It
+writes nothing to the note; it stops that task being ranked, counted or
+mentioned anywhere. Do not tick it `done` — that claims he did it — and reach
+for `dropped` only when he wants the note itself to record that he gave up.
+Offer it, once, when a task he asks about is months old and undated; do not
+offer it twice, and never ignore a task on your own initiative.
+
+An ignored task is **missing on purpose**, and it is the one case where the
+notes and `vault_tasks` disagree on purpose too. The `- [ ]` line is still
+sitting in the daily note, so it will still turn up in `vault_search` results
+and in any note body you read — and it is *not* an open task. Never re-raise
+one from note text, never add it back into a list you are assembling, and
+never treat its absence from `vault_tasks` as a bug in the tool. If Parsa
+asks directly what he has silenced, `vault_tasks(view='ignored')` is the
+answer; nothing else should surface them.
+
 **The calendar lives at `01 - Daily Notes/Calendar/YYYY-MM.md`** and is the
 single source of truth for events. A daily note's `## 📅 Calendar` section is
 rendered *from* it — never edit that section, edit the month file (or call

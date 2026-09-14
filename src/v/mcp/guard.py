@@ -67,13 +67,39 @@ class Privacy:
         wikilinks are stripped and the headline survives. Found the hard way:
         the first version of `vault_nudges` cheerfully returned three contacts
         by name.
+
+        The headline is scrubbed on its own terms rather than blanked, because
+        for some checks it *is* the leak. `project.stale` builds its text as
+        f"{folder} hasn't been touched in {age} days", so the folder name is in
+        `text` and nowhere else that `render()` prints. Blanking the whole
+        string would throw away the actionable half to remove the private
+        half; replacing just the name keeps "something private is going stale"
+        while the model never learns which folder. Parsa still sees the real
+        name — `v nudges` renders the unscrubbed list, since this guard is the
+        MCP surface and he is not the one being kept out.
         """
         out = []
         for n in items:
-            leaks = any(self.blocks(_strip_link(l)) for l in n.links) or \
-                any(f in (n.detail or "") for f in self.folders)
+            # `subject` is checked alongside the two visible fields even
+            # though `render()` never prints it: it is a note path on the
+            # checks that speak about many things at once (`crm.birthday`
+            # carries `10 - Personal CRM/…`), it travels to surfaces as part
+            # of `Nudge.key`, and a field that is private-by-content but
+            # unguarded is exactly how the CRM names got out the first time.
+            private = getattr(n, "subject", "") or ""
+            text = n.text
+            for f in self.folders:
+                text = text.replace(f, "A private folder")
+            # A rewritten headline is itself a leak signal: `project.stale`
+            # sets a private `subject` too, but a check that named a folder in
+            # `text` alone would otherwise pass all three tests below and print
+            # the name anyway.
+            leaks = text != n.text or \
+                any(self.blocks(_strip_link(l)) for l in n.links) or \
+                any(f in (n.detail or "") for f in self.folders) or \
+                (private and self.blocks(private))
             if leaks:
-                n = replace(n, links=[],
+                n = replace(n, text=text, links=[], subject="",
                             detail="(details withheld — private folder)")
             out.append(n)
         return out

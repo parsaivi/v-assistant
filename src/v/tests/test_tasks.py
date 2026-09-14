@@ -388,6 +388,359 @@ def finding_a_task_by_a_distinctive_word_beats_shared_filler():
     eq(hits[0][0].text, "debugging the payment worker")
 
 
+# -------------------------------------------------------------- ignoring --
+# The failure these freeze: after a week of use the vault holds dozens of
+# checkboxes that were never decisions, and V ranks, counts and asks about
+# every one of them forever, because "this is over and I'm not doing it" was
+# not something the system could be told.
+
+STALE_VAULT = (
+    "01 - Daily Notes/2026/06 - June/2026-06-02.md",
+    '---\ndate: "2026-06-02"\n---\n\n## Tasks\n'
+    "- [ ] read the Kafka rebalance doc\n"
+    "- [ ] chase the design review\n",
+)
+
+
+@test
+def an_ignored_task_leaves_every_list_v_builds():
+    """One clause in `open()` rather than one per caller: priorities, overdue,
+    the backlog count and the due-date lookups all read the vault through it,
+    which is what makes "stop bringing it up" mean everywhere at once."""
+    st = store(STALE_VAULT)
+    day = dt.date(2026, 8, 1)
+    t = next(t for t in st.open() if t.text.startswith("read the Kafka"))
+    st.ignore(t, reason="test")
+
+    texts = {x.text for x in st.open()}
+    ok("read the Kafka rebalance doc" not in texts, f"still open: {texts}")
+    ok("chase the design review" in texts, "ignored one, hid two")
+    ok(all("Kafka" not in x.text for x in st.priorities(today=day)),
+       "still ranked")
+    ok(all("Kafka" not in x.text for x in st.overdue(day)), "still overdue")
+    ok(all("Kafka" not in x.text for x in st.due_by(day)), "still due")
+    eq(st.backlog_shape(day)["open"], 1)
+    eq(st.backlog_shape(day)["ignored"], 1)
+
+
+@test
+def ignoring_writes_nothing_to_the_note():
+    """The whole reason this is not `complete(state=DROPPED)`. Parsa's daily
+    note from June keeps the line exactly as he typed it; only V's opinion of
+    it changes."""
+    root = Path(tempfile.mkdtemp())
+    rel, body = STALE_VAULT
+    p = root / rel
+    p.parent.mkdir(parents=True)
+    p.write_text(body, encoding="utf-8")
+    s = Settings(vault=root)
+    s.git_enabled = False
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    st = tasks.TaskStore(conn, s)
+    tasks.replace_for_note(conn, rel, tasks.parse_note(notes.parse(p, root)))
+
+    st.ignore(next(t for t in st.open() if "Kafka" in t.text))
+    eq(p.read_text(encoding="utf-8"), body, "the note was edited —")
+
+
+@test
+def ignoring_follows_a_task_carried_across_notes():
+    """A task pasted into four daily notes is one task — `collapse()` has
+    always said so. Ignoring it four times, once per copy, would be the same
+    chore this feature exists to remove, so the key is the text."""
+    st = store(
+        ("01 - Daily Notes/2026/06 - June/2026-06-02.md",
+         '---\ndate: "2026-06-02"\n---\n\n## Tasks\n- [ ] chase the design review\n'),
+        ("01 - Daily Notes/2026/06 - June/2026-06-03.md",
+         '---\ndate: "2026-06-03"\n---\n\n## Tasks\n- [ ] chase the design review\n'),
+        ("01 - Daily Notes/2026/06 - June/2026-06-04.md",
+         '---\ndate: "2026-06-04"\n---\n\n## Tasks\n- [ ] chase the design review\n'),
+    )
+    eq(len(st.open()), 3, "three copies on disk —")
+    st.ignore(st.open()[0])
+    eq(st.open(), [], "one ignore, every copy —")
+
+
+@test
+def an_ignore_survives_a_full_reindex():
+    """`task_ignores` is the user's decision, not a mirror of the Markdown, so
+    it lives outside the tables `rebuild()` refills. Keyed on the text and not
+    on `blake2b(rel|line)` for the same reason: re-parsing a note renumbers
+    every task below an inserted line."""
+    from v.core import index
+    root = Path(tempfile.mkdtemp())
+    rel, body = STALE_VAULT
+    p = root / rel
+    p.parent.mkdir(parents=True)
+    p.write_text(body, encoding="utf-8")
+    s = Settings(vault=root, state_dir=root / ".state")
+    s.ensure_dirs()
+
+    index.rebuild(s)
+    conn = index.connect(s)
+    st = tasks.TaskStore(conn, s)
+    t = next(x for x in st.open() if "Kafka" in x.text)
+    old_id = t.id
+    st.ignore(t)
+    conn.close()
+
+    # A line inserted above it: every id below moves, the text does not.
+    p.write_text(body.replace("## Tasks\n", "## Tasks\n- [ ] something new\n"),
+                 encoding="utf-8")
+    index.rebuild(s, full=True)
+    conn = index.connect(s)
+    st = tasks.TaskStore(conn, s)
+    texts = {x.text for x in st.open()}
+    ok("read the Kafka rebalance doc" not in texts,
+       f"came back after a rebuild: {texts}")
+    ok("something new" in texts, "the rest of the note must still index")
+    # The point of the test, stated, and it is worse than "the id is gone":
+    # the id it was ignored under now resolves to *the newly inserted task*,
+    # because an id is `blake2b(rel|line)` and the line number was reused. An
+    # id-keyed silence list would not merely have failed open here — it would
+    # have silenced a task written thirty seconds ago.
+    moved = st.get(old_id)
+    ok(moved is not None and moved.text == "something new",
+       f"expected the id to be reused, got {moved and moved.text!r}")
+    eq([i.live for i in st.ignored()], [1], "it should say what it is hiding")
+    conn.close()
+
+
+@test
+def the_flag_is_re_stamped_onto_rows_a_rebuild_recreated():
+    """`task_ignores` is the record and `tasks.ignored` is the flag. A rebuild
+    deletes and refills the mirror from Markdown that knows nothing about the
+    decision, so the flag has to be put back — this is the join between the
+    two, and it is the only thing standing between "ignored" and "ignored
+    until the next time a note is saved"."""
+    from v.core import index
+    root = Path(tempfile.mkdtemp())
+    rel, body = STALE_VAULT
+    p = root / rel
+    p.parent.mkdir(parents=True)
+    p.write_text(body, encoding="utf-8")
+    s = Settings(vault=root, state_dir=root / ".state")
+    s.ensure_dirs()
+
+    index.rebuild(s)
+    conn = index.connect(s)
+    st = tasks.TaskStore(conn, s)
+    eq(index.open_task_count(conn), 2)
+    st.ignore(next(x for x in st.open() if "Kafka" in x.text))
+    eq(conn.execute("SELECT COUNT(*) FROM tasks WHERE ignored=1").fetchone()[0],
+       1, "ignoring must stamp the row it applies to, not only the record —")
+    eq(index.open_task_count(conn), 1, "the count must drop immediately —")
+    conn.close()
+
+    index.rebuild(s, full=True)
+    conn = index.connect(s)
+    flagged = [r[0] for r in conn.execute(
+        "SELECT text FROM tasks WHERE ignored=1")]
+    eq(flagged, ["read the Kafka rebalance doc"],
+       "the flag did not survive the rebuild —")
+    eq(index.open_task_count(conn), 1)
+    eq(index.stats(s)["tasks_ignored"], 1)
+    conn.close()
+
+
+@test
+def the_flag_survives_the_single_note_resync_after_a_write():
+    """The other path into the mirror, and the one that runs constantly:
+    ticking a box or adding a task re-parses just that note. It goes through
+    `replace_for_note`, which recreates every row in the file — including the
+    silenced one, whose flag would be lost if only `apply_ignores` set it."""
+    from v.core import index
+    from v.core.vaultfs import Vault
+    root = Path(tempfile.mkdtemp())
+    rel, body = STALE_VAULT
+    p = root / rel
+    p.parent.mkdir(parents=True)
+    p.write_text(body, encoding="utf-8")
+    s = Settings(vault=root, state_dir=root / ".state")
+    s.git_enabled = False
+    s.ensure_dirs()
+    index.rebuild(s)
+    conn = index.connect(s)
+    st = tasks.TaskStore(conn, s)
+
+    st.ignore(next(x for x in st.open() if "Kafka" in x.text))
+    # Tick the *other* task, which rewrites and re-indexes the same note.
+    st.complete(next(x for x in st.open() if "design" in x.text), Vault(s))
+
+    eq([x.text for x in st.open()], [],
+       "the silenced task came back when its note was re-indexed")
+    eq(conn.execute("SELECT COUNT(*) FROM tasks WHERE ignored=1").fetchone()[0], 1)
+    conn.close()
+
+
+@test
+def an_ignored_task_is_gone_from_the_brief_and_from_answers():
+    """The requirement in one test: ignoring is not a HUD feature.
+
+    Every surface that volunteers a task — the morning brief, the evening
+    review, "what are my priorities", "how far behind am I", the open list —
+    goes through `TaskStore.open()`, so all of them are checked here against
+    one real engine rather than trusted to keep doing so.
+    """
+    from v.core import index
+    from v.core.engine import Engine
+    root = Path(tempfile.mkdtemp())
+    rel, body = STALE_VAULT
+    p = root / rel
+    p.parent.mkdir(parents=True)
+    p.write_text(body, encoding="utf-8")
+    s = Settings(vault=root, state_dir=root / ".state")
+    s.git_enabled = False
+    s.ensure_dirs()
+    index.rebuild(s)
+    engine = Engine(s)
+    try:
+        needle = "Kafka"
+
+        def surfaces() -> dict:
+            return {
+                "brief": engine.brief().text,
+                "evening": engine.evening().text,
+                "priorities": engine.q.priorities().answer + "".join(
+                    r.title for r in engine.q.priorities().rows),
+                "open": "".join(r.title for r in engine.q.open_tasks().rows),
+                "overdue": "".join(r.title for r in
+                                   engine.q.overdue_tasks().rows),
+                "working_state": engine._working_state(
+                    dt.datetime.now()),
+            }
+
+        before = surfaces()
+        # Named explicitly so this cannot quietly become a test that proves
+        # nothing: the brief is the surface the requirement was written about,
+        # and it has to be showing the task before it can be shown not to.
+        shown = {k for k, v in before.items() if needle in v}
+        ok({"brief", "priorities", "open", "overdue", "working_state"} <= shown,
+           f"the fixture must start visible on every list surface, got {shown}")
+
+        t = next(x for x in engine.q.tasks.open() if needle in x.text)
+        engine.q.tasks.ignore(t, reason="test")
+
+        after = surfaces()
+        leaked = [k for k, v in after.items() if needle in v]
+        eq(leaked, [], f"an ignored task is still being volunteered by {leaked}")
+        ok("chase the design review" in after["open"],
+           "ignoring one must not hide the rest")
+    finally:
+        engine.close()
+
+
+@test
+def naming_an_ignored_task_still_finds_it():
+    """The filter hides tasks from lists V volunteers, never from a question
+    that asks for one. Without this the only way back from an ignore is the
+    HUD, and "mark the Kafka thing done" answers that there is no such task."""
+    st = store(STALE_VAULT)
+    st.ignore(next(t for t in st.open() if "Kafka" in t.text))
+    hits = st.find("kafka rebalance")
+    eq(len(hits), 1, "an ignored task must still be findable by name —")
+
+
+@test
+def un_ignoring_takes_the_phrase_or_the_key():
+    """The HUD hands back the key it was given; a person at a terminal types
+    the words. Both have to work or the feature has a one-way door in it."""
+    st = store(STALE_VAULT)
+    t = next(x for x in st.open() if "Kafka" in x.text)
+    key = st.ignore(t)
+    ok(st.unignore(key), "by key —")
+    eq(len({x.text for x in st.open()}), 2, "back in the list —")
+
+    st.ignore(t)
+    ok(st.unignore("Read the Kafka Rebalance Doc"), "by phrase —")
+    eq(len(st.open()), 2)
+    ok(not st.unignore("never ignored anything like this"),
+       "unignoring nothing must report that it did nothing")
+
+
+@test
+def un_ignoring_matches_a_name_the_way_ignoring_did():
+    """The door has to open both ways. `--ignore` finds its task through
+    `find()`, so a task can be silenced by typing four of its words — and
+    before this, bringing it back needed the text reproduced exactly. Found
+    by typing the phrase with a letter wrong, which is how it was noticed."""
+    st = store(STALE_VAULT)
+    st.ignore(next(t for t in st.open() if "Kafka" in t.text))
+    ok(not st.unignore("kafka doc"), "an exact-key miss is still a miss —")
+    hits = st.find_ignored("kafka doc")
+    eq(len(hits), 1, "the phrase must still name it —")
+    ok(st.unignore(hits[0][0].norm))
+    eq(len(st.open()), 2, "back in the list —")
+    eq(st.find_ignored("kafka doc"), [], "nothing left to find")
+
+
+@test
+def ticking_an_ignored_task_clears_the_ignore():
+    """Otherwise the entry outlives the checkbox it was about, and writing the
+    same words next month lands pre-silenced by a decision made about a task
+    that has since been ticked."""
+    root = Path(tempfile.mkdtemp())
+    rel, body = STALE_VAULT
+    p = root / rel
+    p.parent.mkdir(parents=True)
+    p.write_text(body, encoding="utf-8")
+    s = Settings(vault=root)
+    s.git_enabled = False
+    from v.core.vaultfs import Vault
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    st = tasks.TaskStore(conn, s)
+    tasks.replace_for_note(conn, rel, tasks.parse_note(notes.parse(p, root)))
+
+    t = next(x for x in st.open() if "Kafka" in x.text)
+    st.ignore(t)
+    eq(len(st.ignored()), 1)
+    st.complete(t, Vault(s), today=dt.date(2026, 8, 2))
+    eq(st.ignored(), [], "the silence list outlived the task —")
+
+
+@test
+def a_task_with_no_normalisable_text_is_still_ignorable():
+    """`NORM_SQL` and `Task.norm_key` have to agree character for character.
+    They disagreed once, on a checkbox that normalises to nothing, and the
+    ignore was written to a key no query would ever match."""
+    st = store(("01 - Daily Notes/2026/06 - June/2026-06-02.md",
+                '---\ndate: "2026-06-02"\n---\n\n## Tasks\n- [ ] ??? !!! ???\n'))
+    rows = st.open()
+    if not rows:
+        return          # the parser drops it as a placeholder, which is fine
+    st.ignore(rows[0])
+    eq(st.open(), [], "an ignore keyed off norm_key must match NORM_SQL —")
+
+
+@test
+def v_is_told_a_task_has_three_endings():
+    """The prompt is the only place V learns `ignored` exists. Without it the
+    tool ships and V keeps offering to tick things Parsa never did.
+
+    It also has to be told that an ignored task is missing *on purpose*: the
+    `- [ ]` line is still in the daily note, so it still comes back from
+    `vault_search`, and a model that reads note bodies will otherwise helpfully
+    put it back into the list the user just took it out of.
+    """
+    from v.core.identity import SYSTEM
+    low = SYSTEM.lower()
+    ok('state="ignored"' in low or "state='ignored'" in low,
+       "the prompt never shows the ignored state")
+    ok("writes nothing to the note" in low,
+       "the prompt must say ignoring does not touch the vault")
+    ok("missing on purpose" in low and "vault_search" in low,
+       "the prompt must warn against re-raising one from note text")
+    # And the view it points at has to exist, or the instruction is a dead
+    # end that costs a tool call to discover.
+    import v.mcp.server as server
+    ok('view == "ignored"' in
+       Path(server.__file__).read_text(encoding="utf-8"),
+       "the prompt names vault_tasks(view='ignored') and the tool has no "
+       "such view")
+
+
 # -------------------------------------------------------------- calendar --
 @test
 def the_clock_is_pinned_not_inherited():
