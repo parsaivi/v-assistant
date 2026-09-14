@@ -126,10 +126,28 @@ class Reminders:
         return _row(row) if row else None
 
     # ---- state transitions -------------------------------------------
-    def mark_fired(self, reminder: Reminder, *, now: dt.datetime | None = None) -> None:
+    def settle(self, reminder: Reminder, *, now: dt.datetime | None = None) -> bool:
+        """Mark delivered, and say whether *this* caller is the one that did it.
+
+        Called only once something has actually reached a surface — never from
+        the code that merely *builds* the message. See `Engine.due_reminders`
+        for why that distinction is the whole point of this method.
+
+        `WHERE fired IS NULL` makes the read and the write one statement, for
+        the same reason `claim` below does it: two schedulers run against this
+        table on this machine (`v.service` pushing to Telegram, `v-serve` to
+        the phone), on two processes with two connections. Both may legitimately
+        deliver the same reminder to their own surface; only the winner of the
+        race may advance a recurrence, or a daily reminder would quietly become
+        two daily reminders.
+        """
         now = now or dt.datetime.now()
-        self.conn.execute("UPDATE reminders SET fired=? WHERE id=?",
-                          (now.timestamp(), reminder.id))
+        cur = self.conn.execute(
+            "UPDATE reminders SET fired=? WHERE id=? AND fired IS NULL",
+            (now.timestamp(), reminder.id))
+        if cur.rowcount == 0:
+            self.conn.commit()
+            return False
         if reminder.recurrence:
             nxt = advance(reminder.due, reminder.recurrence, now)
             if nxt:
@@ -140,6 +158,12 @@ class Reminders:
                      reminder.recurrence, reminder.source),
                 )
         self.conn.commit()
+        return True
+
+    def mark_fired(self, reminder: Reminder, *, now: dt.datetime | None = None) -> None:
+        """Settle, ignoring who won. Kept for callers that have already
+        delivered and have nothing to decide on the answer."""
+        self.settle(reminder, now=now)
 
     def cancel(self, rid: int) -> bool:
         cur = self.conn.execute(

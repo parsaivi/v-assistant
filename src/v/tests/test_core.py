@@ -1660,6 +1660,71 @@ def quiet_hours_are_respected():
         shutil.rmtree(root)
 
 
+@test
+def composing_a_reminder_does_not_settle_it():
+    """The bug this guards: `due_reminders` used to mark every reminder fired
+    in the same loop that built its text, so a push that failed afterwards
+    left a row claiming delivery of a message nobody ever saw — and `pending()`
+    hid it, because it filters on `fired IS NULL`."""
+    root, s = make_vault()
+    try:
+        e = Engine(s)
+        e.reminders.add("send Parasto the form", dt.datetime.now() - dt.timedelta(minutes=1))
+        first = e.due_reminders()
+        eq(len(first), 1)
+        eq(len(e.reminders.pending()), 1,
+           "composing the message must not mark it delivered")
+        eq(len(e.due_reminders()), 1, "and it must still be offered next tick")
+        e.close()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_failed_push_leaves_the_reminder_due():
+    """Late, never lost. A sink that reports failure must not cost the row."""
+    root, s = make_vault()
+    s.embedding_backend = "tfidf"
+    try:
+        from v.core.scheduler import Scheduler
+        e = Engine(s)
+        e.reminders.add("ask her about digi pay", dt.datetime.now() - dt.timedelta(minutes=1))
+
+        seen = []
+        down = Scheduler(e, s, sink=lambda src, item: seen.append(item) or False)
+        down._deliver("tick", ("reminders", e.due_reminders()))
+        eq(len(seen), 1, "it was handed over")
+        eq(len(e.reminders.pending()), 1,
+           "but an undelivered reminder stays due for the next tick")
+
+        up = Scheduler(e, s, sink=lambda src, item: None)
+        up._deliver("tick", ("reminders", e.due_reminders()))
+        eq(len(e.reminders.pending()), 0, "a delivered one settles")
+        e.close()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def only_one_deliverer_may_advance_a_recurrence():
+    """Two schedulers run against this table on Parsa's machine — `v.service`
+    pushing to Telegram and `v-serve` to the phone. Both may deliver; only one
+    may re-arm, or a daily reminder becomes two daily reminders."""
+    root, s = make_vault()
+    try:
+        telegram_side = reminders.Reminders(s)
+        phone_side = reminders.Reminders(s)
+        due = dt.datetime.now() - dt.timedelta(minutes=5)
+        rem = telegram_side.add("daily thing", due, recurrence="day")
+
+        ok(telegram_side.settle(rem), "the first deliverer claims it")
+        ok(not phone_side.settle(phone_side.get(rem.id)),
+           "the second is told it lost the race")
+        eq(len(phone_side.pending()), 1, "exactly one re-armed copy, not two")
+    finally:
+        shutil.rmtree(root)
+
+
 # --- work ------------------------------------------------------------
 @test
 def gitlab_status_maps_to_vault_vocabulary():

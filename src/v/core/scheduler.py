@@ -133,21 +133,55 @@ class Scheduler:
     def run(self, *, once: bool = False, interval: int = 30) -> None:
         missed = self.catch_up()
         for item in missed:
-            self.sink("catch-up", item)
+            self._deliver("catch-up", item)
 
         if once:
             for item in self.tick():
-                self.sink("tick", item)
+                self._deliver("tick", item)
             return
 
         print(f"scheduler running · {len(self.jobs)} jobs · polling every {interval}s")
         try:
             while True:
                 for item in self.tick():
-                    self.sink("tick", item)
+                    self._deliver("tick", item)
                 time.sleep(interval)
         except KeyboardInterrupt:
             print("\nstopped")
+
+    # ---- delivery ----------------------------------------------------
+    def _deliver(self, source: str, item) -> None:
+        """Hand one job's output to the sink, and settle what arrived.
+
+        The sink contract: return `False` to say *nothing in this item reached
+        anyone*. `None` (what a sink that merely prints returns) and `True`
+        both mean delivered, so a surface with nothing to report doesn't have
+        to care.
+
+        Only reminders are settled, because only reminders have a row that a
+        premature write can destroy. A morning brief that fails to send is
+        regrettable; a reminder that fails to send used to be *gone*, marked
+        delivered in SQLite and invisible in `pending()`. Now an unconfirmed
+        reminder stays due and the one-minute tick tries it again.
+
+        The cost of that is a possible duplicate: a sink that delivered two
+        reminders and failed on a third reports `False` for the item, and all
+        three are retried. Seeing a reminder twice is a smaller failure than
+        never seeing it at all, and this is the trade the whole change is
+        about.
+        """
+        if self.sink(source, item) is False:
+            return          # left due on purpose — the next tick retries it
+        _, payload = item if isinstance(item, tuple) else (source, item)
+        for p in (payload if isinstance(payload, list) else [payload]):
+            if getattr(p, "route", "") != "reminder:fire":
+                continue
+            rid = (getattr(p, "data", None) or {}).get("reminder_id")
+            if rid is not None:
+                try:
+                    self.engine.settle_reminder(rid)
+                except Exception:       # noqa: BLE001 — a retry beats a crash
+                    pass
 
     def tick(self, now: dt.datetime | None = None) -> list[tuple[str, object]]:
         now = now or dt.datetime.now()

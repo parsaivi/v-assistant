@@ -1128,6 +1128,12 @@ def cmd_reminders(args, engine: Engine) -> int:
             print(ui.hint("nothing due"))
         for r in fired:
             print(ui.markdown(r.render()))
+            # Settled only now, after it is on screen — the terminal is a
+            # surface like any other, and `due_reminders` no longer settles
+            # anything it merely composed.
+            rid = (r.data or {}).get("reminder_id")
+            if rid is not None:
+                engine.settle_reminder(rid)
         return 0
     pending = engine.reminders.pending()
     print(ui.hint(f"{len(pending)} pending"))

@@ -1227,6 +1227,23 @@ class Engine:
                         data={"reminder_id": rem.id}, route="reminder")
 
     def due_reminders(self, now: dt.datetime | None = None) -> list[Response]:
+        """Everything due, as messages — and **nothing is marked fired here.**
+
+        This used to settle each reminder in the same loop that built its text,
+        which meant a push that failed afterwards — Telegram unreachable, an
+        SSE bus nobody was holding — left a row the table swore had been
+        delivered and no human had ever seen. `telegram.send_message` is
+        documented "best-effort — never raises" and returns `False`, so the
+        loss was silent by construction, and `pending()` (hence `v reminders`
+        and the HUD panel) hid the evidence because it filters on `fired IS
+        NULL`.
+
+        Composing and delivering are two different facts. Only the second one
+        is allowed to write to the row: `Scheduler._deliver` settles what its
+        sink confirms, and anything unconfirmed stays due and is retried on
+        the next one-minute tick. Late, never lost — which is what this
+        module's header has always claimed.
+        """
         out = []
         for rem in self.reminders.due_now(now):
             late = rem.overdue_by
@@ -1238,8 +1255,14 @@ class Engine:
                                 buttons=[Button("Snooze 30m", "snooze",
                                                 {"id": rem.id, "minutes": 30})],
                                 data={"reminder_id": rem.id}, route="reminder:fire"))
-            self.reminders.mark_fired(rem, now=now)
         return out
+
+    def settle_reminder(self, rid: int, now: dt.datetime | None = None) -> bool:
+        """Mark one reminder delivered, by id. Safe to call twice."""
+        rem = self.reminders.get(rid)
+        if rem is None:
+            return False
+        return self.reminders.settle(rem, now=now)
 
     # ---- questions the window refused --------------------------------
     def answer_deferred(self, now: dt.datetime | None = None) -> list[Response]:

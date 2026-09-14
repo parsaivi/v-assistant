@@ -233,14 +233,32 @@ def build_sink(bus: Broadcast, s: Settings | None = None):
     """
     s = s or default_settings
 
-    def sink(source: str, item) -> None:
+    def sink(source: str, item) -> bool:
+        """Returns False when a reminder had no one to go to.
+
+        The backlog is a reconnect buffer, not a mailbox: it is in memory, it
+        holds the last `keep` events, and it dies with the process. For the
+        brief or a brag draft that is exactly right. For a reminder it is not
+        — `Scheduler._deliver` would settle the row, and a phone that was
+        simply not running that morning would have nothing, forever.
+
+        So a reminder with no live listener is not published at all and is
+        reported undelivered; it stays due, and the next one-minute tick
+        offers it again. The retry *is* the backlog, and it is a durable one,
+        because it lives in SQLite. Everything else publishes as before.
+        """
         name, payload = item if isinstance(item, tuple) else (source, item)
         items = payload if isinstance(payload, list) else [payload]
+        live = bus.listeners > 0
+        ok = True
         for p in items:
             if p is None:
                 continue
             text = getattr(p, "render", lambda: str(p))()
             if not text or not text.strip():
+                continue
+            if getattr(p, "route", "") == "reminder:fire" and not live:
+                ok = False
                 continue
             data = getattr(p, "data", None) or {}
             bus.publish(str(name), text, {
@@ -252,6 +270,7 @@ def build_sink(bus: Broadcast, s: Settings | None = None):
                 "files": [file_meta(s, rel) for rel in (data.get("files") or [])
                           if isinstance(rel, str)],
             })
+        return ok
     return sink
 
 
