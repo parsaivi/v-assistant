@@ -24,7 +24,10 @@ one.** The shell only ever gets text back from this whole process (see
 through. These tools do the entire job themselves: build a self-contained
 HTML file (`core/render.py`), save it, and open it in the browser. The model
 never sees the HTML and should not try to describe its contents — it just
-reports what it opened.
+reports what it opened. Saving also announces the artifact (`core/media.py`),
+so if the HUD is open it appears in its viewport at the same moment — again
+without the model being told, because a surface it cannot see is not
+something it should be reasoning about.
 """
 
 from __future__ import annotations
@@ -1041,7 +1044,8 @@ def vault_chart(labels: list[str], values: list[float], kind: str = "bar",
                                           title=title, unit=unit)
     except ValueError as exc:
         return _err(str(exc))
-    path = render.save(page, slug=title or kind, settings=S)
+    path = render.save(page, slug=title or kind, title=title or f"{kind} chart",
+                       caption=f"{len(labels)} points · vault_chart", settings=S)
     render.open_file(path)
     sent = _send_to_telegram(path, caption=title)
     return (f"Opened a {kind} chart"
@@ -1096,7 +1100,8 @@ def vault_trend(series: str, days: int = 14, month: str | None = None) -> str:
                         "carbs, fiber, category-spend")
     except ValueError as exc:
         return _err(str(exc))
-    path = render.save(page, slug=series, settings=S)
+    path = render.save(page, slug=series, title=f"{series} trend",
+                       caption=f"last {days} days · vault_trend", settings=S)
     render.open_file(path)
     sent = _send_to_telegram(path, caption=f"{series} trend")
     return (f"Opened the {series} trend in your browser ({path})."
