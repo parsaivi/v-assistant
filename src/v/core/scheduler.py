@@ -99,6 +99,13 @@ class Scheduler:
             # truth instead of a feed, a section, and a reminders table
             # disagreeing with each other.
             Job("calendar-sync", dt.time(6, 30), self._calendar_sync),
+            # Saturday opens this vault's week, so the week note has to exist
+            # and be seeded before the first daily note of it embeds anything.
+            # Early, and before `calendar-sync` would render the day: a daily
+            # note whose `## ⏱ Schedule` says "not synced yet" all Saturday is
+            # the one failure that would make the whole feature feel dead.
+            Job("week-scaffold", dt.time(5, 30), self._week_scaffold,
+                weekdays=(5,)),
             # Every 10 minutes, not every minute like reminders: an unread
             # email is not as time-critical as a reminder Parsa set for a
             # specific minute, and Gmail's list endpoint is not free to poll
@@ -313,6 +320,24 @@ class Scheduler:
             memory_markdown=self.engine.memory.export_markdown(),
         )
         return "refreshed 19 - Assistant/V/"
+
+    def _week_scaffold(self):
+        """Create and seed this week's note, then render it into the dailies.
+
+        The V half of "both". Templater does this when Parsa makes the note in
+        Obsidian; this is for the weeks he doesn't, and `reseed` is what makes
+        running after Templater harmless — it is append-only and deduped, so a
+        note Obsidian already filled gains nothing.
+        """
+        wp = self.engine.q.weekplan
+        day = dt.date.today()
+        rel = wp.ensure_week(day)
+        added = wp.reseed(day)
+        synced = sum(1 for i in range(7)
+                     if wp.sync_daily_note(day + dt.timedelta(days=i)))
+        return (f"week note {rel}"
+                + (f" · +{added} repeating block(s)" if added else "")
+                + (f" · {synced} daily note(s) synced" if synced else ""))
 
     def _calendar_sync(self):
         cal = self.engine.q.calendar

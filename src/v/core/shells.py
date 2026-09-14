@@ -375,6 +375,10 @@ READ_TOOLS = [
     "mcp__vault__vault_validate", "mcp__vault__vault_status",
     "mcp__vault__vault_standup", "mcp__vault__vault_reminders",
     "mcp__vault__vault_tasks", "mcp__vault__vault_calendar",
+    # The week's shape, and the gaps in it. Read-only and free — and the only
+    # tools that can answer "when am I free", which the calendar cannot.
+    "mcp__vault__vault_schedule_week", "mcp__vault__vault_free_time",
+    "mcp__vault__vault_now",
     "mcp__vault__vault_memory_list", "mcp__vault__vault_voice_list",
     # Emails and phone numbers out of `10 - Personal CRM`, and nothing else
     # from it. On the read list rather than the write one because it changes
@@ -422,7 +426,15 @@ WRITE_TOOLS = [
     "mcp__vault__vault_append", "mcp__vault__vault_create",
     "mcp__vault__vault_remind", "mcp__vault__vault_undo",
     "mcp__vault__vault_task_done", "mcp__vault__vault_add_task",
-    "mcp__vault__vault_schedule",
+    "mcp__vault__vault_schedule", "mcp__vault__vault_add_block",
+    # Changing a block that already exists. These *are* edits, and they are
+    # here rather than in `EDIT_TOOLS` on purpose: they take a date and a
+    # time, can only rewrite one line of one `## Schedule` section, check the
+    # kind against a closed vocabulary first, and refuse a line they cannot
+    # find exactly once. "My class was cancelled" is the most obvious thing
+    # to say to V from a phone, and gating it to the terminal would make the
+    # schedule the one thing V can add to but never correct.
+    "mcp__vault__vault_remove_block", "mcp__vault__vault_move_block",
     # Creating a Google event is the one write here that leaves the machine:
     # it emails the guests, and `vault_undo` does not reach it. Behind the
     # write flag like everything else, and the tool description says to

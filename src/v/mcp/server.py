@@ -436,6 +436,225 @@ def vault_calendar(day: str | None = None, days: int = 1) -> str:
     return r.answer + ("\n\n" + r.table(30) if r.rows else "")
 
 
+# ------------------------------------------------------------------- the week --
+# Three read tools and one write, and they are deliberately not folded into the
+# calendar tools above. The calendar answers "what is scheduled"; these answer
+# "where do my hours go" — which is a different file, a different question, and
+# the only one of the two that can say what is *free*.
+@mcp.tool(
+    description=(
+        "Parsa's hour-by-hour schedule — where his time actually goes, from "
+        "the '## Schedule' section of that week's note at "
+        "'01 - Daily Notes/Weekly/YYYY/YYYY-Www.md'. One-off events from the "
+        "vault calendar are folded in, so this is the complete picture of a "
+        "day.\n\n"
+        "Each block has a kind: class · work · commute · gym · sleep · study · "
+        "paper · personal · event. Use this to answer 'am I in class now?', "
+        "'what does Tuesday look like?', 'how much am I working this week?'\n\n"
+        "`day` is YYYY-MM-DD (default today); `days` widens the window (7 for "
+        "the whole week). An empty result means that day is unscheduled, not "
+        "that there is no schedule."
+    )
+)
+def vault_schedule_week(day: str | None = None, days: int = 1) -> str:
+    when = notes.as_date(day) if day else dt.date.today()
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    r = E().q.schedule(when, days=days)
+    return r.answer + ("\n\n" + r.table(50) if r.rows else "")
+
+
+@mcp.tool(
+    description=(
+        "When Parsa is FREE — the gaps left after class, work, commute, gym, "
+        "sleep and every calendar event are subtracted from the waking day. "
+        "Nothing in the vault records free time; it is computed here.\n\n"
+        "This is the tool for 'when can I work on the paper?', 'do I have two "
+        "hours tomorrow?', 'when should we meet?'. Prefer it over reading the "
+        "schedule and doing the arithmetic yourself.\n\n"
+        "`day` is YYYY-MM-DD (default today), `days` widens the window, and "
+        "`min_minutes` sets the shortest gap worth reporting."
+    )
+)
+def vault_free_time(day: str | None = None, days: int = 1,
+                    min_minutes: int = 30) -> str:
+    when = notes.as_date(day) if day else dt.date.today()
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    r = E().q.free_time(when, days=days, min_minutes=min_minutes)
+    return r.answer + ("\n\n" + r.table(50) if r.rows else "")
+
+
+@mcp.tool(
+    description=(
+        "What Parsa is in the middle of right now, and how long until he is "
+        "free. Answers 'is he busy?', 'can he talk?' without reading a whole "
+        "day's schedule."
+    )
+)
+def vault_now() -> str:
+    wp = E().q.weekplan
+    now = dt.datetime.now()
+    block = wp.now_block(now)
+    if block:
+        out = f"now ({now:%H:%M}) · {block.render()}"
+        gap = wp.next_free(15, start=now)
+        if gap and gap.date == now.date():
+            out += f"\nfree from {gap.start:%H:%M}"
+        return out
+    gap = next((g for g in wp.free(now.date(), min_minutes=15,
+                                   after=now.time())), None)
+    if gap:
+        return (f"now ({now:%H:%M}) · nothing scheduled — free until "
+                f"{gap.end:%H:%M}")
+    return f"now ({now:%H:%M}) · nothing scheduled"
+
+
+@mcp.tool(
+    description=(
+        "Add a time block to a week's schedule — 'gym tuesday 19:00-20:30', "
+        "'class 2026-09-20 10:30-12:00 Compiler @204', 'paper friday "
+        "10:00-13:00'. Use this for TIME (a stretch of the day that is spoken "
+        "for), and vault_add_task for a TODO.\n\n"
+        "Recognises a kind (class · work · commute · gym · sleep · study · "
+        "paper · personal · event) anywhere in the text; the rest becomes the "
+        "label. Appends to that week's note only — other weeks are untouched, "
+        "which is the point of the design. Commits as [bot] and is undoable. "
+        "For something that should repeat every week, tell Parsa to add it to "
+        "'05 - Templates/Week Schedule.md' instead."
+    )
+)
+def vault_add_block(text: str) -> str:
+    from ..core import weekplan as wp_mod
+    block = wp_mod.parse_natural(text, today=dt.date.today())
+    if not block:
+        return _err("couldn't find a time in that. Try "
+                    "'gym tuesday 19:00-20:30'.")
+    e = E()
+    said = e.q.weekplan.add(block)
+    e.q.weekplan.sync_daily_note(block.date)
+    return f"{block.date.isoformat()} · {said}"
+
+
+# The two verbs that change a block that already exists. They are *edits*,
+# and they are deliberately not behind `Persona.edit_surfaces` with
+# `vault_edit`/`vault_rewrite`: those take arbitrary text and can touch any
+# line of any note, which is why they are gated to the machine Parsa is
+# sitting at. These take a date and a time, can only ever rewrite one line in
+# one `## Schedule` section, validate the kind against a closed vocabulary
+# before writing, and refuse a line they cannot find exactly once. "My class
+# was cancelled" is the single most obvious thing to say to V from a phone,
+# and it would be absurd for that to be the one thing it cannot do.
+@mcp.tool(
+    description=(
+        "Remove a time block from Parsa's schedule — a cancelled class, a "
+        "meeting that is off, a gym session he skipped.\n\n"
+        "`day` is the date the block is on (YYYY-MM-DD) and `at` is its start "
+        "time (HH:MM). Call vault_schedule_week first if you are not certain "
+        "of both — this refuses rather than guessing, and a wrong guess "
+        "deletes the wrong hour.\n\n"
+        "Writes one line out of that week's note, commits as [bot], and is "
+        "undoable with vault_undo. To cancel something only this once, this "
+        "is the right tool; to stop it repeating every week, tell Parsa to "
+        "edit '05 - Templates/Week Schedule.md' instead."
+    )
+)
+def vault_remove_block(day: str, at: str) -> str:
+    e = E()
+    when = notes.as_date(day)
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    found = _block_at(e, when, at)
+    if isinstance(found, str):
+        return found
+    try:
+        return e.q.weekplan.remove(when, found.line())
+    except Exception as exc:
+        return _err(str(exc))
+    finally:
+        e.q.weekplan.sync_daily_note(when)
+
+
+@mcp.tool(
+    description=(
+        "Move or change a time block that is already on the schedule — push a "
+        "meeting an hour later, shift a gym session to another day, rename it, "
+        "or change its kind.\n\n"
+        "`day` + `at` name the block as it stands now (call vault_schedule_week "
+        "if unsure). Everything else is optional and only what you pass is "
+        "changed: `to_day` (YYYY-MM-DD), `to_start`/`to_end` (HH:MM), `kind` "
+        "(class · work · commute · gym · sleep · study · paper · personal · "
+        "event), `label`.\n\n"
+        "Rewrites the line in place so the note stays in time order, commits "
+        "as [bot], and is undoable with vault_undo."
+    )
+)
+def vault_move_block(day: str, at: str, to_day: str | None = None,
+                     to_start: str | None = None, to_end: str | None = None,
+                     kind: str | None = None, label: str | None = None) -> str:
+    from ..core import weekplan as wp_mod
+    e = E()
+    when = notes.as_date(day)
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    found = _block_at(e, when, at)
+    if isinstance(found, str):
+        return found
+
+    changes: dict = {}
+    if to_day:
+        moved = notes.as_date(to_day)
+        if moved is None:
+            return _err(f"couldn't read {to_day!r} as a date — use YYYY-MM-DD")
+        changes["date"] = moved
+    for key, raw in (("start", to_start), ("end", to_end)):
+        if raw:
+            parsed = wp_mod._parse_time(raw)
+            if parsed is None:
+                return _err(f"couldn't read {raw!r} as a time — use HH:MM")
+            changes[key] = parsed
+    if kind:
+        changes["kind"] = kind
+    if label is not None:
+        changes["label"] = label
+    if not changes:
+        return _err("nothing to change — pass to_day, to_start, to_end, "
+                    "kind or label")
+    try:
+        said = e.q.weekplan.move(when, found.line(), **changes)
+    except Exception as exc:
+        return _err(str(exc))
+    e.q.weekplan.sync_daily_note(when)
+    if changes.get("date") and changes["date"] != when:
+        e.q.weekplan.sync_daily_note(changes["date"])
+    return said
+
+
+def _block_at(engine, day: dt.date, at: str):
+    """The one block starting at `at` on `day`, or an error string saying why not.
+
+    Addressed by start time rather than by its written line, because a model
+    holding a whole line is a model that has to reproduce it byte-perfectly —
+    including the `·` separators and an `@location` it may not have been shown.
+    A time is what Parsa would say out loud.
+    """
+    from ..core import weekplan as wp_mod
+    want = wp_mod._parse_time(at or "")
+    if want is None:
+        return _err(f"couldn't read {at!r} as a time — use HH:MM")
+    on_day = [b for b in engine.q.weekplan.on(day) if b.start == want]
+    if not on_day:
+        listed = ", ".join(f"{b.time_label} {b.title}"
+                           for b in engine.q.weekplan.on(day)) or "nothing"
+        return _err(f"nothing starts at {at} on {day.isoformat()}. "
+                    f"That day has: {listed}.")
+    if len(on_day) > 1:
+        listed = ", ".join(f"{b.kind} {b.title}" for b in on_day)
+        return _err(f"{len(on_day)} blocks start at {at} on {day.isoformat()} "
+                    f"({listed}) — this tool can't tell which you mean.")
+    return on_day[0]
+
+
 # ------------------------------------------------------------------ contacts --
 # The one tool that reads `10 - Personal CRM/`, and it returns addresses and
 # numbers only — `core/contacts.py` documents why that hole exists and why it

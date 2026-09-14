@@ -1032,6 +1032,141 @@ def cmd_calendar(args, engine: Engine) -> int:
     return 0
 
 
+def cmd_week(args, engine: Engine) -> int:
+    """The week's shape — read it, seed it, add to it, or find the gaps.
+
+    `cmd_calendar` is the sibling of this and the split is deliberate: that one
+    answers "what is scheduled", this one answers "where do my hours go". They
+    read different files and only this one can tell you what is *free*.
+    """
+    import datetime as _dt
+    from .core import weekplan as wp_mod
+    wp = engine.q.weekplan
+    day = _dt.date.fromisoformat(args.day) if args.day else _dt.date.today()
+
+    if args.init:
+        done = wp_mod.install(engine.s)
+        if not done:
+            print(ui.note("already installed — nothing to write"))
+        for line in done:
+            print(ui.ok(line))
+        return 0
+
+    if args.add:
+        block = wp_mod.parse_natural(" ".join(args.add), today=day)
+        if not block:
+            print(ui.error("couldn't find a time in that — try "
+                           "'class compiler tuesday 10:30-12:00'"))
+            return 1
+        print(ui.ok(wp.add(block)))
+        wp.sync_daily_note(block.date)
+        return 0
+
+    if args.drop or args.move:
+        # Blocks are addressed the way Parsa would say one out loud — a date
+        # and a start time — not by their written line. A line is exact and
+        # unforgiving and nobody has one to hand.
+        when_raw, at = (args.drop or args.move)
+        when = _dt.date.fromisoformat(when_raw)
+        found = [b for b in wp.on(when)
+                 if b.start == wp_mod._parse_time(at)]
+        if not found:
+            listed = ", ".join(f"{b.time_label} {b.title}" for b in wp.on(when))
+            print(ui.error(f"nothing starts at {at} on {when}"
+                           + (f" — that day has: {listed}" if listed else "")))
+            return 1
+        if len(found) > 1:
+            print(ui.error(f"{len(found)} blocks start at {at} on {when} — "
+                           "edit the week note directly"))
+            return 1
+        line = found[0].line()
+        try:
+            if args.drop:
+                print(ui.ok(wp.remove(when, line)))
+            else:
+                changes: dict = {}
+                if args.to_day:
+                    changes["date"] = _dt.date.fromisoformat(args.to_day)
+                if args.to:
+                    span = args.to.split("-", 1)
+                    changes["start"] = wp_mod._parse_time(span[0])
+                    if len(span) > 1:
+                        changes["end"] = wp_mod._parse_time(span[1])
+                    if changes["start"] is None:
+                        print(ui.error(f"couldn't read {args.to!r} — "
+                                       "use HH:MM or HH:MM-HH:MM"))
+                        return 1
+                if args.kind:
+                    changes["kind"] = args.kind
+                if args.label is not None:
+                    changes["label"] = args.label
+                if not changes:
+                    print(ui.error("nothing to change — pass --to, --to-day, "
+                                   "--kind or --label"))
+                    return 1
+                print(ui.ok(wp.move(when, line, **changes)))
+        except ValueError as exc:
+            print(ui.error(str(exc)))
+            return 1
+        wp.sync_daily_note(when)
+        return 0
+
+    if args.ensure:
+        rel = wp.ensure_week(day)
+        print(ui.ok(f"week note ready: {rel}"))
+        return 0
+
+    if args.reseed:
+        n = wp.reseed(day)
+        print(ui.ok(f"added {n} repeating block(s) to {wp.week_rel(day)}"
+                    if n else "nothing missing — the week is already seeded"))
+        return 0
+
+    if args.sync:
+        n = 0
+        with ui.Spinner("syncing daily notes"):
+            for i in range(args.days):
+                if wp.sync_daily_note(day + _dt.timedelta(days=i)):
+                    n += 1
+        print(ui.ok(f"synced {n} daily note(s)"))
+        return 0
+
+    if args.now:
+        block = wp.now_block()
+        if block:
+            print(ui.markdown(f"**now** · {block.render()}"))
+        else:
+            nxt = wp.next_free(30)
+            print(ui.markdown("**now** · nothing scheduled — the hour is yours"))
+            if nxt and nxt.date == _dt.date.today():
+                print(ui.note(f"free until {nxt.end.strftime('%H:%M')}"))
+        return 0
+
+    if args.free:
+        r = engine.q.free_time(day, days=args.days, min_minutes=args.min_minutes)
+        print(ui.markdown(r.answer))
+        if r.rows:
+            print()
+            print(ui.markdown(r.table(50)))
+        return 0
+
+    # Default: the whole week the day falls in, so `v week` means the week.
+    days = args.days if args.days > 1 else 7
+    start = day if args.day else wp_mod.week_start_of(day)
+    r = engine.q.schedule(start, days=days)
+    print(ui.markdown(r.answer))
+    if r.rows:
+        print()
+        print(ui.markdown(r.table(80)))
+    load = wp.load(start)
+    if load:
+        print()
+        print(ui.markdown(" · ".join(
+            f"**{k}** {wp_mod.human_span(v)}"
+            for k, v in sorted(load.items(), key=lambda kv: -kv[1]))))
+    return 0
+
+
 def cmd_gcal(args, engine: Engine) -> int:
     """The live Google account, as opposed to `calendar`, which is the vault."""
     import datetime as _dt
@@ -2083,6 +2218,34 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--day", help="YYYY-MM-DD (default today)")
     s.add_argument("--days", type=int, default=1)
     s.set_defaults(fn=cmd_calendar)
+
+    s = sub.add_parser("week", help="the week's shape — hours, not tasks")
+    s.add_argument("--day", help="YYYY-MM-DD (default: this week)")
+    s.add_argument("--days", type=int, default=1)
+    s.add_argument("--free", action="store_true", help="the gaps, not the blocks")
+    s.add_argument("--min-minutes", type=int, default=30, dest="min_minutes",
+                   help="shortest gap worth reporting (default 30)")
+    s.add_argument("--now", action="store_true", help="what you are in the middle of")
+    s.add_argument("--add", nargs="+", metavar="TEXT",
+                   help="e.g. --add gym tuesday 19:00-20:30")
+    s.add_argument("--drop", nargs=2, metavar=("DAY", "HH:MM"),
+                   help="remove the block starting then, e.g. --drop 2026-09-20 10:30")
+    s.add_argument("--move", nargs=2, metavar=("DAY", "HH:MM"),
+                   help="change that block; say how with --to/--to-day/--kind/--label")
+    s.add_argument("--to", metavar="HH:MM[-HH:MM]", help="its new time")
+    s.add_argument("--to-day", dest="to_day", metavar="YYYY-MM-DD",
+                   help="its new date")
+    s.add_argument("--kind", help="its new kind (class, work, gym, paper, …)")
+    s.add_argument("--label", help="its new label")
+    s.add_argument("--ensure", action="store_true",
+                   help="create the week note, seeded with what repeats")
+    s.add_argument("--reseed", action="store_true",
+                   help="add repeating blocks missing from an existing week")
+    s.add_argument("--sync", action="store_true",
+                   help="render the schedule into daily notes")
+    s.add_argument("--init", action="store_true",
+                   help="write the vault side: seed template, sections, dashboard")
+    s.set_defaults(fn=cmd_week)
 
     s = sub.add_parser("gcal", help="the live Google Calendar, yours and others'")
     s.add_argument("action", nargs="?", default="list",
