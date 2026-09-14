@@ -58,7 +58,13 @@
       </div>
 
       <div class="vr"></div>
-      <div id="clock">--:--:--</div>
+      <!-- Two clocks, one instant: the time V files notes on, and the date
+           Parsa's year is actually counted in. `#jdate` is filled from the
+           snapshot, never from the browser's locale — see `hud._jalali`. -->
+      <div id="when">
+        <div id="clock">--:--:--</div>
+        <div id="jdate" data-off="0"><span class="d"></span><span class="off">تعطیل</span></div>
+      </div>
     </header>
 
     <!-- three columns ------------------------------------------------- -->
@@ -139,7 +145,38 @@
           <span class="r" id="pane-r"></span>
         </div>
 
-        <div class="pane" id="pane"></div>
+        <!-- the conversation, and the viewport that floats over it -->
+        <div class="panewrap">
+          <div class="pane" id="pane"></div>
+
+          <!-- VIEWPORT · the pictures a turn is about. Built by paintFrames();
+               everything inside is replaced wholesale, so nothing here is
+               content — it is the empty frame. -->
+          <div id="viewport" hidden>
+            <i class="wire"></i>
+            <div class="vp">
+              <div class="head">
+                <span class="led"></span>
+                <span class="title">VIEWPORT</span>
+                <span class="fill"></span>
+                <span class="tag" id="vp-count"></span>
+                <button type="button" class="x" id="vp-close"
+                        title="clear the viewport — the files stay where they are"
+                        aria-label="clear the viewport">✕</button>
+              </div>
+              <div class="glass" id="vp-glass">
+                <div class="scan"></div>
+                <div class="corner tl"></div><div class="corner tr"></div>
+                <div class="corner bl"></div><div class="corner br"></div>
+              </div>
+              <div class="meta">
+                <div class="t" id="vp-title"></div>
+                <div class="s" id="vp-sub"></div>
+              </div>
+              <div class="strip" id="vp-strip"></div>
+            </div>
+          </div>
+        </div>
 
         <div class="foot">
           <div class="palette" id="palette" hidden role="listbox" aria-label="commands"></div>
@@ -221,6 +258,25 @@
       <div class="rows"></div>
     </div>
   </div>
+
+  <!-- a frame, at the size the picture actually is -->
+  <div id="lightbox" hidden>
+    <div class="sheet">
+      <div class="bar">
+        <span class="kind" id="lb-kind"></span>
+        <span class="t" id="lb-title"></span>
+        <span class="fill"></span>
+        <span class="s" id="lb-sub"></span>
+        <button type="button" class="x" id="lb-close" aria-label="close">✕</button>
+      </div>
+      <div class="stagearea" id="lb-stage"></div>
+    </div>
+  </div>
+
+  <!-- The block editor. Outside `#pane` on purpose: the pane is rebuilt by
+       the four-second poll, and a form rebuilt under the cursor eats the
+       keystroke you were in the middle of. -->
+  <div id="blockedit" hidden></div>
 
   <div id="offline" hidden>LINK DOWN · RETRYING</div>
 </div>

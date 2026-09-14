@@ -46,10 +46,55 @@ const ARCS = {
 
 const VIEWS = [
   { id: 'console', idx: '01', label: 'CONSOLE', title: 'CONVERSATION' },
-  { id: 'agenda',  idx: '02', label: 'AGENDA',  title: 'DAY' },
-  { id: 'memory',  idx: '03', label: 'MEMORY',  title: 'MEMORY STORE' },
-  { id: 'vault',   idx: '04', label: 'VAULT',   title: 'VAULT SEARCH' },
+  { id: 'tasks',   idx: '02', label: 'TASKS',   title: 'TASK LIST' },
+  { id: 'agenda',  idx: '03', label: 'AGENDA',  title: 'DAY' },
+  { id: 'week',    idx: '04', label: 'WEEK',    title: 'WEEK' },
+  { id: 'memory',  idx: '05', label: 'MEMORY',  title: 'MEMORY STORE' },
+  { id: 'vault',   idx: '06', label: 'VAULT',   title: 'VAULT SEARCH' },
 ];
+
+/* One colour per block kind, and the vocabulary is closed on the server
+ * (`weekplan.KINDS`) so this map can be exhaustive rather than defensive.
+ *
+ * Mostly the HUD's own six tones. `paper` gets the one hue that appears
+ * nowhere else on the page, because it is the thing the week is *for* — the
+ * hours that get eaten first are the ones with nothing loud defending them,
+ * and a colour that reads as "not like the others" is doing real work. */
+const KINDS = {
+  class:    '#9C86FF', work:  '#6FE3FF', commute: '#4E7482', gym: '#48E39B',
+  sleep:    '#2F4A57', study: '#FFC061', paper:   '#FF9BC7',
+  personal: '#7BD1C4', event: '#FFA05A',
+};
+
+/* The task view's filters, and the honest name for each one.
+ *
+ * `STALE` is the one that is not a re-cut of the others: open, undated, and
+ * older than two months. `backlog_shape` has counted those as `rotting` since
+ * the task layer was written and nothing could ever act on them, which is
+ * exactly the pile this view exists to empty. */
+const TASK_FILTERS = [
+  { id: 'open',    label: 'OPEN',    empty: 'NOTHING OPEN.' },
+  { id: 'overdue', label: 'OVERDUE', empty: 'NOTHING PAST ITS DATE.' },
+  { id: 'stale',   label: 'STALE',   empty: 'NOTHING ROTTING. THE BACKLOG IS LIVE.' },
+  { id: 'ignored', label: 'IGNORED', empty: 'NOTHING SILENCED. V IS TRACKING EVERYTHING.' },
+  { id: 'done',    label: 'DONE',    empty: 'NOTHING CLOSED IN THE LAST FORTNIGHT.' },
+];
+
+/* What each row button does, in the row's own words. The server holds the
+ * same table in `hud.TASK_ACTIONS`; these are the labels for it.
+ *
+ * The three that matter are the three answers a task can get. `done` and
+ * `drop` both write to the note — a tick and a strike-through — and are
+ * undoable with `v undo`. `ignore` writes to nothing: the checkbox stays
+ * exactly as it was typed and V stops counting it. That is the one this view
+ * was built for, and it is why the button says what it does not touch. */
+const TASK_BUTTONS = {
+  done:      { glyph: '✓', label: 'DONE',    why: 'ticks the box in the note · undoable with v undo' },
+  open:      { glyph: '↺', label: 'REOPEN',  why: 'unticks it in the note' },
+  dropped:   { glyph: '⊘', label: 'DROP',    why: 'strikes it out in the note, so the decision survives · undoable' },
+  ignored:   { glyph: '⊗', label: 'IGNORE',  why: 'leaves the note untouched — V stops bringing it up anywhere' },
+  unignored: { glyph: '↺', label: 'RESTORE', why: 'back into every list V builds' },
+};
 
 /* The quick row is a shortcut to the palette's own entries, so every chip
  * here is a command that really exists. It used to hold `/memory` and
@@ -61,6 +106,19 @@ const QUICK = ['/why', '/brief', '/status', '/nudges', '/cost', '/new'];
  * screen, the palette is a keystroke, and the clipboard belongs to the
  * browser. Everything else in the table is an engine call. */
 const CLIENT_ONLY = new Set(['why', 'help', 'copy']);
+
+/* Where a picture came from, in the viewport's own words.
+ *
+ * Provenance is the one thing a frame must always say. A chart V drew from
+ * vault numbers, a screenshot Parsa pasted into a bug report two months ago
+ * and a map tile fetched from Neshan are three completely different claims,
+ * and once they are all PNGs on a black panel they look identical. `label`
+ * is what goes under the picture; `abbr` is what fits on a 42px thumbnail. */
+const SOURCES = {
+  note:   { label: 'IN NOTE',  abbr: 'NOTE', tone: C.cyan },
+  render: { label: 'V DREW',   abbr: 'DREW', tone: C.green },
+  place:  { label: 'MAP OF',   abbr: 'MAP',  tone: C.amber },
+};
 
 /* ---- tiny DOM builder --------------------------------------------------
  * `el('div.card', {title: x}, [child, 'text'])`. Strings become text nodes,
@@ -214,7 +272,21 @@ const app = {
   snap: null,           // the last /api/state
   live: null,           // the last SSE frame
   hits: null,           // the last vault search
+  tasks: null,          // the last /api/tasks
+  taskView: 'open',     // which filter the task view is showing
+  taskBusy: '',         // the key of the row with an action in flight
+  taskError: '',        // the last failed action, shown until dismissed
+  nudgeBusy: '',        // the key of the nudge with a silence/restore in flight
+  nudgeError: '',       // the last failed silence/restore
+  weekZoom: 1,          // index into WEEK_ZOOM — how many pixels a minute gets
+  weekKinds: null,      // the block vocabulary, as the server last sent it
+  blockEdit: null,      // the block being added or edited, or null
+  blockErr: '',         // what the server said no to, shown in the form
+  blockBusy: false,     // a write is in flight — don't send it twice
   query: '',
+  frame: '',           // which frame the viewport is showing, by id
+  seenFrames: null,    // ids already on screen — what makes an arrival an arrival
+  lightbox: '',        // which frame is blown up, or '' for none
   trace: false,
   busy: false,
   connected: false,
@@ -400,8 +472,44 @@ function paintState(name, detail, tools) {
 }
 
 /* ---- header, gauges, footer -------------------------------------------- */
+/* The day currently under the clock, so the probe wired up once in `boot()`
+ * can read the live one. `paintHeader` runs every poll and `#jdate` is a
+ * static node — attaching the listener there instead would add a fresh pair
+ * every four seconds for as long as the HUD is open. */
+let jday = null;
+
+function jalaliRows(j) {
+  const holiday = j.holiday === null
+    ? (j.friday ? 'Friday — off, and that much is known offline'
+                : 'unknown — the calendar service was not reached')
+    : (j.holiday ? 'تعطیل — a day off' : 'a working day');
+  return [
+    ['JALALI', j.iso],
+    ['GREGORIAN', j.gregorian],
+    ['WEEKDAY', j.weekday],
+    ['STATUS', holiday],
+    ['MONTH KEY', j.month_key],
+    ...(j.events || []).slice(0, 3).map((e) => ['MARKED', e]),
+  ];
+}
+
+function paintJalali(snap) {
+  const j = snap.jalali;
+  if (!j) return;
+  jday = j;
+  if (!changed('jdate', JSON.stringify(j))) return;
+  const box = $('jdate');
+  box.querySelector('.d').textContent = j.short;
+  /* Three states, not two — `hud._jalali` leaves `holiday` null when the
+   * service was unreachable, and "I don't know" must not be drawn as "no". A
+   * Friday is the one case where null is still an answer. */
+  box.dataset.off = (j.holiday === null && !j.friday) ? '?' : (j.off ? '1' : '0');
+  box.title = j.label;
+}
+
 function paintHeader(snap, live) {
   const s = live.session;
+  paintJalali(snap);
   $('c-model').textContent = snap.header.model || 'local';
   $('c-lat').textContent = s.latency_ms ? s.latency_ms + 'ms' : '—';
   $('c-turns').textContent = `${s.local}/${s.turns}`;
@@ -429,15 +537,21 @@ function paintGauges(snap, live) {
   if (!changed('gauges', JSON.stringify([g, s.spent, s.turns, s.local,
                                          s.latency_ms, snap.header.model]))) return;
   const cap = g.budget.cap || 2;
-  const used = s.spent;
+  /* The day's, off the run log every surface writes — not this tab's running
+   * total. The bar is drawn against a *daily* cap, so it has to be filled by
+   * a daily number: the old one zeroed on /new and on every restart, and
+   * never saw a penny spent over Telegram. `spent` is still here, as the
+   * second row, because "what has this conversation cost" is a real question
+   * — just not the one a cap answers. */
+  const used = g.budget.used;
   const drift = g.drift.files;
   fill($('gauges'), [
     gauge('BUDGET', `${money(used)} / ${money(cap)}`, used / cap,
-      used / cap > 0.8 ? C.amber : C.green, 'GAUGE', `Session spend ${money(used)}`, [
-        ['CAP', money(cap) + ' daily'],
-        ['TURNS', `${s.turns} (${s.local} free)`],
+      used / cap > 0.8 ? C.amber : C.green, 'GAUGE', `Spent today ${money(used)}`, [
+        ['TODAY', `${money(used)} of ${money(cap)} cap · ${g.budget.turns} turns`],
+        ['SESSION', `${money(s.spent)} · ${s.turns} turns (${s.local} free)`],
         ['MODEL', snap.header.model || 'local'],
-        ['NOTE', 'session total, not the day\'s'],
+        ['SCOPE', 'today is every surface; session resets on /new'],
       ]),
     gauge('LATENCY', s.latency_ms ? s.latency_ms + 'ms' : '—',
       Math.min(1, (s.latency_ms || 0) / 4000), C.cyan, 'GAUGE',
@@ -469,8 +583,10 @@ function paintFooter(snap, live) {
   $('f-net').textContent = v.network;
   const mins = Math.floor(s.up / 60);
   $('f-session').textContent = `${s.id} · ${mins}m`;
-  $('t-spend').textContent = money(s.spent);
-  $('t-cap').textContent = 'of ' + money(snap.gauges.budget.cap) + ' cap';
+  /* The tile has said SPEND TODAY since it was built. It now says it truly. */
+  $('t-spend').textContent = money(snap.gauges.budget.used);
+  $('t-cap').textContent = 'of ' + money(snap.gauges.budget.cap) + ' cap · '
+    + money(s.spent) + ' this session';
   $('t-mem').textContent = snap.header.memories.toLocaleString();
   $('t-memsub').textContent = 'active memories';
 }
@@ -567,34 +683,85 @@ function paintPaneHead(snap) {
     : v.title;
   const meta = {
     console: () => `session ${app.live ? app.live.session.id : '—'} · ${app.live ? app.live.session.turns : 0} turns`,
+    /* The counts, said in full, because the whole complaint this view answers
+     * is that the open number was meaningless. `carried` and `ignored` are
+     * the two that explain it: one is the same task written five times, the
+     * other is what has been deliberately silenced. */
+    tasks: () => {
+      const c = taskCounts();
+      if (!c) return 'checkbox commitments, collapsed across notes';
+      return `${c.open} open · ${c.overdue} past date · ${c.stale} rotting · ${c.ignored} silenced`;
+    },
     agenda: () => 'vault calendar + reminders',
+    /* What the week costs, said as hours rather than as blocks: "31 blocks"
+     * is a number about the note, and "40h spoken for" is a number about his
+     * life. The second one is the question the view answers. */
+    /* Hours committed and what is on right now. Not how many hours are
+     * free — that was a tally under every day header, and a calendar that
+     * counts the time you have not committed is nagging rather than
+     * reporting. `v week --free` answers it when it is actually asked. */
+    week: () => {
+      const w = snap && snap.week;
+      if (!w) return 'panel missing — restart v hud';
+      if (!w.blocks) return `${w.rel} · nothing scheduled`;
+      return `${w.blocks} blocks · ${hrs(w.claimed)} committed · `
+        + (w.now ? `now: ${w.now.title} until ${w.now.until}` : 'nothing on right now');
+    },
     memory: () => snap ? `${snap.header.memories} active · decay on read` : '',
     vault: () => app.hits ? `${app.hits.backend}${app.hits.ms ? ' · ' + app.hits.ms + 'ms' : ''}` : 'semantic when embeddings are built',
   }[app.view];
   $('pane-m').textContent = meta ? meta() : '';
   const right = {
     console: () => app.live && app.live.session.spent ? money(app.live.session.spent) + ' THIS SESSION' : 'FREE SO FAR',
+    tasks: () => app.tasks ? `${app.tasks.total} SHOWN · WRITES TO THE NOTE` : '',
     agenda: () => snap ? `${snap.day_events.length} ITEMS` : '',
+    week: () => {
+      const w = snap && snap.week;
+      if (!w) return '';
+      if (w.next) {
+        const when = w.next.today ? 'TODAY' : w.next.day;
+        return `NEXT · ${when} ${w.next.at} · ${w.next.title.toUpperCase()}`;
+      }
+      return 'NOTHING LEFT THIS WEEK';
+    },
     memory: () => 'SORTED BY SALIENCE',
     vault: () => s ? `${s.notes.toLocaleString()} NOTES INDEXED` : '',
   }[app.view];
   $('pane-r').textContent = right ? right() : '';
 }
 
-/** Render the pane, but only if its own data moved. `key` is the signature. */
+/** Render the pane, but only if its own data moved. `key` is the signature.
+ *
+ * The signature is recorded *after* the draw, not before, and that ordering
+ * is load-bearing: `changed()` used to mark the frame as drawn and then hand
+ * over to a function that could throw. One row referring to a button that did
+ * not exist was enough — the DOM kept the previous view's rows, the memo
+ * claimed the new ones were on screen, and every later frame returned early.
+ * The filter looked broken rather than the row, and nothing in the pane ever
+ * recovered. Advancing the memo last means a failed draw is simply retried on
+ * the next frame. */
 function renderPane(key, draw) {
   const node = $('pane');
   node.dataset.stale = app.snap && app.snap.stale ? '1' : '0';
-  if (!changed('pane', app.view + '|' + key)) return;
+  /* Which view owns the pane, so a view that scrolls itself can say so in
+   * CSS. Set here rather than in the view: setting it in `paintWeekInto`
+   * left `week` on the pane after switching to TASKS, which inherited the
+   * week's "don't scroll, no padding" and broke the task list. */
+  node.dataset.pane = app.view;
+  const sig = app.view + '|' + key;
+  if (memo.pane === sig) return;
   hideProbe();
   const top = node.scrollTop;
   draw(node);
+  memo.pane = sig;
   node.scrollTop = top;
 }
 
 function paintPane() {
   if (app.view === 'console') return paintConsole();
+  if (app.view === 'tasks') return paintTasks();
   if (app.view === 'agenda') return paintAgenda();
+  if (app.view === 'week') return paintWeek();
   if (app.view === 'memory') return paintMemory();
   if (app.view === 'vault') return paintVault();
 }
@@ -605,6 +772,7 @@ function paintConsole() {
   const turns = (app.live && app.live.turns) || [];
   const node = $('pane');
   node.dataset.stale = app.snap && app.snap.stale ? '1' : '0';
+  node.dataset.pane = app.view;
   /* A landed turn is immutable, so its count and the length of the last one
    * are enough to say whether the log moved. */
   const sig = turns.length + ':' + (turns.length ? turns[turns.length - 1].text.length : 0);
@@ -665,6 +833,161 @@ function paintTurns(pane, turns) {
   }))]);
 }
 
+/* ---- the task view ------------------------------------------------------
+ * The right rail's TASKS card answers "what should I do next" in six rows.
+ * This answers the other question, which had no surface at all: "what is V
+ * still counting that I am never going to do?"
+ *
+ * Which is why the row is a row of *verbs* rather than a checkbox. A vault
+ * that has been written in for a year accumulates checkboxes that were never
+ * decisions, and until now the only thing V could be told about one of them
+ * was that it was finished — so they stayed open, stayed ranked, and stayed
+ * in every count of how far behind he was. `IGNORE` is the missing third
+ * answer, and it deliberately writes nothing to the note: the line stays
+ * exactly as it was typed in July, and V stops bringing it up. */
+
+function taskCounts() {
+  if (app.tasks && app.tasks.counts) return app.tasks.counts;
+  return (app.snap && app.snap.task_counts) || null;
+}
+
+/* Only the newest request is allowed to be the answer.
+ *
+ * The four-second poll refetches this list while it is on screen, so pressing
+ * a filter chip reliably puts two requests in flight at once — and the older
+ * one can land last. It did: clicking DONE drew 62 in the header and left the
+ * IGNORED list's empty state in the body, which reads as a broken filter
+ * rather than as a race. A sequence number is the whole fix; an AbortController
+ * would cancel the poll instead, which is the same outcome with a spurious
+ * error to swallow on every click. */
+let taskSeq = 0;
+
+async function loadTasks(view) {
+  if (view) app.taskView = view;
+  const seq = ++taskSeq;
+  const want = app.taskView;
+  let next;
+  try {
+    const r = await fetch('/api/tasks?view=' + encodeURIComponent(want));
+    if (!r.ok) throw new Error('tasks ' + r.status);
+    next = await r.json();
+  } catch (err) {
+    next = { view: want, rows: [], total: 0, counts: null,
+             error: String(err.message || err) };
+  }
+  if (seq !== taskSeq) return;
+  app.tasks = next;
+  if (app.view === 'tasks') { memo.pane = null; paintPane(); paintPaneHead(app.snap); }
+}
+
+function paintTasks() {
+  renderPane([app.taskView, app.taskBusy, app.taskError,
+              JSON.stringify(app.tasks)].join('|'),
+             (node) => paintTasksInto(node));
+}
+
+function paintTasksInto(pane) {
+  const data = app.tasks;
+  const counts = taskCounts() || {};
+  const filters = el('div.tfilter', {}, TASK_FILTERS.map((f) => {
+    const n = counts[f.id];
+    const b = el('button', { type: 'button', onclick: () => loadTasks(f.id) }, [
+      el('span.l', { text: f.label }),
+      n === undefined || n === null ? null : el('span.n', { text: String(n) }),
+    ]);
+    b.setAttribute('aria-pressed', String(app.taskView === f.id));
+    return b;
+  }));
+
+  const err = app.taskError
+    ? el('div.terr', { text: app.taskError, onclick: () => { app.taskError = ''; memo.pane = null; paintPane(); } })
+    : null;
+
+  if (!data) { fill(pane, [filters, err, el('div.empty', { text: 'READING THE VAULT…' })]); return; }
+  if (data.error) { fill(pane, [filters, err, el('div.empty', { text: 'TASK LIST UNREACHABLE · ' + data.error })]); return; }
+
+  const spec = TASK_FILTERS.find((f) => f.id === data.view) || TASK_FILTERS[0];
+  if (!data.rows.length) { fill(pane, [filters, err, el('div.empty', { text: spec.empty })]); return; }
+
+  fill(pane, [filters, err,
+              el('div.tlist', {}, data.rows.map((t) => taskRow(t, data.view)))]);
+}
+
+/** One task, with everything that can be done to it. */
+function taskRow(t, view) {
+  const tone = t.ignored ? C.dim
+    : (t.rank === 'P0' ? C.red : (t.rank === 'P1' ? C.amber : (t.rotting ? C.violet : '#3F6472')));
+  /* The meta line is the row's argument for being on screen. `12d old` and
+   * `carried 5×` are the two facts that decide whether a task is live work or
+   * something to get rid of, and neither of them is in the text of the
+   * checkbox — which is why a vault full of them is hard to prune by hand. */
+  const meta = [t.where, t.why];
+  if (view === 'ignored') meta.push(t.carried ? `hiding ${t.carried} open` : 'no live copy left');
+  else {
+    if (t.age) meta.push(t.age + 'd old');
+    if (t.carried > 1) meta.push('carried ' + t.carried + '×');
+    if (t.rotting) meta.push('rotting');
+  }
+
+  const verbs = view === 'ignored' ? ['unignored']
+    : (t.done ? ['open', 'ignored'] : ['done', 'dropped', 'ignored']);
+
+  const row = el('div.trow', { style: `--t:${tone}` }, [
+    el('button.tbox', {
+      type: 'button',
+      'aria-label': t.done ? 'reopen' : 'tick',
+      disabled: view === 'ignored' || app.taskBusy === t.key,
+      onclick: () => taskAction(t, t.done ? 'open' : 'done'),
+    }, [el('span', { text: t.done ? '✓' : '' })]),
+    el('div.tmid', {}, [
+      el('div.n', { text: t.title }),
+      el('div.m', { text: meta.filter(Boolean).join(' · ') }),
+    ]),
+    el('span.trank', { text: t.rank }),
+    el('div.tacts', {}, verbs.map((v) => {
+      const b = TASK_BUTTONS[v];
+      const btn = el('button', {
+        type: 'button', title: b.label + ' — ' + b.why,
+        disabled: app.taskBusy === t.key,
+        onclick: (ev) => { ev.stopPropagation(); taskAction(t, v); },
+      }, [el('span.g', { text: b.glyph }), el('span.l', { text: b.label })]);
+      btn.dataset.verb = v;
+      return btn;
+    })),
+  ]);
+  row.dataset.done = t.done ? '1' : '0';
+  row.dataset.ignored = t.ignored ? '1' : '0';
+
+  return probed(row, t.ignored ? 'IGNORED TASK' : 'TASK · ' + t.rank, t.title, [
+    ['WHY RANKED', t.why],
+    ['WHERE', t.where + (t.area ? ' · ' + t.area : '')],
+    t.rel ? ['NOTE', t.rel] : null,
+    t.carried > 1 && view !== 'ignored' ? ['CARRIED', t.carried + ' notes hold this same line'] : null,
+    ...verbs.map((v) => [TASK_BUTTONS[v].label, TASK_BUTTONS[v].why]),
+  ]);
+}
+
+/** Run one verb against one task, then reload the list and the panels. */
+async function taskAction(t, verb) {
+  if (app.taskBusy) return;
+  app.taskBusy = t.key;
+  memo.pane = null;
+  paintPane();
+  try {
+    /* The key travels with every call, not just the ignore ones: it is how an
+     * un-ignore finds an entry whose checkbox has since moved or whose note
+     * was deleted, and the server ignores it when it has an id to write to. */
+    await post('/api/task', { id: t.id || 0, key: t.key || '', state: verb });
+    app.taskError = '';
+  } catch (err) {
+    app.taskError = String(err.message || err);
+  } finally {
+    app.taskBusy = '';
+  }
+  await loadTasks();
+  refresh(true);
+}
+
 function paintAgenda() {
   const items = (app.snap && app.snap.day_events) || [];
   renderPane(JSON.stringify(items), (node) => paintAgendaInto(node, items));
@@ -688,6 +1011,367 @@ function paintAgendaInto(pane, items) {
       ['STATUS', d.past ? 'past' : 'ahead'],
     ]);
   }))]);
+}
+
+/* ---- the week ----------------------------------------------------------
+ *
+ * A grid, not a list, and that is the whole point of putting it here: `v week`
+ * already prints the rows, and the one thing a terminal cannot show is the
+ * *shape* — where the solid walls of the week are, and what is beside what.
+ *
+ * Three things this gets right that the first cut did not:
+ *
+ * **The canvas is the whole day.** 00:00 to 24:00, always, scrolled rather
+ * than clipped. Sizing the grid to whatever hours happened to have blocks
+ * meant the rows moved every time anything changed, and 03:00 was not
+ * somewhere you could scroll to — it did not exist.
+ *
+ * **The header is inside the same grid.** It is row one, `position: sticky`,
+ * sharing the column template with the columns underneath it. Two grids side
+ * by side cannot be kept aligned — one of them eventually gets a scrollbar.
+ *
+ * **Overlaps split the width.** Two events at the same hour were drawn at the
+ * same coordinates, one on top of the other. The server assigns lanes; this
+ * lays them out.
+ */
+const WEEK_ZOOM = [0.55, 0.8, 1.15, 1.7];   /* pixels per minute */
+const SNAP = 15;                             /* minutes, for click-to-add */
+
+function paintWeek() {
+  const w = app.snap && app.snap.week;
+  /* Zoom is view state, not snapshot state, so it goes in the signature —
+   * otherwise zooming does nothing until the next poll happens to change
+   * something else.
+   *
+   * The editor is deliberately NOT in here. It used to be, and that was the
+   * bug that made it feel broken: every keystroke mutated `app.blockEdit`,
+   * which changed the signature, which rebuilt the whole pane on the next
+   * four-second poll — destroying the input you were typing into, along with
+   * its focus and cursor. It lives outside the pane now and nothing on this
+   * path can touch it. */
+  renderPane(JSON.stringify(w) + '|' + app.weekZoom,
+    (node) => paintWeekInto(node, w));
+}
+
+function hrs(mins) {
+  if (!mins) return '0h';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h && m ? `${h}h${String(m).padStart(2, '0')}` : (h ? `${h}h` : `${m}m`);
+}
+
+function dayName(iso) {
+  return new Date(iso + 'T12:00:00').toDateString().slice(0, 3).toUpperCase();
+}
+
+/* Not `clock` — that name is already the wall clock in the header, and a
+ * second `function clock` simply replaces it at parse time. The gutter
+ * labels came out blank and the header kept working, which is the confusing
+ * way round for the two of them to fail. */
+function hhmm(mins) {
+  const m = Math.max(0, Math.min(24 * 60 - 1, Math.round(mins)));
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
+
+function minutesOf(hhmmStr) {
+  const [h, m] = String(hhmmStr).split(':').map(Number);
+  return h * 60 + m;
+}
+
+function paintWeekInto(pane, w) {
+  /* `hud.js` is served off disk on every load; `snapshot()` is Python held in
+   * a process. So a HUD left running across an upgrade serves a new page from
+   * an old server, the nav grows a WEEK button, and the panel behind it is
+   * simply absent — which is not the same nothing as an empty week, and used
+   * to print the same message. */
+  if (!w || !w.days) {
+    fill(pane, [el('div.empty', {
+      text: 'THIS SNAPSHOT HAS NO WEEK PANEL — THE SERVER PREDATES IT. RESTART v hud.',
+    })]);
+    return;
+  }
+  if (!w.exists) {
+    fill(pane, [el('div.empty', { text: `NO WEEK NOTE AT ${w.rel} — RUN v week --ensure` })]);
+    return;
+  }
+
+  const pxm = WEEK_ZOOM[app.weekZoom];
+  const height = (w.hi - w.lo) * pxm;
+  const at = (m) => (m - w.lo) * pxm;
+
+  /* Hour labels, thinned as the grid tightens so they never collide. */
+  const every = pxm < 0.7 ? 180 : (pxm < 1.1 ? 120 : 60);
+  const gutter = [];
+  for (let m = w.lo; m <= w.hi; m += 60) {
+    const major = m % every === 0;
+    gutter.push(el('i.line', { style: `top:${at(m)}px`, 'data-major': major ? '1' : '0' }));
+    if (major) gutter.push(el('span.h', { text: hhmm(m), style: `top:${at(m)}px` }));
+  }
+
+  const cells = [el('div.hcell.hgut', {}, [
+    el('button.zoom', {
+      type: 'button', title: 'tighter',
+      onclick: () => { app.weekZoom = Math.max(0, app.weekZoom - 1); paintWeek(); },
+      text: '−',
+    }),
+    el('button.zoom', {
+      type: 'button', title: 'taller',
+      onclick: () => { app.weekZoom = Math.min(WEEK_ZOOM.length - 1, app.weekZoom + 1); paintWeek(); },
+      text: '+',
+    }),
+  ])];
+  for (const d of w.days) {
+    const h = el('div.hcell', {}, [el('b', { text: d.label })]);
+    h.dataset.today = d.today ? '1' : '0';
+    cells.push(h);
+  }
+
+  const gutCol = el('div.gutcol', { style: `height:${height}px` }, gutter);
+  const columns = w.days.map((d) => {
+    const kids = [];
+    for (let m = w.lo + 60; m < w.hi; m += 60) {
+      kids.push(el('i.line', { style: `top:${at(m)}px`,
+                               'data-major': m % every === 0 ? '1' : '0' }));
+    }
+    for (const b of d.blocks) {
+      const tone = KINDS[b.kind] || C.dim;
+      const top = at(b.s);
+      const tall = Math.max(3, (b.e - b.s) * pxm);
+      /* `depth` insets a block that sits wholly inside a longer one; `lane`
+       * splits the remaining width between things that genuinely overlap
+       * without containing each other. Drawing order follows depth, so the
+       * smaller thing is on top — which is also what the pointer hits, which
+       * is the whole reason to do it this way. */
+      const indent = Math.min(40, b.depth * 11);
+      const width = (100 - indent) / b.lanes;
+      const box = el('div.blk', {
+        style: `--t:${tone};top:${top}px;height:${tall}px;`
+             + `left:${indent + b.lane * width}%;`
+             + `width:calc(${width}% - 2px);z-index:${2 + b.depth}`,
+        onclick: (e) => { e.stopPropagation(); openBlockEditor(d, b); },
+      }, [
+        el('span.k', { text: b.kind }),
+        b.label ? el('span.n', { text: b.label }) : null,
+      ].filter(Boolean));
+      box.dataset.past = b.past ? '1' : '0';
+      box.dataset.now = b.now ? '1' : '0';
+      box.dataset.nested = b.depth ? '1' : '0';
+      /* Under ~26px there is room for one line, not two, and forcing two is
+       * what clipped a 30-minute standup's title through the middle of its
+       * own glyphs. */
+      box.dataset.tight = tall < 26 ? '1' : '0';
+      /* The same probe every other row on this page has. A block is often
+       * too short to show its own title, and hovering is how you read it —
+       * `title=` was a browser tooltip a second and a half late, which is not
+       * the same thing as the HUD's own. */
+      kids.push(probed(box, b.kind.toUpperCase(), b.label || b.kind, [
+        ['WHEN', `${d.label} · ${b.time}`],
+        ['FOR', hrs(b.mins)],
+        b.where ? ['WHERE', b.where] : null,
+        b.depth ? ['INSIDE', 'sits within a longer block'] : null,
+        ['STATUS', b.now ? 'happening now' : (b.past ? 'past' : 'ahead')],
+        ['', 'click to edit or delete'],
+      ]));
+    }
+    if (d.today && w.now_min !== null && w.now_min >= w.lo && w.now_min <= w.hi) {
+      kids.push(el('i.nowline', { style: `top:${at(w.now_min)}px` }));
+    }
+    const col = el('div.col', {
+      style: `height:${height}px`,
+      /* Click the empty canvas to add something there. The minute under the
+       * pointer is snapped to the quarter hour — a calendar that opens a form
+       * at 14:07 is a calendar nobody uses twice. */
+      onclick: (e) => {
+        const box = col.getBoundingClientRect();
+        const m = Math.round(((e.clientY - box.top) / pxm + w.lo) / SNAP) * SNAP;
+        openBlockEditor(d, null, Math.max(0, Math.min(24 * 60 - 60, m)));
+      },
+    }, kids);
+    col.dataset.today = d.today ? '1' : '0';
+    return col;
+  });
+
+  const grid = el('div.wk-grid', {}, cells.concat([gutCol], columns));
+  const scroll = el('div.wk-scroll', {}, [grid]);
+
+  const foot = w.blocks ? el('div.wk-foot', {}, [
+    el('div.wk-load', {}, w.load.map((k) => probed(
+      el('i', { style: `--t:${KINDS[k.kind] || C.dim};flex:${k.mins}` }),
+      'LOAD', k.kind, [['HOURS', hrs(k.mins)],
+                       ['SHARE', Math.round(k.share * 100) + '% of claimed time']]))),
+    el('div.legend', {}, w.load.map((k) => el('span', {}, [
+      el('i', { style: `background:${KINDS[k.kind] || C.dim}` }),
+      el('b', { text: k.kind }), ' ', hrs(k.mins),
+    ])).concat([el('span.src', { text: w.rel })])),
+  ]) : el('div.wk-foot', {}, [
+    el('div.legend', {}, [el('span.src', {
+      text: `${w.rel} — nothing under ## Schedule yet. Click anywhere above to add a block.`,
+    })]),
+  ]);
+
+  fill(pane, [el('div.week', {}, [scroll, foot])]);
+  app.weekKinds = w.kinds || Object.keys(KINDS);
+
+  /* Open where the week actually starts. Only on the first paint of a given
+   * week — re-centring on every four-second poll would yank the view out from
+   * under anyone reading it. */
+  if (memo.weekScroll !== w.start + '|' + app.weekZoom) {
+    memo.weekScroll = w.start + '|' + app.weekZoom;
+    requestAnimationFrame(() => { scroll.scrollTop = at(w.focus); });
+  }
+}
+
+/* ---- editing a block ---------------------------------------------------
+ *
+ * The TASKS view has written to the vault since it was built; this is the
+ * same contract for time. Every verb here is one `[bot]` commit on one note,
+ * reverted by `v undo`, and the server refuses a line it cannot find exactly
+ * once — so a tab left open on a week somebody has since changed fails loudly
+ * rather than clobbering a neighbour.
+ *
+ * It renders into `#blockedit`, which lives outside `#pane` on purpose. When
+ * it was part of the pane, the four-second poll rebuilt it: every keystroke
+ * changed the render signature, the DOM was replaced under the cursor, and
+ * the field you were typing into lost its focus and its selection. Nothing on
+ * the polling path reaches this node now — it is redrawn only when something
+ * actually happens to it.
+ */
+function openBlockEditor(day, block, minute) {
+  app.blockEdit = block
+    ? { mode: 'edit', date: day.date, line: block.line, kind: block.kind,
+        /* One field for label and location, because that is one line in the
+         * note. Showing only the label meant an `@location` you could not
+         * see survived every rename you made. */
+        label: (block.label || '') + (block.where ? ' @' + block.where : ''),
+        from: block.from, to: block.to }
+    : { mode: 'add', date: day.date, line: '', kind: 'personal', label: '',
+        from: hhmm(minute), to: hhmm(Math.min(24 * 60, minute + 60)) };
+  app.blockErr = '';
+  app.blockBusy = false;
+  drawBlockEditor();
+}
+
+function closeBlockEditor() {
+  app.blockEdit = null;
+  app.blockErr = '';
+  app.blockBusy = false;
+  drawBlockEditor();
+}
+
+/* Redraw only the parts that cannot be edited in place. The inputs are built
+ * once per open and then left alone — rebuilding them is what ate keystrokes,
+ * so the kind picker and the error line repaint themselves and nothing else
+ * is touched. */
+function drawBlockEditor() {
+  const host = $('blockedit');
+  const e = app.blockEdit;
+  if (!e) { host.hidden = true; fill(host, []); return; }
+  host.hidden = false;
+
+  const adding = e.mode === 'add';
+  const bind = (k, node) => {
+    node.addEventListener('input', () => { e[k] = node.value; });
+    return node;
+  };
+  const field = (label, node) => el('label.f', {}, [el('span', { text: label }), node]);
+
+  const kinds = el('div.kinds', {}, (app.weekKinds || Object.keys(KINDS)).map((k) => {
+    const b = el('button', {
+      type: 'button', text: k, style: `--t:${KINDS[k] || C.dim}`,
+      onclick: () => {
+        e.kind = k;
+        for (const other of kinds.children) other.dataset.on = '0';
+        b.dataset.on = '1';
+      },
+    });
+    b.dataset.on = e.kind === k ? '1' : '0';
+    return b;
+  }));
+
+  const err = el('div.err', { text: app.blockErr });
+  err.hidden = !app.blockErr;
+
+  const submit = () => (adding
+    ? sendBlock('add', { date: e.date, kind: e.kind, from: e.from, to: e.to,
+                         label: e.label })
+    : sendBlock('move', { date: e.date, line: e.line, to_date: e.date,
+                          kind: e.kind, from: e.from, to: e.to, label: e.label }));
+
+  const form = el('div.blk-form', {
+    /* Enter saves, Escape closes — the two keys anyone tries. */
+    onkeydown: (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); submit(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); closeBlockEditor(); }
+    },
+  }, [
+    el('div.top', {}, [
+      el('span.t', { text: adding ? 'NEW BLOCK' : 'EDIT BLOCK' }),
+      el('span.fill'),
+      el('button.x', { type: 'button', text: '✕', onclick: closeBlockEditor,
+                       'aria-label': 'close' }),
+    ]),
+    kinds,
+    el('div.row', {}, [
+      field('DATE', bind('date', el('input', { type: 'date', value: e.date }))),
+      field('FROM', bind('from', el('input', { type: 'time', value: e.from, step: '300' }))),
+      field('TO', bind('to', el('input', { type: 'time', value: e.to, step: '300' }))),
+    ]),
+    field('LABEL', bind('label', el('input', {
+      type: 'text', value: e.label, placeholder: 'Compiler Design @204',
+    }))),
+    err,
+    el('div.acts', {}, [
+      adding ? null : el('button.drop', {
+        type: 'button', text: 'DELETE',
+        title: 'removes the line from the week note · undoable with v undo',
+        onclick: () => sendBlock('drop', { date: e.date, line: e.line }),
+      }),
+      el('span.fill'),
+      el('button.ghost', { type: 'button', text: 'CANCEL', onclick: closeBlockEditor }),
+      el('button.go', { type: 'button', text: adding ? 'ADD' : 'SAVE',
+                        onclick: submit }),
+    ].filter(Boolean)),
+  ]);
+
+  /* The scrim closes, the sheet does not — a mis-click at the edge of a form
+   * should not throw away what was typed into it. */
+  fill(host, [el('div.blk-sheet', { onclick: closeBlockEditor }, [
+    el('div.inner', { onclick: (ev) => ev.stopPropagation() }, [form]),
+  ])]);
+
+  const first = form.querySelector('input');
+  if (first) requestAnimationFrame(() => first.focus());
+}
+
+function blockError(message) {
+  app.blockErr = String(message || '').toUpperCase();
+  const host = $('blockedit');
+  const line = host.querySelector('.err');
+  if (!line) return drawBlockEditor();
+  line.textContent = app.blockErr;
+  line.hidden = !app.blockErr;
+}
+
+async function sendBlock(action, body) {
+  if (app.blockBusy) return;
+  /* The date the block currently lives on is what names its week note, so a
+   * move to another day sends both: `date` to find it, `to_date` to put it. */
+  if (action !== 'add' && app.blockEdit && app.blockEdit.line) {
+    const was = app.blockEdit.line.match(/^\s*[-*+]\s+(\d{4}-\d{2}-\d{2})/);
+    if (was) body.date = was[1];
+  }
+  app.blockBusy = true;
+  blockError('');
+  try {
+    await post('/api/block', Object.assign({ action }, body));
+    app.blockEdit = null;
+    app.blockBusy = false;
+    drawBlockEditor();
+    memo.pane = '';
+    await refresh(true);
+  } catch (err) {
+    app.blockBusy = false;
+    blockError(err.message || err);
+  }
 }
 
 function paintMemory() {
@@ -767,8 +1451,8 @@ function paintVaultInto(pane) {
 /* ---- right rail --------------------------------------------------------- */
 function paintPanels(snap, live) {
   if (!changed('panels', JSON.stringify([snap.day_events, snap.tasks,
-      snap.deadlines, snap.mail, snap.nudges, live.pending,
-      snap.vault.tasks_open]))) return;
+      snap.deadlines, snap.mail, snap.nudges, snap.nudges_off, live.pending,
+      snap.task_counts, app.nudgeBusy, app.nudgeError]))) return;
   hideProbe();
   /* TODAY */
   const events = snap.day_events.slice(0, 4);
@@ -788,7 +1472,15 @@ function paintPanels(snap, live) {
   }) : [el('div.empty', { style: 'padding:6px 2px', text: 'nothing today' })]);
 
   /* TASKS */
-  $('tag-tasks').textContent = `M-02 · ${snap.vault.tasks_open} OPEN`;
+  /* `vault.tasks_open` counted every unticked box in the vault — the MR review
+   * checklists, the lesson rules, `- [ ] Trained today` in every daily note —
+   * and put the total on this card as "OPEN". It read as 800 things owed. The
+   * count here is commitments only, collapsed across the notes they were
+   * carried through, minus what has been silenced, which is the number the
+   * task view is built to bring down. */
+  const tc = snap.task_counts || { open: 0, ignored: 0 };
+  $('tag-tasks').textContent = `M-02 · ${tc.open} OPEN`
+    + (tc.ignored ? ` · ${tc.ignored} OFF` : '');
   fill($('p-tasks'), snap.tasks.length ? snap.tasks.map((t) => {
     const tone = t.rank === 'P0' ? C.red : (t.rank === 'P1' ? C.amber : '#3F6472');
     const b = el('button.task', { type: 'button', style: `--t:${tone}`,
@@ -801,6 +1493,7 @@ function paintPanels(snap, live) {
     return probed(b, 'TASK · ' + t.rank, t.title, [
       ['WHY RANKED', t.why], ['WHERE', t.where], ['NOTE', t.rel],
       ['CLICK', t.done ? 'reopens it in the note' : 'ticks it in the note'],
+      ['DROP OR IGNORE', 'in the TASKS view — 02 in the left rail'],
     ]);
   }) : [el('div.empty', { style: 'padding:6px 2px', text: 'nothing ranked' })]);
 
@@ -855,18 +1548,76 @@ function paintPanels(snap, live) {
   ) : [el('div.empty', { style: 'padding:6px 2px', text: 'nothing written this session' })]);
 
   /* NUDGES */
-  $('tag-nudges').textContent = `M-06 · ${snap.nudges.length} FIRED`;
-  fill($('p-nudges'), snap.nudges.length ? snap.nudges.map((n) => {
+  const off = snap.nudges_off || [];
+  $('tag-nudges').textContent = `M-06 · ${snap.nudges.length} FIRED`
+    + (off.length ? ` · ${off.length} OFF` : '');
+  const rows = snap.nudges.map((n) => {
     const tone = n.urgency >= 3 ? C.red : (n.urgency === 2 ? C.amber : (n.urgency === 1 ? C.cyan : '#5E8C9C'));
     return probed(el('div.nudge', { style: `--t:${tone}` }, [
       el('span.bar'),
       el('span', {}, [el('span.k', { text: n.kind }), el('span.n', { text: n.text })]),
-    ]), 'NUDGE', n.kind.toLowerCase(), [
+      /* Only on a nudge that has a key. A check that *crashed* arrives
+       * without one — the server refuses to silence those, and a button that
+       * is going to be refused should not be drawn. */
+      n.key ? el('button.nx', {
+        type: 'button', title: 'silence — stop raising this until I restore it',
+        disabled: app.nudgeBusy === n.key,
+        onclick: (ev) => { ev.stopPropagation(); nudgeAction('silence', n.key); },
+      }, [el('span', { text: '⊗' })]) : null,
+    ].filter(Boolean)), 'NUDGE', n.kind.toLowerCase(), [
       ['URGENCY', ['fyi', 'worth a look', 'today', 'act now'][n.urgency] || '—'],
       n.detail ? ['DETAIL', n.detail] : null,
       ['CHECK', 'free · SQL over the vault'],
+      n.key ? ['SILENCE', '⊗ hides `' + n.key + '` everywhere until restored'] : null,
     ]);
-  }) : [el('div.empty', { style: 'padding:6px 2px', text: 'nothing to flag' })]);
+  });
+  if (!rows.length) {
+    rows.push(el('div.empty', { style: 'padding:6px 2px', text: 'nothing to flag' }));
+  }
+  /* Under the panel it censors, never behind a menu. A silence list you have
+   * to go looking for is one you forget you made, and then "nothing needs
+   * you" has quietly stopped being true. */
+  if (off.length) {
+    rows.push(el('div.nudge-off', {}, [
+      el('div.h', { text: 'SILENCED' }),
+      ...off.map((s) => probed(el('div.r', {}, [
+        el('span.n', { text: s.text || s.key }),
+        el('button.nx', {
+          type: 'button', title: 'restore — back in every list V builds',
+          disabled: app.nudgeBusy === s.key,
+          onclick: (ev) => { ev.stopPropagation(); nudgeAction('restore', s.key); },
+        }, [el('span', { text: '↺' })]),
+      ]), 'SILENCED CHECK', s.key, [
+        ['SINCE', s.at],
+        s.reason ? ['WHY', s.reason] : null,
+        ['RESTORE', '↺ puts it back in the brief, the digest and this panel'],
+      ])),
+    ]));
+  }
+  if (app.nudgeError) {
+    rows.push(el('div.empty', { style: `padding:6px 2px;color:${C.red}`,
+                                text: app.nudgeError }));
+  }
+  fill($('p-nudges'), rows);
+}
+
+/** Silence or restore one check, then repaint from a forced snapshot. */
+async function nudgeAction(action, key) {
+  /* Set before the await, so a double-click is dropped by the guard rather
+   * than by a disabled attribute that has not been painted yet. */
+  if (app.nudgeBusy) return;
+  app.nudgeBusy = key;
+  try {
+    await post('/api/nudge', { action, key });
+    app.nudgeError = '';
+  } catch (err) {
+    app.nudgeError = String(err.message || err);
+  } finally {
+    app.nudgeBusy = '';
+  }
+  /* Forced: the panel is drawn from the cached snapshot, and the whole point
+   * of the click was to change what that snapshot says. */
+  await refresh(true);
 }
 
 /* ---- actions ------------------------------------------------------------ */
@@ -881,6 +1632,10 @@ function go(view) {
   $('input').placeholder = view === 'vault'
     ? 'search the vault — enter runs it'
     : 'ask V anything · / for commands';
+  /* Fetched on entry rather than ridden along on the four-second poll: this
+   * is 120 rows to render six of them everywhere else on the page, and the
+   * card in the right rail already covers the glance. */
+  if (view === 'tasks') loadTasks();
   if (app.snap) paintPaneHead(app.snap);
   paintPane();
   $('input').focus();
@@ -998,12 +1753,199 @@ async function runSearch(q) {
   paintPane();
 }
 
+/* ---- the viewport -------------------------------------------------------
+ * The pictures a turn is about, on the surface that has room for one.
+ *
+ * `hud.py` finds them; this draws them. Three rules it follows, each of them
+ * a thing that went wrong first:
+ *
+ * **The picture is never markup.** `/api/media?id=…` takes a hash the server
+ * minted for a file it had already decided to show. There is no filename in
+ * the URL, so nothing a note or an email subject contains can steer it — the
+ * same argument `el()` makes for text, made for bytes.
+ *
+ * **It redraws only on a real change.** The live stream fires on every tool
+ * call. Rebuilding the <img> on that cadence restarted the download each
+ * time, which on a 4 MB screenshot is a picture that never finishes arriving.
+ *
+ * **An arrival is visible; a redraw is not.** The scan line runs once, on a
+ * frame that was not on screen a moment ago. Everything else — clicking the
+ * filmstrip, a poll landing — is silent, because a panel that flashes every
+ * four seconds is one you turn off.
+ */
+const mediaSrc = (id) => '/api/media?id=' + encodeURIComponent(id);
+
+function fmtBytes(n) {
+  if (!n) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function frameById(id) {
+  return ((app.live && app.live.frames) || []).find((f) => f.id === id) || null;
+}
+
+/** The picture itself: an <img> for an image, a sandboxed frame for a page.
+ *  Sized entirely in CSS, so the same node serves the panel and the lightbox. */
+function frameMedia(f) {
+  if (f.kind === 'page') {
+    /* A rendered chart or map is a whole document, so it is framed rather
+     * than drawn. `sandbox` without `allow-same-origin` puts it in an opaque
+     * origin: it can draw itself and reach Neshan for tiles, and it can read
+     * nothing of this page — not the DOM around it, not storage, not the
+     * conversation. The server sends it `ARTIFACT_CSP` to match. */
+    return el('iframe', { src: mediaSrc(f.id), sandbox: 'allow-scripts',
+                          loading: 'lazy', title: f.title || 'rendered artifact' });
+  }
+  return el('img', { src: mediaSrc(f.id), alt: f.title || '',
+                     loading: 'lazy', decoding: 'async' });
+}
+
+/** Fit a whole rendered page inside the panel's glass.
+ *
+ * `render._shell` authors at 720–900px wide. Dropped into a 320px frame it
+ * lays out *at* 320px and scrolls, which puts the middle of a bar chart on
+ * screen and none of its labels — a picture of a chart that cannot be read
+ * is worse than no picture, because it looks like the surface is broken.
+ * So the document is laid out at its real width and the whole thing scaled
+ * down: a thumbnail of the page rather than a crop of it. Click it and the
+ * lightbox shows it at a size meant for reading.
+ */
+function fitPage(glass, frame) {
+  /* Wider than tall on purpose. A chart page is mostly white below its last
+   * bar, so fitting to the page's full height would shrink it to a stamp in
+   * the middle of the glass to make room for nothing; the height here is the
+   * part worth showing, and what falls off the bottom is the margin. */
+  const W = 780, H = 460;
+  const w = glass.clientWidth, h = glass.clientHeight;
+  if (!w || !h) return;
+  const k = Math.min(w / W, h / H);
+  frame.style.cssText = `position:absolute;top:0;left:${((w - W * k) / 2).toFixed(1)}px;`
+    + `width:${W}px;height:${H}px;transform:scale(${k.toFixed(4)});transform-origin:0 0`;
+}
+
+function paintFrames(live) {
+  const frames = (live && live.frames) || [];
+  const vp = $('viewport');
+  /* `null` means no payload has landed yet — a reload, not a clear. The two
+   * have to be told apart: on a reload whatever is already there is history
+   * and must not scan in, while the first picture after a clear is the most
+   * important arrival there is. */
+  const booted = app.seenFrames !== null;
+  if (!frames.length) {
+    vp.hidden = true;
+    app.frame = '';
+    app.seenFrames = new Set();
+    if (app.lightbox) closeLightbox();
+    memo.frames = null;
+    return;
+  }
+  const known = booted ? app.seenFrames : new Set(frames.map((f) => f.id));
+  const fresh = frames.filter((f) => !known.has(f.id)).map((f) => f.id);
+  app.seenFrames = new Set(frames.map((f) => f.id));
+
+  /* A new picture takes the glass. Otherwise whatever was being looked at
+   * keeps it — a poll landing must not yank the view off the frame someone
+   * clicked to two seconds ago. */
+  if (fresh.length) app.frame = frames[0].id;
+  if (!frames.some((f) => f.id === app.frame)) app.frame = frames[0].id;
+
+  const sig = JSON.stringify([frames.map((f) => f.id), app.frame]);
+  if (!changed('frames', sig)) return;
+  vp.hidden = false;
+
+  const f = frameById(app.frame) || frames[0];
+  const src = SOURCES[f.source] || SOURCES.note;
+  $('vp-count').textContent = frames.length > 1
+    ? `${frames.indexOf(f) + 1}/${frames.length}` : src.abbr;
+
+  const glass = $('vp-glass');
+  glass.dataset.kind = f.kind;
+  /* The decoration is kept and the media swapped, rather than rebuilding the
+   * box: the corner brackets and the scan line are the frame, not content. */
+  for (const node of [...glass.children]) {
+    if (!node.classList.contains('scan') && !node.classList.contains('corner')) node.remove();
+  }
+  const media = frameMedia(f);
+  glass.insertBefore(media, glass.firstChild);
+  if (f.kind === 'page') fitPage(glass, media);
+  glass.dataset.fresh = fresh.includes(f.id) ? '1' : '0';
+
+  $('vp-title').textContent = f.title || '(untitled)';
+  fill($('vp-sub'), [
+    el('b', { text: src.label }), ' · ',
+    f.caption || f.rel.split('/').pop().replace(/\.md$/, '') || f.kind,
+    f.bytes ? ' · ' + fmtBytes(f.bytes) : '', ' · ' + f.time,
+  ]);
+
+  fill($('vp-strip'), frames.length < 2 ? [] : frames.map((g) => {
+    const s = SOURCES[g.source] || SOURCES.note;
+    const b = el('button', { type: 'button', title: g.title,
+      'aria-current': String(g.id === f.id),
+      onclick: () => { app.frame = g.id; memo.frames = null; paintFrames(app.live); } },
+      [g.kind === 'page' ? el('span', { text: s.abbr })
+                         : el('img', { src: mediaSrc(g.id), alt: '', loading: 'lazy' })]);
+    return probed(b, 'FRAME · ' + s.label, g.title, [
+      ['SOURCE', s.label], ['FROM', g.rel || g.caption || '—'],
+      ['KIND', g.kind], ['SIZE', fmtBytes(g.bytes) || '—'], ['AT', g.time],
+    ]);
+  }));
+}
+
+/** Full size, over everything. A page too: a chart shrunk into the panel is
+ *  the one frame that most needs somewhere bigger to be read. */
+function openLightbox(id) {
+  const f = frameById(id);
+  if (!f) return;
+  app.lightbox = id;
+  const src = SOURCES[f.source] || SOURCES.note;
+  $('lb-kind').textContent = src.label;
+  $('lb-title').textContent = f.title || '(untitled)';
+  $('lb-sub').textContent = [f.rel || f.caption, fmtBytes(f.bytes)]
+    .filter(Boolean).join(' · ');
+  fill($('lb-stage'), [frameMedia(f)]);
+  $('lightbox').hidden = false;
+}
+
+function closeLightbox() {
+  app.lightbox = '';
+  $('lightbox').hidden = true;
+  fill($('lb-stage'), []);
+}
+
+/** Step through the strip. Only bound inside the lightbox, where the arrow
+ *  keys are not already the palette's. */
+function stepLightbox(by) {
+  const frames = (app.live && app.live.frames) || [];
+  const i = frames.findIndex((f) => f.id === app.lightbox);
+  const n = frames.length;
+  if (i < 0 || n < 2) return;
+  const next = frames[(((i + by) % n) + n) % n];   // wraps both ways
+  app.frame = next.id;
+  memo.frames = null;
+  paintFrames(app.live);
+  openLightbox(next.id);
+}
+
+/** The close button. The files stay exactly where they are — this is the
+ *  screen being cleared, which is why it is the same verb as `/clear`. */
+async function clearFrames() {
+  try {
+    const out = await post('/api/frames', { action: 'clear' });
+    if (out.live) applyLive(out.live);
+  } catch (err) {
+    $('viewport').hidden = true;      // the server said no; the panel still goes
+  }
+}
+
 /* ---- the two channels --------------------------------------------------- */
 function applyLive(live) {
   app.live = live;
   paintState(live.state.name, live.state.detail, live.state.tools);
   paintRoute(live);
   paintBus(live);
+  paintFrames(live);
   if (app.snap) {
     paintHeader(app.snap, live);
     paintGauges(app.snap, live);
@@ -1025,6 +1967,10 @@ async function refresh(force) {
     $('hud').dataset.agent = snap.agent === 'v' ? 'v' : snap.agent;
     if (snap.live) applyLive(snap.live);
     else if (app.live) applyLive(app.live);
+    /* Only while it is the visible view. A task ticked in Obsidian should
+     * show up here without a reload; a task list nobody is looking at should
+     * not be queried every four seconds. */
+    if (app.view === 'tasks' && !app.taskBusy) loadTasks();
   } catch (err) {
     setOffline(true);
   }
@@ -1098,10 +2044,35 @@ function boot() {
   paintState('idle', 'connecting…', []);
   go('console');
   clock(); setInterval(clock, 1000);
+  $('jdate').addEventListener('mouseenter', () => {
+    if (jday) showProbe($('jdate'), 'DATE', jday.label, jalaliRows(jday));
+  });
+  $('jdate').addEventListener('mouseleave', hideProbe);
   parallax();
 
   $('form').addEventListener('submit', (e) => { e.preventDefault(); send(); });
   $('why').addEventListener('click', toggleTrace);
+
+  /* The viewport. Clicking the glass blows the picture up; clicking ✕ says
+   * stop showing me these, which is the screen being cleared and not a file
+   * being deleted — see `/api/frames`. */
+  $('vp-glass').addEventListener('click', () => openLightbox(app.frame));
+  $('vp-close').addEventListener('click', clearFrames);
+  $('lb-close').addEventListener('click', closeLightbox);
+  $('lightbox').addEventListener('click', (e) => {
+    if (e.target === $('lightbox')) closeLightbox();   // the backdrop, not the sheet
+  });
+  /* Escape reaches here from anywhere, including the prompt — a picture over
+   * the whole screen is the one thing on this page that has to be dismissable
+   * without first working out what has focus. The palette's own Escape is on
+   * the input and runs first, which is the right order: close the small thing
+   * before the big one. */
+  window.addEventListener('keydown', (e) => {
+    if (!app.lightbox) return;
+    if (e.key === 'Escape') { e.preventDefault(); closeLightbox(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); stepLightbox(1); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); stepLightbox(-1); }
+  });
 
   fetch('/api/commands').then((r) => r.json())
     .then((d) => { COMMANDS = d.commands || []; })
@@ -1128,6 +2099,13 @@ function boot() {
     }
   });
   window.addEventListener('scroll', hideProbe, true);
+  /* A scaled page is fitted to a measured box, so a resized window leaves it
+   * at the wrong scale. Refitted rather than repainted: rebuilding the node
+   * would restart the download on every pixel of a drag. */
+  window.addEventListener('resize', () => {
+    const glass = $('vp-glass'), page = glass.querySelector('iframe');
+    if (page) fitPage(glass, page);
+  }, { passive: true });
 
   stream();
   refresh(true);

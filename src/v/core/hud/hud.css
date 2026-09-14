@@ -179,7 +179,7 @@ input { font-family: inherit; }
  * name inside it is not, and the default LTR paragraph gets that right on its
  * own. This is why nudges are missing from the list below and it is not an
  * oversight. */
-.day .title, .ev .n, .task .n, .dl .n, .msg .subj, .mem .text,
+.day .title, .ev .n, .task .n, .trow .n, .dl .n, .msg .subj, .mem .text,
 .hit .title, .turn .bubble, #probe .title, #probe .row .v {
   unicode-bidi: plaintext;
 }
@@ -207,8 +207,32 @@ input { font-family: inherit; }
 .chip .k { font-size: 8.5px; letter-spacing: .16em; color: var(--label-2); }
 .chip .v { font-family: var(--disp); font-weight: 600; font-size: 13.5px;
   letter-spacing: .04em; color: var(--body); }
+#when { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; flex: none; }
 #clock { font-family: var(--disp); font-weight: 600; font-size: 17px; letter-spacing: .1em;
   color: var(--paper); flex: none; white-space: nowrap; text-shadow: 0 0 14px rgba(111,227,255,.45); }
+
+/* The Jalali date under the clock. `direction: rtl` rather than relying on
+ * the bidi algorithm to work it out: the string is Persian words and
+ * Arabic-Indic digits, and the digits are weak characters that take their
+ * ordering from the paragraph — left to LTR, "۱۸ شهریور ۱۴۰۵" is one
+ * reordering away from reading as the wrong day of the wrong month. `isolate`
+ * keeps that decision from leaking into the header around it. */
+#jdate { direction: rtl; unicode-bidi: isolate; display: flex; align-items: center;
+  gap: 6px; font-size: 10.5px; letter-spacing: .02em; color: var(--body-2);
+  white-space: nowrap; line-height: 1.1; }
+#jdate .off { display: none; font-size: 8.5px; letter-spacing: .06em;
+  padding: 1px 4px; border-radius: 3px; color: #201203;
+  background: var(--amber); box-shadow: 0 0 9px rgba(255,192,97,.5); }
+/* A day off is worth seeing from across the room; an ordinary one is not
+ * worth a colour. So the badge appears rather than the text changing state,
+ * and the date behind it warms only in that one case. */
+#jdate[data-off="1"] { color: var(--amber); }
+#jdate[data-off="1"] .off { display: inline-block; }
+/* Unknown is its own state, and it looks like neither: the service was not
+ * reachable, so the date is still right and the holiday flag is absent
+ * rather than false. */
+#jdate[data-off="?"] { color: var(--label); }
+#jdate[data-off="?"]::after { content: "?"; font-size: 9px; color: var(--label); }
 
 /* ---- the three columns ------------------------------------------------- */
 .body { display: grid; grid-template-columns: 238px minmax(360px, 1fr) minmax(0, 392px);
@@ -374,7 +398,19 @@ input { font-family: inherit; }
   background: repeating-linear-gradient(90deg, rgba(111,227,255,.2) 0 1px, transparent 1px 8px); }
 .panehead .r { font-size: 9px; letter-spacing: .14em; color: var(--label); flex: none; white-space: nowrap; }
 
+.panewrap { position: relative; display: flex; flex: 1 1 0; min-height: 0; }
 .pane { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 16px 16px 20px; }
+/* The week draws its own 24-hour scroller. Two nested scrollers meant the
+   wheel moved the pane first and the canvas looked stuck; the padding goes
+   too, or a full-height child overflows the padding box and puts the outer
+   scrollbar straight back.
+
+   Flex rather than `height: 100%` on the child: a percentage height only
+   resolves if the parent's own height is definite, and that is a chain three
+   elements long which any later layout change can quietly break. `flex: 1`
+   against `min-height: 0` cannot. */
+.pane[data-pane="week"] { overflow: hidden; padding: 0;
+  display: flex; flex-direction: column; }
 .pane[data-stale="1"] { opacity: .55; transition: opacity .2s; }
 
 /* console */
@@ -440,6 +476,73 @@ input { font-family: inherit; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hit .track { position: relative; height: 3px; background: rgba(111,227,255,.1); }
 .hit .track i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--t); }
+
+/* task view
+ *
+ * The one screen here with more than one verb per row, and the layout follows
+ * from that: the checkbox on the left is the answer you already had, and the
+ * three buttons on the right are the ones that were missing. They sit at .38
+ * at rest rather than hidden until hover — this view exists to be used, and a
+ * control you have to discover by accident is a control that goes unused,
+ * which is how the backlog got to 800 in the first place. */
+.tfilter { position: sticky; top: -16px; z-index: 3; display: flex; flex-wrap: wrap;
+  align-items: center; gap: 3px; margin: -16px -16px 12px; padding: 16px 16px 11px;
+  background: linear-gradient(180deg, rgba(4,7,10,.97) 74%, rgba(4,7,10,0)); }
+.tfilter button { display: flex; align-items: center; gap: 7px; padding: 5px 11px;
+  border: 1px solid var(--line-3); background: rgba(8,20,28,.5); color: var(--label);
+  font-family: var(--disp); font-weight: 600; font-size: 10.5px; letter-spacing: .14em;
+  cursor: pointer; }
+.tfilter button:hover { border-color: rgba(111,227,255,.36); color: var(--body); }
+.tfilter button[aria-pressed="true"] { border-color: rgba(111,227,255,.5);
+  background: var(--wash); color: var(--paper); }
+.tfilter .n { font-family: var(--mono); font-size: 10px; letter-spacing: 0; color: var(--cyan); }
+.tfilter button[aria-pressed="true"] .n { color: var(--paper); }
+
+.tlist { display: flex; flex-direction: column; gap: 2px; }
+.trow { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto;
+  align-items: center; gap: 11px; padding: 8px 11px; border-left: 2px solid var(--t);
+  background: rgba(8,20,28,.42); }
+.trow:hover { background: var(--wash); }
+.trow[data-ignored="1"] { opacity: .6; }
+.trow[data-done="1"] .n { color: var(--dim); text-decoration: line-through; }
+.tbox { display: flex; align-items: center; justify-content: center; flex: none;
+  width: 15px; height: 15px; padding: 0; border: 1px solid rgba(111,227,255,.34);
+  background: transparent; color: var(--void); font-size: 10px; line-height: 1; cursor: pointer; }
+.tbox:hover { border-color: rgba(111,227,255,.7); }
+.trow[data-done="1"] .tbox { border-color: var(--green); background: var(--green); }
+.tbox:disabled { opacity: .35; cursor: default; }
+.tmid { min-width: 0; }
+.trow .n { font-family: var(--sans); font-size: 13px; color: #CDEAF5;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Composed by the page in English out of vault fragments, so it stays LTR —
+ * the same split the bidi block at the top of this file argues for. */
+.trow .m { padding-top: 3px; font-size: 9.5px; letter-spacing: .04em; color: var(--label-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trank { font-family: var(--disp); font-weight: 600; font-size: 10px;
+  letter-spacing: .12em; color: var(--t); }
+
+.tacts { display: flex; gap: 4px; opacity: .38; transition: opacity .12s; }
+.trow:hover .tacts, .trow:focus-within .tacts { opacity: 1; }
+.tacts button { display: flex; align-items: center; gap: 5px; padding: 4px 8px;
+  border: 1px solid var(--line-3); background: rgba(6,16,22,.6); color: var(--label);
+  font-family: var(--disp); font-weight: 600; font-size: 9.5px; letter-spacing: .12em;
+  cursor: pointer; white-space: nowrap; }
+.tacts .g { font-family: var(--mono); font-size: 11px; letter-spacing: 0; }
+.tacts button:disabled { opacity: .35; cursor: default; }
+/* Colour by consequence, not by position: green writes a tick, amber writes a
+ * strike-through, red writes nothing at all and silences the row. */
+.tacts button[data-verb="done"]:hover { border-color: rgba(72,227,155,.55); color: var(--green); }
+.tacts button[data-verb="open"]:hover { border-color: rgba(111,227,255,.55); color: var(--cyan); }
+.tacts button[data-verb="dropped"]:hover { border-color: rgba(255,192,97,.55); color: var(--amber); }
+.tacts button[data-verb="ignored"]:hover { border-color: rgba(255,106,90,.5); color: var(--red); }
+.tacts button[data-verb="unignored"]:hover { border-color: rgba(111,227,255,.55); color: var(--cyan); }
+
+/* Below this the three labels and a task title fight over the same row, and
+ * the title is the part you are reading. The glyphs keep their tooltips. */
+@media (max-width: 1440px) { .tacts .l { display: none; } }
+
+.terr { margin: 0 0 10px; padding: 8px 11px; border-left: 2px solid var(--red);
+  background: rgba(255,106,90,.08); font-size: 11px; color: #FF9E92; cursor: pointer; }
 
 .empty { padding: 22px 4px; font-size: 11px; letter-spacing: .1em; color: var(--label-2); }
 
@@ -575,6 +678,33 @@ input { font-family: inherit; }
 .nudge .k { display: block; font-size: 8.5px; letter-spacing: .16em; color: var(--t); }
 .nudge .n { display: block; padding-top: 3px; font-family: var(--sans); font-size: 12.5px;
   line-height: 1.5; color: var(--body); }
+.nudge > span:nth-child(2) { flex: 1; min-width: 0; }
+
+/* The silence button. Faint until the row is under the pointer, same rule as
+ * `.tacts`: this panel is read far more often than it is acted on, and four
+ * live buttons at full strength read as four more things demanding attention
+ * — which is the exact complaint the button exists to answer. */
+.nx { flex: none; width: 20px; height: 20px; padding: 0; display: flex;
+  align-items: center; justify-content: center; opacity: 0; transition: opacity .12s;
+  border: 1px solid var(--line-3); background: rgba(6,16,22,.6);
+  color: var(--label); font-family: var(--mono); font-size: 11px; cursor: pointer; }
+.nudge:hover .nx, .nudge:focus-within .nx,
+.nudge-off .r:hover .nx, .nudge-off .r:focus-within .nx { opacity: 1; }
+.nx:hover { border-color: rgba(255,106,90,.5); color: var(--red); }
+.nudge-off .nx:hover { border-color: rgba(111,227,255,.55); color: var(--cyan); }
+.nx:disabled { opacity: .35; cursor: default; }
+
+.nudge-off { margin-top: 3px; padding-top: 7px; border-top: 1px solid var(--line); }
+.nudge-off .h { font-family: var(--disp); font-size: 8.5px; letter-spacing: .18em;
+  color: var(--label-2); padding-bottom: 5px; }
+.nudge-off .r { display: flex; gap: 9px; align-items: center; }
+.nudge-off .r + .r { padding-top: 4px; }
+/* Dim and struck through: it is on screen to be undone, not to be read as
+ * live. The two states must never be mistakable at a glance. */
+.nudge-off .n { flex: 1; min-width: 0; font-family: var(--sans); font-size: 11.5px;
+  line-height: 1.4; color: var(--label); text-decoration: line-through;
+  text-decoration-color: var(--line-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .tiles { display: flex; gap: 8px; }
 .tile { flex: 1; position: relative; padding: 9px 11px; border: 1px solid var(--line-2);
@@ -603,6 +733,121 @@ input { font-family: inherit; }
 .bus .spark { display: flex; align-items: flex-end; gap: 2px; height: 14px; flex: none; }
 .bus .spark i { width: 2px; }
 .bus .tail { font-size: 9px; letter-spacing: .12em; color: var(--label); flex: none; white-space: nowrap; }
+
+/* ---- the viewport ------------------------------------------------------
+ * The pictures a turn is about, projected over the conversation.
+ *
+ * It is the `.card` frame, not a second look: the same clipped corner, the
+ * same hairline rail down the left, the same head row of led/title/fill/tag.
+ * A surface where a picture arrives in a different chrome to everything else
+ * reads as a different application, and the whole argument for the HUD is
+ * that it is one screen.
+ *
+ * Two things it has that a card does not. The wire is the probe's idiom
+ * borrowed — a line back to where the thing came from, which here is the
+ * aperture that was lit while it was found. The scan is the arrival: it runs
+ * once per frame and then stops, so a picture landing is visible out of the
+ * corner of an eye without anything continuing to move afterwards.
+ */
+@keyframes hVpIn   { from { opacity: 0; transform: translateY(10px) scale(.97) }
+                     to   { opacity: 1; transform: none } }
+@keyframes hVpScan { from { transform: translateY(-100%) } to { transform: translateY(1100%) } }
+
+#viewport { position: absolute; right: 12px; bottom: 12px; z-index: 32;
+  width: min(348px, calc(100% - 24px)); pointer-events: none; }
+#viewport[hidden] { display: none; }
+#viewport .wire { position: absolute; left: 14px; top: -54px; width: 1px; height: 54px;
+  background: linear-gradient(180deg, transparent, rgba(111,227,255,.5)); }
+#viewport .wire::before { content: ""; position: absolute; left: -2px; top: -3px;
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--cyan); box-shadow: 0 0 9px var(--cyan); }
+
+#viewport .vp { position: relative; pointer-events: auto; padding: 10px 11px 11px;
+  border: 1px solid rgba(111,227,255,.34); backdrop-filter: blur(11px);
+  background: linear-gradient(180deg, rgba(14,32,42,.93), rgba(5,12,18,.92));
+  box-shadow: inset 0 1px 0 rgba(199,243,255,.09), 0 18px 52px rgba(2,6,10,.78);
+  clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px));
+  animation: hVpIn .22s ease-out both; }
+#viewport .vp::before { content: ""; position: absolute; top: 0; right: 0; width: 20px; height: 1px;
+  background: rgba(111,227,255,.5); transform: rotate(-45deg); transform-origin: 100% 0; }
+
+#viewport .head { display: flex; align-items: center; gap: 8px; padding-bottom: 9px; }
+#viewport .led { width: 6px; height: 6px; flex: none; background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan); animation: hLed 3.2s ease-in-out infinite; }
+#viewport .title { font-family: var(--disp); font-weight: 600; font-size: 12.5px;
+  letter-spacing: .22em; color: #CDEAF5; }
+#viewport .fill { flex: 1; height: 1px; background: rgba(111,227,255,.14); }
+#viewport .tag { font-size: 8px; letter-spacing: .14em; color: var(--faint); flex: none; }
+#viewport .x, #lightbox .x { flex: none; width: 17px; height: 17px; padding: 0;
+  border: 1px solid rgba(111,227,255,.2); background: transparent; cursor: pointer;
+  font: inherit; font-size: 9px; line-height: 1; color: #5E8C9C; }
+#viewport .x:hover, #lightbox .x:hover { border-color: rgba(111,227,255,.55); color: var(--paper); }
+
+/* The picture. A fixed height so a tall screenshot and a wide map do not
+ * make the panel jump around the corner of the screen as the filmstrip is
+ * clicked through; `contain` rather than `cover` because a cropped chart is
+ * a wrong chart. */
+#viewport .glass { position: relative; height: 190px; overflow: hidden;
+  border: 1px solid rgba(111,227,255,.16); background: rgba(3,9,14,.8); cursor: zoom-in; }
+#viewport .glass img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* Positioned and scaled by `fitPage()` — see there for why a chart is
+ * laid out at its real width and shrunk rather than reflowed. */
+#viewport .glass iframe { position: absolute; border: 0; background: #fff; }
+#viewport .glass .scan { position: absolute; left: 0; right: 0; height: 18px; z-index: 2;
+  pointer-events: none; opacity: 0;
+  background: linear-gradient(180deg, transparent, rgba(111,227,255,.22), transparent); }
+#viewport .glass[data-fresh="1"] .scan { opacity: 1; animation: hVpScan .5s linear 1 both; }
+#viewport .glass .corner { position: absolute; width: 11px; height: 11px; z-index: 2;
+  pointer-events: none; border: 0 solid rgba(111,227,255,.55); }
+#viewport .glass .corner.tl { left: 4px; top: 4px; border-left-width: 1px; border-top-width: 1px; }
+#viewport .glass .corner.tr { right: 4px; top: 4px; border-right-width: 1px; border-top-width: 1px; }
+#viewport .glass .corner.bl { left: 4px; bottom: 4px; border-left-width: 1px; border-bottom-width: 1px; }
+#viewport .glass .corner.br { right: 4px; bottom: 4px; border-right-width: 1px; border-bottom-width: 1px; }
+
+#viewport .meta { padding: 8px 2px 0; }
+#viewport .meta .t { font-family: var(--sans); font-size: 12px; line-height: 1.45;
+  color: var(--paper); overflow-wrap: anywhere; }
+#viewport .meta .s { padding-top: 3px; font-size: 9px; letter-spacing: .1em;
+  color: var(--label); overflow-wrap: anywhere; }
+#viewport .meta .s b { font-weight: 400; color: var(--cyan); }
+
+/* The filmstrip. Hidden entirely at one frame — a strip of one is a border
+ * around a picture that is already on screen. */
+#viewport .strip { display: flex; gap: 5px; padding-top: 9px; overflow-x: auto; }
+#viewport .strip:empty { display: none; }
+#viewport .strip button { position: relative; flex: none; width: 42px; height: 30px;
+  padding: 0; border: 1px solid rgba(111,227,255,.18); background: rgba(3,9,14,.8);
+  cursor: pointer; overflow: hidden; font: inherit; font-size: 8px; letter-spacing: .1em;
+  color: var(--label); }
+#viewport .strip button img { width: 100%; height: 100%; object-fit: cover; display: block; }
+#viewport .strip button:hover { border-color: rgba(111,227,255,.5); }
+#viewport .strip button[aria-current="true"] { border-color: var(--cyan);
+  box-shadow: 0 0 12px rgba(111,227,255,.28); }
+
+/* ---- the lightbox ------------------------------------------------------ */
+#lightbox { position: fixed; inset: 0; z-index: 60; display: flex;
+  align-items: center; justify-content: center; padding: 34px;
+  background: rgba(2,5,8,.86); backdrop-filter: blur(4px); }
+#lightbox[hidden] { display: none; }
+#lightbox .sheet { display: flex; flex-direction: column; max-width: 100%; max-height: 100%;
+  padding: 11px 13px 13px; border: 1px solid rgba(111,227,255,.38);
+  background: linear-gradient(180deg, rgba(14,32,42,.96), rgba(5,12,18,.96));
+  box-shadow: inset 0 1px 0 rgba(199,243,255,.09), 0 24px 70px rgba(2,6,10,.8);
+  clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px));
+  animation: hVpIn .18s ease-out both; }
+#lightbox .bar { display: flex; align-items: center; gap: 10px; padding-bottom: 10px; }
+#lightbox .kind { font-size: 8px; letter-spacing: .2em; color: var(--cyan); flex: none; }
+#lightbox .bar .t { font-family: var(--sans); font-size: 12.5px; color: var(--paper);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#lightbox .bar .fill { flex: 1; min-width: 14px; height: 1px; background: rgba(111,227,255,.14); }
+#lightbox .bar .s { font-size: 9px; letter-spacing: .12em; color: var(--label); flex: none; }
+#lightbox .stagearea { display: flex; align-items: center; justify-content: center;
+  min-height: 0; min-width: 0; }
+#lightbox img { max-width: 84vw; max-height: 78vh; object-fit: contain; display: block; }
+/* No scaling here — this is where a chart is finally at a size meant
+ * for reading, so it gets the width `render._shell` authored for. */
+#lightbox iframe { width: min(84vw, 900px); height: min(78vh, 620px);
+  border: 0; background: #fff; display: block; }
 
 /* ---- the probe --------------------------------------------------------- */
 #probe { position: fixed; inset: 0; pointer-events: none; z-index: 40; }
@@ -640,5 +885,161 @@ input { font-family: inherit; }
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .bg-scan { display: none; }
   .bus .tape { animation: none; }
+  /* The scan's whole existence is the animation; with none it would sit on
+   * the picture as a static grey band. */
+  #viewport .glass .scan { display: none; }
   .wave i { transform: scaleY(.4); }
 }
+
+/* ---- the week -----------------------------------------------------------
+ *
+ * One grid, two rows: a sticky header and a 24-hour canvas. The header shares
+ * the column template with the columns beneath it — which is the only way to
+ * keep them aligned, since two separate grids drift the moment one of them
+ * gets a scrollbar.
+ *
+ * `--pxm` (pixels per minute) is set inline by the renderer; everything here
+ * is positioned in the pixels it produced, so the CSS never has to know what
+ * time it is. */
+.week { display: flex; flex-direction: column; flex: 1; min-height: 0;
+  position: relative; }
+
+.wk-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.wk-scroll::-webkit-scrollbar { width: 8px; }
+.wk-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+
+.wk-grid { display: grid; grid-template-columns: 52px repeat(7, minmax(0, 1fr));
+  align-items: start; padding-right: 14px; }
+
+/* Row one, and it stays put. `--void` rather than transparent: blocks scroll
+ * underneath it and would otherwise show through. */
+.wk-grid .hcell { position: sticky; top: 0; z-index: 6; background: var(--void);
+  border-bottom: 1px solid var(--line-3); padding: 2px 0 5px 6px;
+  min-width: 0; display: flex; align-items: center; gap: 4px; }
+.wk-grid .hcell b { font-family: var(--disp); font-size: 12.5px; font-weight: 600;
+  letter-spacing: .11em; color: var(--label); white-space: nowrap; }
+.wk-grid .hcell[data-today="1"] { border-bottom-color: var(--cyan); }
+.wk-grid .hcell[data-today="1"] b { color: var(--paper); }
+.wk-grid .hgut { padding-left: 0; justify-content: center; }
+.wk-grid .hgut .zoom { width: 17px; height: 17px; padding: 0; line-height: 1;
+  border: 1px solid var(--line-2); background: transparent; cursor: pointer;
+  color: var(--label); font-family: var(--mono); font-size: 11px; }
+.wk-grid .hgut .zoom:hover { border-color: var(--cyan); color: var(--cyan); }
+
+.wk-grid .gutcol { position: relative; }
+.wk-grid .gutcol .h { position: absolute; right: 7px; transform: translateY(-50%);
+  font-family: var(--mono); font-size: 9px; letter-spacing: .04em;
+  color: var(--faint); white-space: nowrap; }
+.wk-grid .gutcol .line { display: none; }
+
+.wk-grid .col { position: relative; border-left: 1px solid var(--line-3);
+  min-width: 0; cursor: copy; }
+.wk-grid .col[data-today="1"] { background: var(--wash); }
+.wk-grid .col .line { position: absolute; left: 0; right: 0; height: 1px;
+  background: var(--line-3); pointer-events: none; }
+.wk-grid .col .line[data-major="1"] { background: var(--line-2); }
+
+/* A block. `--t` is its kind's colour; everything else derives from it, so a
+ * new kind needs one entry in `KINDS` and nothing here. `left`/`width` come
+ * from its lane, so two things at the same hour sit side by side instead of
+ * one on top of the other. */
+.week .blk { position: absolute; overflow: hidden; cursor: pointer;
+  border-left: 2px solid var(--t);
+  background: color-mix(in srgb, var(--t) 17%, var(--void));
+  padding: 2px 5px; display: flex; flex-direction: column; gap: 0;
+  line-height: 1.18; border-radius: 1px; }
+.week .blk:hover { background: color-mix(in srgb, var(--t) 30%, var(--void));
+  z-index: 4; box-shadow: 0 0 0 1px var(--t); }
+.week .blk .k { font-family: var(--disp); font-size: 9px; font-weight: 600;
+  letter-spacing: .13em; text-transform: uppercase; color: var(--t);
+  white-space: nowrap; flex: none; }
+.week .blk .n { font-family: var(--sans); font-size: 10.5px; color: var(--body-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A block that sits wholly inside a longer one. Drawn over it, inset, with a
+   hard edge so it reads as "during", not as "instead of" — and on top, which
+   is what makes the pointer hit the small thing you aimed at. */
+.week .blk[data-nested="1"] { box-shadow: -1px 0 0 0 var(--void), 0 1px 6px -1px #000;
+  background: color-mix(in srgb, var(--t) 30%, var(--void)); }
+.week .blk[data-nested="1"]:hover { background: color-mix(in srgb, var(--t) 44%, var(--void)); }
+.week .blk[data-past="1"] { opacity: .4; }
+.week .blk[data-now="1"] { box-shadow: 0 0 0 1px var(--t), 0 0 16px -3px var(--t); }
+.week .blk[data-now="1"] .n { color: var(--paper); }
+/* Too short for two lines — say the one thing that fits, on one line, rather
+ * than clipping a title through the middle of its own glyphs. */
+.week .blk[data-tight="1"] { flex-direction: row; align-items: center; gap: 5px;
+  padding: 0 5px; }
+.week .blk[data-tight="1"] .k { font-size: 8.5px; }
+.week .blk[data-tight="1"] .n { font-size: 9.5px; }
+
+.week .nowline { position: absolute; left: -2px; right: -2px; height: 1px;
+  background: var(--red); box-shadow: 0 0 8px var(--red); z-index: 5;
+  pointer-events: none; }
+.week .nowline::before { content: ''; position: absolute; left: -3px; top: -2.5px;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
+
+.wk-foot { flex: none; display: flex; flex-direction: column; gap: 5px;
+  padding: 7px 14px 10px; border-top: 1px solid var(--line-3); }
+.wk-load { display: flex; height: 4px; gap: 1px; }
+.wk-load i { background: var(--t); display: block; min-width: 2px; }
+.wk-foot .legend { display: flex; flex-wrap: wrap; align-items: center;
+  gap: 4px 13px; font-family: var(--mono); font-size: 9px; color: var(--label-2); }
+.wk-foot .legend > span { display: inline-flex; align-items: center; gap: 4px; }
+.wk-foot .legend i { width: 6px; height: 6px; display: inline-block; flex: none; }
+.wk-foot .legend b { color: var(--body-2); font-weight: 500; letter-spacing: .04em; }
+.wk-foot .src { color: var(--ghost); margin-left: auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- the block editor --------------------------------------------------- */
+#blockedit { position: fixed; inset: 0; z-index: 60; }
+#blockedit[hidden] { display: none; }
+.blk-sheet { position: absolute; inset: 0; z-index: 20; display: flex;
+  align-items: center; justify-content: center; padding: 16px;
+  background: rgba(4, 7, 10, .72); backdrop-filter: blur(2px); }
+.blk-sheet .inner { width: min(430px, 100%); }
+.blk-form { border: 1px solid var(--line); background: var(--void);
+  box-shadow: 0 18px 50px -12px #000; display: flex; flex-direction: column;
+  gap: 10px; padding: 12px 14px 13px; }
+.blk-form .top { display: flex; align-items: center; gap: 8px; }
+.blk-form .top .t { font-family: var(--disp); font-size: 12px; font-weight: 600;
+  letter-spacing: .16em; color: var(--cyan); }
+.blk-form .top .fill { flex: 1; height: 1px; background: var(--line-3); }
+.blk-form .top .x { background: transparent; border: 0; cursor: pointer;
+  color: var(--label); font-size: 12px; padding: 2px 4px; }
+.blk-form .top .x:hover { color: var(--red); }
+
+.blk-form .kinds { display: flex; flex-wrap: wrap; gap: 4px; }
+.blk-form .kinds button { font-family: var(--disp); font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase; cursor: pointer;
+  padding: 3px 8px; border: 1px solid var(--line-2); background: transparent;
+  color: var(--label); }
+.blk-form .kinds button:hover { border-color: var(--t); color: var(--t); }
+.blk-form .kinds button[data-on="1"] { border-color: var(--t); color: var(--void);
+  background: var(--t); font-weight: 600; }
+
+.blk-form .row { display: flex; gap: 8px; }
+.blk-form .f { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+.blk-form .f > span { font-family: var(--mono); font-size: 8.5px;
+  letter-spacing: .12em; color: var(--label-2); }
+.blk-form input { width: 100%; background: #070D12; color: var(--body);
+  border: 1px solid var(--line-2); padding: 5px 7px; font-family: var(--mono);
+  font-size: 11.5px; }
+.blk-form input:focus { outline: none; border-color: var(--cyan); }
+.blk-form input::-webkit-calendar-picker-indicator { filter: invert(.6) sepia(1)
+  saturate(3) hue-rotate(155deg); cursor: pointer; }
+
+.blk-form .err { font-family: var(--mono); font-size: 9.5px; color: var(--red);
+  border-left: 2px solid var(--red); padding-left: 7px; line-height: 1.4; }
+
+.blk-form .acts { display: flex; align-items: center; gap: 7px; }
+.blk-form .acts .fill { flex: 1; }
+.blk-form .acts button { font-family: var(--disp); font-size: 11px; font-weight: 600;
+  letter-spacing: .13em; cursor: pointer; padding: 5px 13px;
+  border: 1px solid var(--line-2); background: transparent; color: var(--label); }
+.blk-form .acts .go { border-color: var(--cyan); color: var(--void);
+  background: var(--cyan); }
+.blk-form .acts .go:hover { filter: brightness(1.12); }
+.blk-form .acts .ghost:hover { border-color: var(--body-2); color: var(--body-2); }
+.blk-form .acts .drop { border-color: rgba(255, 106, 90, .4); color: var(--red); }
+.blk-form .acts .drop:hover { background: var(--red); color: var(--void);
+  border-color: var(--red); }

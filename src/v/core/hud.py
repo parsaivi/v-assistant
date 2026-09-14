@@ -39,11 +39,30 @@ a turn in flight is `thinking`, the seconds after an answer are `speaking`, a
 turn that wrote to the vault is `writing`, and a turn that raised is `fault`.
 The list is an indicator, not a control.
 
+**And it is the surface with room for a picture.** Every other one V has is
+words: the terminal cannot draw a Neshan raster at the width a transcript can
+spare, and `render.py` has said so since the half-blocks were tried and
+removed. So a chart went to `webbrowser.open()` and a screenshot pasted into a
+note was invisible unless Obsidian was the window in front. `Frame` and the
+viewport are the fix — see `media.py` for the finding, which is the half with
+the interesting argument in it. Two things are worth stating here: the
+pictures arrive on `_Scout`'s thread and never on the one answering, so a
+static-map fetch is never latency added to an answer in order to decorate it;
+and the bytes are addressed by a hash of a path the session has already
+decided to show, so `/api/media` has no filename in it to traverse with.
+
 ```
 browser ──HTTP(loopback)──►  _Handler ──►  _Bridge ──►  Engine.handle
    ▲                             │                          │
    │                             ▼                          ▼
-   └── SSE /api/events ◄──── Session ◄──── engine.progress (tool events)
+   ├── SSE /api/events ◄──── Session ◄──── engine.progress (tool events)
+   │                             ▲                          │
+   │                          frames                   rel · rels
+   │                             │                          ▼
+   └── GET /api/media ◄──────────┴──────── _Scout ◄──── notes · places
+                                              ▲
+                                        media.Spool ◄── render.save()
+                                                        (any process)
 ```
 
 `Session` is the part that is *not* behind the bridge, and that is deliberate:
@@ -57,6 +76,7 @@ HUD stays alive *during* a long answer rather than freezing until it lands.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import http.server
 import json
 import mimetypes
@@ -68,7 +88,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import commands as commands_mod, index, persona as persona_mod
+from . import (commands as commands_mod, index, jalali as jalali_mod,
+               media as media_mod, notes as notes_mod,
+               persona as persona_mod, weekplan)
 from .config import Settings, settings as default_settings
 from .engine import Engine
 
@@ -97,13 +119,40 @@ SPEAK_HOLD = 3.0
 #: Panel sizes. The design's own counts, which are also about one screen.
 N_AGENDA = 8
 N_TASKS = 6
+#: The TASKS *view* is not the TASKS card. The card is the six most urgent
+#: things and fits beside the conversation; the view is the whole backlog,
+#: which is the only place a task can be got rid of. Capped anyway — a list
+#: nobody can reach the bottom of is a list nobody prunes, and the count above
+#: it stays honest about what was cut.
+N_TASK_VIEW = 120
 N_DEADLINES = 4
 N_MEMS = 8
 N_NUDGES = 4
+#: The silence list is a *reminder* that it exists, not a management screen —
+#: it sits under the panel it censors, so it has to stay short.
+N_NUDGES_OFF = 6
 N_MAIL = 4
 N_HITS = 8
 #: The tool-bus ticker and the sparkline behind it.
 N_TICKER = 24
+#: How many pictures the viewport keeps. A turn that reads six bug-report
+#: notes can produce two dozen screenshots, and a filmstrip nobody can reach
+#: the end of is a filmstrip nobody looks at. Newest wins; the note path is on
+#: every frame, so what falls off is one click away in Obsidian.
+N_FRAMES = 12
+#: How many notes one turn may be scouted for pictures at all. The cap is on
+#: the *turn*, not the call: `vault_search` alone can name twelve notes.
+N_SCOUT = 10
+#: Of those, how many may come from a *result set* rather than from a call's
+#: own argument — see `_Scout` for why the two are not the same signal.
+N_LOOSE = 3
+#: How many place maps one turn may fetch. Each one is a Neshan request
+#: against a quota, so this is a cost cap as much as a design one: no
+#: question is about four places at once.
+N_MAPS = 3
+#: How often the scout looks at the render spool. Fast enough that a chart
+#: appears while V is still writing the sentence announcing it.
+SPOOL_POLL = 0.5
 
 #: Gmail is the one panel that is not free — it is a network round trip to
 #: Google. So it is cached, and the HUD redraws from the cache rather than
@@ -112,6 +161,11 @@ MAIL_TTL = 300.0
 #: The drift walk is one `stat` per note. Cheap, but not free at 3,400 notes
 #: times a two-second poll.
 DRIFT_TTL = 30.0
+#: Whether today is a holiday is a fact that changes once a day, so this is
+#: long. Only the *flag* is behind it — the Jalali date beside the clock is
+#: arithmetic and is recomputed every poll, which is why the date never
+#: blanks when the calendar service is unreachable.
+JALALI_TTL = 3600.0 * 6
 
 #: Which arc of the aperture a tool call lights. The design draws four —
 #: VLT · CAL · MSG · MEM — and these are the real MCP tool names behind them.
@@ -174,6 +228,43 @@ class Call:
 
 
 @dataclass
+class Frame:
+    """One picture the viewport can show, and where it came from.
+
+    A frame is a *view*, not a delivery: the same PNG can be on this screen,
+    on the phone and in a Telegram chat at once, and showing it twice costs
+    nothing. That is the whole reason `media.Spool` exists beside the outbox
+    in `files.py` rather than reusing it — see that module's docstring.
+
+    `id` is a hash of the path rather than the path itself. Not obscurity:
+    `/api/media?id=…` then has no string a caller controls anywhere near a
+    filesystem, so path traversal is not defended against, it is unexpressible.
+    The registry that maps it back is `Session.media`.
+    """
+
+    id: str
+    kind: str                  # image · page
+    title: str
+    caption: str = ""
+    source: str = "note"       # note · render · place
+    rel: str = ""
+    bytes: int = 0
+    at: float = field(default_factory=time.time)
+
+    def json(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "title": self.title,
+                "caption": self.caption, "source": self.source,
+                "rel": self.rel, "bytes": self.bytes,
+                "time": dt.datetime.fromtimestamp(self.at).strftime("%H:%M:%S")}
+
+
+def frame_id(path) -> str:
+    """A stable, short handle for a file on disk. Stable matters: the same
+    screenshot cited by two notes in one turn is one frame, not two."""
+    return hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
 class Turn:
     """One exchange, kept as content rather than as markup — same reason
     `tui.Entry` is: the browser re-renders on every state change, and a turn
@@ -226,6 +317,15 @@ class Session:
         self.last_ms = 0.0
         self.last_model = ""
         self.step = ""
+        # The viewport. `frames` is newest-first like `calls`; `media` is the
+        # id→path registry behind `/api/media` and outlives the frame list on
+        # purpose — a browser still fetching a picture that has just been
+        # pushed off the filmstrip should get it, not a 404.
+        self.frames: list[Frame] = []
+        self.media: dict[str, Path] = {}
+        #: Set by `Hud` to `_Scout.saw`. None in every test that builds a
+        #: bare Session, which is why `_progress` checks rather than assumes.
+        self.watch = None
         self._subs: list[queue.Queue] = []
         self._seq = 0
 
@@ -291,6 +391,13 @@ class Session:
                 self.calls.insert(0, call)
                 del self.calls[N_TICKER:]
                 self.step = call.label
+            self._look(ev)
+        elif ev.kind == "tool_result":
+            # The other half of the same picture. `rel` says what a call was
+            # *about* as it goes out; `rels` says what it came back holding,
+            # which for `vault_search` is eight notes at once and is where
+            # most of the screenshots come from.
+            self._look(ev)
         elif ev.kind == "text":
             self._settle("OK")
             with self.lock:
@@ -308,6 +415,76 @@ class Session:
                 call.status = status
             self.inflight.clear()
 
+    def _look(self, ev) -> None:
+        """Hand the notes a call named to whoever is finding pictures.
+
+        The two fields go over separately and stay separate the whole way,
+        because they are not the same claim and `shells.py` says so: `rel` is
+        the note a call names in its own argument — "it is reading *this*" —
+        while `rels` is everything scraped out of what came back, "a
+        constellation". `_Scout` spends them differently.
+
+        Handed off rather than resolved here for the reason this whole class
+        exists: `_progress` runs on the thread running the turn, and a note
+        read — never mind a static-map fetch — on that thread is latency
+        added to the answer in order to decorate it.
+        """
+        if self.watch is None:
+            return
+        chosen = [r for r in [getattr(ev, "rel", "")] if r]
+        listed = [r for r in (getattr(ev, "rels", []) or []) if r]
+        if chosen or listed:
+            self.watch(chosen, listed)
+
+    # ---- the viewport --------------------------------------------------
+    def show(self, items) -> None:
+        """Put pictures on screen. Newest batch first, in the order the note
+        embeds them, deduplicated by file.
+
+        Both halves of that ordering are deliberate. *Newest batch first*
+        because the picture V has just found is the one being talked about.
+        *Document order within the batch* because a bug-report note's four
+        screenshots are a sequence — inserting each one at the front turned
+        them back to front, so the panel opened on the last screenshot of the
+        note and the filmstrip read right to left.
+
+        Deduplicated because the same screenshot really does arrive twice in
+        one turn — `vault_search` names the note, then `vault_read` reads it —
+        and a filmstrip with the same frame in it twice reads as a bug in the
+        surface rather than as two mentions of one picture.
+        """
+        # Built before the lock is taken: `Item.bytes` is a `stat()`, and the
+        # SSE loop is waiting on this lock to draw the aperture.
+        made = [(frame_id(i.path), i, i.bytes) for i in items]
+        new = []
+        with self.lock:
+            have = {f.id for f in self.frames}
+            for fid, item, size in made:
+                if fid in have:
+                    continue
+                have.add(fid)
+                new.append(Frame(id=fid, kind=item.kind, title=item.title,
+                                 caption=item.caption, source=item.source,
+                                 rel=item.rel, bytes=size, at=item.at))
+                self.media[fid] = Path(item.path)
+            self.frames[:0] = new
+            del self.frames[N_FRAMES:]
+            # The registry outlives the strip, but not forever.
+            if len(self.media) > 200:
+                for key in list(self.media)[:-200]:
+                    del self.media[key]
+        if new:
+            self.publish()
+
+    def clear_frames(self) -> None:
+        with self.lock:
+            self.frames.clear()
+        self.publish()
+
+    def media_path(self, fid: str) -> Path | None:
+        with self.lock:
+            return self.media.get(fid)
+
     # ---- turns --------------------------------------------------------
     def begin(self, text: str) -> None:
         with self.lock:
@@ -315,6 +492,11 @@ class Session:
             self.busy = True
             self.fault = ""
             self.step = "routing"
+        # The frames stay — a follow-up question is usually *about* what is
+        # on screen — but the scout forgets which notes it has already been
+        # through, so asking again about the same note shows it again.
+        if self.watch is not None:
+            self.watch(None, None)
         self.publish()
 
     def landed(self, turn: Turn, *, wrote: str = "",
@@ -342,29 +524,50 @@ class Session:
         self.publish()
 
     def reset(self) -> None:
-        """`/new`. The *conversation* ends, not the surface.
+        """`/new`. Every counter on this object is scoped to one conversation,
+        so all of them go.
 
-        So the transcript, the route and the writes attributed to "this
-        session" all go — they belong to the recap V just filed — and the
-        money does not. `spent` and the turn counts are what the budget gauge
-        draws, and a gauge that zeroes whenever you change subject is a gauge
-        that tells you the day was free. The uptime and session id in the
-        footer are the HUD's own, and the HUD did not restart.
+        This used to keep `spent` and the turn counts across a reset, on the
+        argument that a budget gauge which zeroes whenever you change subject
+        tells you the day was free. The argument was right and the fix was in
+        the wrong place: the money was being read off a *session* counter and
+        drawn against a *daily* cap, which is a number that was never the
+        day's — it also zeroed on every restart, and counted only turns taken
+        at this surface while Telegram spent from the same wallet unrecorded.
+        `spend_today()` answers that question properly now, off the run log
+        every surface already writes, so this object no longer has to
+        half-answer it. What is left here is the session, and after `/new`
+        there is a new one — new id, uptime from zero, nothing carried.
         """
         with self.lock:
             self.turns.clear()
             self.calls.clear()
             self.inflight.clear()
             self.writes.clear()
+            self.frames.clear()
             self.fault = ""
             self.step = ""
+            self.spent = 0.0
+            self.n_turns = 0
+            self.n_local = 0
+            self.last_ms = 0.0
+            self.last_model = ""
+            self.spoke_at = 0.0
+            # The footer's `s-xxxx · 12m`. It reads as the conversation's age
+            # — that is what a person sitting in front of it takes it for —
+            # so after `/new` it has to be the new conversation's age, not the
+            # tab's.
+            self.started = time.time()
         self.publish()
 
     def clear_log(self) -> None:
         """`/clear` — the screen, and nothing else. The conversation V is
-        holding is untouched; this is the terminal's `\x1b[2J`, not `/new`."""
+        holding is untouched; this is the terminal's `\x1b[2J`, not `/new`.
+
+        The viewport is part of the screen, so it goes too."""
         with self.lock:
             self.turns.clear()
+            self.frames.clear()
         self.publish()
 
     def failed(self, why: str) -> None:
@@ -384,6 +587,7 @@ class Session:
             calls = [c.json() for c in self.calls]
             route = [c.json() for c in self.calls[:6]][::-1]
             turns = [t.json() for t in self.turns]
+            frames = [f.json() for f in self.frames]
             writes = [{"path": p, "confidence": c, "status": s}
                       for p, c, s, _ in self.writes]
             session = {
@@ -397,8 +601,8 @@ class Session:
         return {"state": {"name": name, "detail": detail,
                           "tools": self.tools_lit()},
                 "route": route, "ticker": calls, "turns": turns,
-                "pending": writes, "session": session, "busy": session and
-                self.busy}
+                "pending": writes, "frames": frames, "session": session,
+                "busy": session and self.busy}
 
     # ---- SSE ----------------------------------------------------------
     def subscribe(self) -> queue.Queue:
@@ -481,26 +685,288 @@ def _events(engine, day: dt.date, now: dt.datetime) -> list[dict]:
     return out[:N_AGENDA]
 
 
-def _tasks(engine, day: dt.date) -> list[dict]:
-    out = []
-    for t in engine.q.tasks.priorities(today=day, limit=N_TASKS):
-        overdue = t.is_overdue(day)
-        out.append({
-            "id": t.id,
-            "title": _plain(t.text, 90),
-            # The design ranks P0/P1/P2. V ranks by overdue-then-due, which is
-            # the same idea with the reason still attached, so the label is
-            # derived from that rather than from a priority field the vault
-            # does not have.
-            "rank": "P0" if overdue else ("P1" if t.due else "P2"),
-            "why": ("overdue" if overdue else
-                    f"due {t.due.isoformat()}" if t.due else "no date"),
-            "where": t.section or _stem(t.rel).rsplit("/", 1)[-1],
-            "done": t.state == "done",
-            "doing": t.state == "doing",
-            "rel": t.rel,
+def _lanes(blocks: list[dict]) -> None:
+    """Lay overlapping blocks out, in place. Two rules, and the split matters.
+
+    **Contained blocks nest.** A 30-minute standup inside an eight-hour work
+    block is not two things competing for the column — it is one thing that
+    happens *during* another. Splitting the column for it wastes half the day's
+    width on a stripe of empty work block, which is what "beside" looked like
+    in practice. So a block wholly inside a longer one gets a `depth`: it is
+    drawn on top, inset from the left, and — because it is on top — it is what
+    the pointer hits. Clicking the small thing you aimed at is the whole point.
+
+    **Genuine partial overlaps split.** 13:00–14:00 against 13:30–15:00 is two
+    things neither of which contains the other, and there is no honest way to
+    draw that except side by side. Those get lanes, assigned only among peers
+    at the same depth so a nested block never widens its parent's cluster.
+    """
+    for blk in blocks:
+        span = blk["e"] - blk["s"]
+        blk["depth"] = sum(
+            1 for other in blocks
+            if other is not blk
+            and other["s"] <= blk["s"] and blk["e"] <= other["e"]
+            and (other["e"] - other["s"]) > span)
+
+    def assign(cluster: list[dict]) -> None:
+        ends: list[int] = []
+        for blk in cluster:
+            for i, end in enumerate(ends):
+                if blk["s"] >= end:
+                    blk["lane"], ends[i] = i, blk["e"]
+                    break
+            else:
+                blk["lane"] = len(ends)
+                ends.append(blk["e"])
+        for blk in cluster:
+            blk["lanes"] = len(ends)
+
+    by_depth: dict[int, list[dict]] = {}
+    for blk in blocks:
+        by_depth.setdefault(blk["depth"], []).append(blk)
+    for peers in by_depth.values():
+        peers.sort(key=lambda b: (b["s"], -(b["e"] - b["s"])))
+        cluster: list[dict] = []
+        reach = 0
+        for blk in peers:
+            if cluster and blk["s"] >= reach:
+                assign(cluster)
+                cluster, reach = [], 0
+            cluster.append(blk)
+            reach = max(reach, blk["e"])
+        if cluster:
+            assign(cluster)
+
+
+def _week(engine, day: dt.date, now: dt.datetime) -> dict:
+    """The week as a grid: seven columns of blocks over a full 24-hour canvas.
+
+    Three things here exist only because a screen needs them and the CLI does
+    not: minute offsets, so the page lays a block out by arithmetic instead of
+    parsing times in a zone it disagrees with V about; lanes, so two things at
+    the same hour sit beside each other instead of on top of each other; and
+    `line`, the block's own text, which is both its identity and exactly what
+    `vault.edit` needs back to change it.
+
+    What is deliberately *not* here any more is free time. It was a chip under
+    every day header reading "11h free", and a calendar that tallies the hours
+    you have not committed is nagging rather than reporting. Free time is an
+    answer to a question — `v week --free`, `vault_free_time` — and it stays
+    there.
+
+    Free by construction, like every other panel: two Markdown files read and
+    some arithmetic. Nothing reaches a model.
+    """
+    wp = engine.q.weekplan
+    start = weekplan.week_start_of(day)
+    today = now.date()
+    minute_now = now.hour * 60 + now.minute
+
+    days, earliest, latest = [], None, None
+    claimed = 0
+    load: dict[str, int] = {}
+    for i in range(7):
+        d = start + dt.timedelta(days=i)
+        is_today = d == today
+        blocks = []
+        for b in wp.busy(d):
+            if not b.end:
+                continue
+            s = b.start.hour * 60 + b.start.minute
+            e = b.end.hour * 60 + b.end.minute
+            earliest = s if earliest is None else min(earliest, s)
+            latest = e if latest is None else max(latest, e)
+            claimed += b.minutes
+            load[b.kind] = load.get(b.kind, 0) + b.minutes
+            blocks.append({
+                # The written line, which is the block's identity: the HUD
+                # hands it straight back to delete or move the thing, and
+                # `vault.edit` refuses it if the week has changed underneath.
+                "line": b.line(),
+                "kind": b.kind,
+                "title": _plain(b.label or b.kind, 80),
+                "label": _plain(b.label, 80),
+                "where": _plain(b.location, 40),
+                "time": b.time_label,
+                "from": b.start.strftime("%H:%M"),
+                "to": b.end.strftime("%H:%M"),
+                "s": s, "e": e, "mins": b.minutes,
+                "lane": 0, "lanes": 1, "depth": 0,
+                "now": is_today and s <= minute_now < e,
+                "past": d < today or (is_today and e <= minute_now),
+            })
+        _lanes(blocks)
+        days.append({
+            "date": d.isoformat(),
+            "label": d.strftime("%a %-d").upper(),
+            "weekday": d.strftime("%A"),
+            "today": is_today,
+            "blocks": blocks,
         })
-    return out
+
+    rel = wp.week_rel(start)
+    current = wp.now_block(now)
+    nxt = None
+    for d in days:
+        for blk in d["blocks"]:
+            if d["date"] > today.isoformat() or (
+                    d["date"] == today.isoformat() and blk["s"] > minute_now):
+                nxt = {"date": d["date"], "day": d["label"],
+                       "today": d["date"] == today.isoformat(),
+                       "at": blk["from"], "kind": blk["kind"],
+                       "title": blk["title"]}
+                break
+        if nxt:
+            break
+
+    return {
+        "start": start.isoformat(),
+        "label": weekplan.week_label(start),
+        "rel": rel,
+        "exists": (engine.s.vault / rel).exists(),
+        "blocks": sum(len(d["blocks"]) for d in days),
+        "days": days,
+        # The canvas is the whole day, every week, so the grid never changes
+        # height under you and 03:00 is somewhere you can scroll to rather
+        # than somewhere that does not exist.
+        "lo": 0, "hi": 24 * 60,
+        # …but it opens where the week actually starts, an hour of air above
+        # the earliest block, because nobody wants to land on midnight.
+        "focus": max(0, (earliest if earliest is not None else 8 * 60) - 60),
+        "span": [earliest if earliest is not None else 8 * 60,
+                 latest if latest is not None else 18 * 60],
+        "claimed": claimed,
+        "load": [{"kind": k, "mins": m,
+                  "share": (m / claimed) if claimed else 0.0}
+                 for k, m in sorted(load.items(), key=lambda kv: -kv[1])],
+        "kinds": list(weekplan.KINDS),
+        "now_min": minute_now if start <= today <= start + dt.timedelta(6) else None,
+        "now": ({"kind": current.kind,
+                 "title": _plain(current.label or current.kind, 60),
+                 "time": current.time_label,
+                 "until": current.end.strftime("%H:%M") if current.end else ""}
+                if current else None),
+        "next": nxt,
+    }
+
+
+def _tasks(engine, day: dt.date) -> list[dict]:
+    """The card: the six most urgent, same rows the view draws."""
+    return [_task_row(t, day)
+            for t in engine.q.tasks.priorities(today=day, limit=N_TASKS)]
+
+
+#: Everything that can be done to a checkbox from this surface, and what each
+#: one does. Three of them are the answers the view is *for* — done, dropped,
+#: ignored — and the rest are their undos. Kept here as one table because the
+#: page draws its buttons from the same vocabulary, and a verb invented on
+#: either side alone is a button that 400s; `test_hud` asserts they agree.
+TASK_ACTIONS = {
+    "done":      "ticks the box in the note",
+    "dropped":   "strikes it out in the note — the decision survives",
+    "ignored":   "leaves the note alone; V stops bringing it up",
+    "unignored": "brings it back into every list",
+    "open":      "unticks it in the note",
+    "doing":     "marks it started in the note",
+}
+
+
+#: What the view's filter row can ask for. `stale` is the one that is new
+#: information rather than a re-cut of the same list — see `_task_view`.
+TASK_VIEWS = ("open", "overdue", "stale", "ignored", "done")
+
+
+def _task_row(t, day: dt.date) -> dict:
+    """One task, as the view draws it. Same shape the card uses plus the
+    fields the row's own actions need — the key, so ignoring survives the
+    line moving, and the age, which is the whole reason this view exists."""
+    overdue = t.is_overdue(day)
+    age = t.age_days(day)
+    return {
+        "id": t.id,
+        "key": t.norm_key,
+        "title": _plain(t.text, 160),
+        # The design ranks P0/P1/P2. V ranks by overdue-then-due, which is the
+        # same idea with the reason still attached, so the label is derived
+        # from that rather than from a priority field the vault does not have.
+        "rank": "P0" if overdue else ("P1" if t.due else "P2"),
+        "why": ("overdue" if overdue else
+                f"due {t.due.isoformat()}" if t.due else "no date"),
+        "where": t.section or _stem(t.rel).rsplit("/", 1)[-1],
+        "area": t.area or "",
+        "rel": t.rel,
+        "state": t.state,
+        "done": t.state == "done",
+        "doing": t.state == "doing",
+        # Always false here: a row built from a task is a task the filter let
+        # through. The ignored view builds its rows from the silence list
+        # instead, because an entry outlives the checkbox it was about.
+        "ignored": False,
+        "age": age if age and age > 0 else 0,
+        "carried": t.carried,
+        "rotting": t.is_rotting,
+    }
+
+
+def _task_view(engine, day: dt.date, view: str) -> dict:
+    """The TASK view's own read — a list long enough to prune, which is the
+    one thing the six-row card cannot be.
+
+    Not folded into `snapshot()`: the card is on screen always and this is on
+    screen sometimes, and putting 120 rows on a four-second poll to render six
+    of them is how a free surface stops being one. The page fetches this when
+    the view is open and after every action, the same way `/api/search` works.
+    """
+    from . import tasks as tasks_mod
+    store = engine.q.tasks
+    shape = store.backlog_shape(day)
+    silenced = store.ignored()
+
+    if view == "ignored":
+        # Served from the silence list itself, not from a filtered task query:
+        # an entry whose note has since been deleted is still an entry, and it
+        # is the one most worth being able to see and clear.
+        rows = [{"id": 0, "key": i.norm, "title": _plain(i.text, 160),
+                 "rank": "OFF", "why": (f"ignored {i.age_days()}d ago"
+                                        if i.at else "ignored"),
+                 "where": _stem(i.rel).rsplit("/", 1)[-1] if i.rel else "—",
+                 "area": "", "rel": i.rel, "state": "open", "done": False,
+                 "doing": False, "ignored": True, "age": i.age_days(),
+                 "carried": i.live, "rotting": False,
+                 "reason": i.reason} for i in silenced]
+    elif view == "done":
+        # A fortnight. Long enough to answer "did I already do that?", short
+        # enough that the list is not the vault's entire history of ticks.
+        since = day - dt.timedelta(days=14)
+        done = [t for t in store.done()
+                if (t.done_on or t.note_date or dt.date.min) >= since]
+        done.sort(key=lambda t: (t.done_on or t.note_date or dt.date.min),
+                  reverse=True)
+        rows = [_task_row(t, day) for t in done[:N_TASK_VIEW]]
+    else:
+        # `collapse` for the same reason `priorities` uses it: a task carried
+        # forward into five daily notes is one task, and listing it five times
+        # is what makes a backlog look unprunable.
+        pool = tasks_mod.collapse(store.open())
+        if view == "stale":
+            # The point of the whole feature, as its own filter: open, undated
+            # and older than two months. `backlog_shape` has always counted
+            # these as `rotting` and nothing could ever act on them.
+            pool = [t for t in pool if t.is_rotting]
+        elif view == "overdue":
+            pool = [t for t in pool if t.is_overdue(day)]
+        pool.sort(key=lambda t: (-t.urgency(day), t.effective_date or dt.date.max))
+        rows = [_task_row(t, day) for t in pool[:N_TASK_VIEW]]
+
+    return {
+        "view": view,
+        "rows": rows,
+        "total": len(rows),
+        "counts": {"open": shape["open"], "overdue": shape["overdue"],
+                   "stale": shape["rotting"], "ignored": len(silenced),
+                   "carried": shape["carried"], "live": shape["live"]},
+    }
 
 
 def _deadlines(engine, day: dt.date) -> list[dict]:
@@ -548,16 +1014,75 @@ def _memories(engine) -> list[dict]:
     return out
 
 
+def spend_today(s: Settings, day: dt.date | None = None) -> dict:
+    """What the day has actually cost, across every surface.
+
+    Read from `hermes.jsonl`, which every process that runs a paid shell
+    appends to — the HUD, the REPL, the Telegram service, the phone — so the
+    number survives `/new`, survives a restart, and has a $0.40 conversation
+    held over Telegram at lunch still on it at six.
+
+    `list_cost_usd` and not `Response.cost`, which is the mistake this was
+    written to avoid: on a subscription `cost` is 0.0 *by design* (see
+    `engine.py`'s cost model — the allowance consumed travels in
+    `data["list_cost_usd"]` instead), so a gauge summing it would sit at
+    $0.00 through a day that used half the plan. On an API key the two are the
+    same figure, so this is right in both billing modes.
+
+    Filtered by calendar day rather than `hermes.usage(1)`'s rolling 24 hours,
+    because the cap it is drawn against is a *daily* one and a bar that still
+    carries yesterday evening at nine this morning is not measuring the thing
+    on the label.
+
+    A missing file is a day with no paid runs in it, which is $0.00 and not an
+    error. A malformed line is skipped rather than raising: this is a gauge,
+    and half a day's spend on screen beats a panel that went blank because
+    something truncated a write.
+    """
+    day = day or dt.date.today()
+    stamp = day.isoformat()
+    used, runs = 0.0, 0
+    try:
+        with (s.log_dir / "hermes.jsonl").open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                    if not str(row.get("at", "")).startswith(stamp):
+                        continue
+                    used += float(row.get("list_cost_usd") or 0.0)
+                    runs += 1
+                except (ValueError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    return {"used": round(used, 6), "turns": runs}
+
+
 def _nudges(engine, day: dt.date) -> list[dict]:
     try:
         found = engine.nudges.all(today=day)
     except Exception:
         return []
     found.sort(key=lambda n: -n.urgency)
-    return [{"kind": n.kind.replace("_", " ").upper(),
+    return [{"key": n.key,
+             "kind": n.kind.replace("_", " ").upper(),
              "text": _plain(n.text, 140), "detail": _plain(n.detail, 120),
              "urgency": n.urgency}
             for n in found[:N_NUDGES]]
+
+
+def _nudges_off(engine) -> list[dict]:
+    """What the user has silenced. On the snapshot rather than behind its own
+    fetch because it is four rows on a good day and the panel has to be able
+    to say "and 3 hidden" without a second round trip — a silence list you
+    have to go looking for is one you forget you made."""
+    try:
+        off = engine.nudges.silenced()
+    except Exception:
+        return []
+    return [{"key": s.key, "text": _plain(s.text, 120),
+             "at": s.at[:10], "reason": _plain(s.reason, 80)}
+            for s in off[:N_NUDGES_OFF]]
 
 
 def _mail(engine, cache: dict) -> dict:
@@ -595,6 +1120,41 @@ def _mail(engine, cache: dict) -> dict:
     return out
 
 
+def _jalali(day: dt.date, cache: dict) -> dict:
+    """The date beside the clock, in the calendar Parsa's year is counted in.
+
+    Split the way `jalali.py` is split, and for the visible reason: the date
+    itself is arithmetic, so it is computed here on every snapshot and is
+    always right. Only `holiday` needs the network, so only `holiday` is
+    behind the cache — and when the lookup fails it stays `None`, which the
+    client draws as a quiet "?" rather than as a working day. A dashboard
+    that says "not a holiday" because a request timed out is worse than one
+    that admits it doesn't know.
+    """
+    now = time.time()
+    date = jalali_mod.convert(day)
+    out = {"iso": date.iso, "short": date.short, "label": date.label,
+           "month_key": date.month_key, "weekday": date.weekday,
+           "gregorian": day.isoformat(), "friday": date.is_friday,
+           "holiday": None, "events": [], "off": date.off}
+    cached = cache.get("val")
+    if cached and cache.get("day") == day.isoformat() and \
+            cache.get("at", 0) + JALALI_TTL > now:
+        out.update(cached)
+        return out
+    try:
+        full = jalali_mod.lookup(day, timeout=6.0)
+        found = {"holiday": full.holiday, "events": list(full.events),
+                 "off": full.off}
+    except jalali_mod.CalendarError:
+        # Nothing to report and nothing to log at: the date is still on
+        # screen, and the flag comes back on its own when the network does.
+        return out
+    cache["at"], cache["day"], cache["val"] = now, day.isoformat(), found
+    out.update(found)
+    return out
+
+
 def _drift(engine, cache: dict) -> list[str]:
     now = time.time()
     if cache.get("at", 0) + DRIFT_TTL > now:
@@ -627,6 +1187,13 @@ def snapshot(engine, session: Session, caches: dict,
     mem_stats = engine.memory.stats()
     deadlines = _deadlines(engine, day)
     live = session.live()
+    # `index.stats()["tasks_open"]` counts every unticked box in the vault —
+    # rituals, MR review checklists, lesson rules, the lot — which is 800-odd
+    # here and was what the TASKS card put on screen as "OPEN". That number is
+    # the complaint, not the answer to it: this one is commitments only,
+    # collapsed across the notes they were carried through, and minus what has
+    # been silenced.
+    backlog = engine.q.tasks.backlog_shape(day)
 
     # The design's `alarmMode` is a prop you flip. Here it is a fact: the edge
     # pulses when something is actually due inside a day, and goes quiet by
@@ -643,6 +1210,7 @@ def snapshot(engine, session: Session, caches: dict,
                        if deadlines else "")}
 
     cap = float(getattr(engine.s, "daily_budget_usd", 2.0)) or 2.0
+    today_spend = spend_today(engine.s, day)
     return {
         "at": now.isoformat(timespec="seconds"),
         "day": day.isoformat(),
@@ -658,7 +1226,13 @@ def snapshot(engine, session: Session, caches: dict,
             "memories": mem_stats.get("active", 0),
         },
         "gauges": {
-            "budget": {"used": live["session"]["spent"], "cap": cap},
+            # Two numbers, because they answer two questions and one of them
+            # used to be quietly answering both. `used` is the day's, across
+            # every surface, and is what the bar fills against the cap;
+            # `session` is what this conversation has cost since `/new`.
+            "budget": {"used": today_spend["used"], "cap": cap,
+                       "turns": today_spend["turns"],
+                       "session": live["session"]["spent"]},
             "latency": {"ms": live["session"]["latency_ms"]},
             "context": {"turns": live["session"]["turns"],
                         "local": live["session"]["local"]},
@@ -672,11 +1246,18 @@ def snapshot(engine, session: Session, caches: dict,
             "indexed": int(index.last_indexed(engine.conn)),
             "network": "local-first" if not online else "escalation on",
         },
+        "jalali": _jalali(day, caches.setdefault("jalali", {})),
         "day_events": _events(engine, day, now),
+        "week": _week(engine, day, now),
         "tasks": _tasks(engine, day),
+        "task_counts": {"open": backlog["open"], "overdue": backlog["overdue"],
+                        "stale": backlog["rotting"],
+                        "ignored": backlog["ignored"],
+                        "carried": backlog["carried"], "live": backlog["live"]},
         "deadlines": deadlines,
         "mems": _memories(engine),
         "nudges": _nudges(engine, day),
+        "nudges_off": _nudges_off(engine),
         "mail": _mail(engine, caches.setdefault("mail", {})),
     }
 
@@ -772,12 +1353,136 @@ class _Bridge:
         self._in.put((None, {}, threading.Event()))
 
 
+class _Scout:
+    """The thread that finds pictures, off the thread that answers.
+
+    Two feeds, one worker, because they are the same job seen from two sides.
+
+    *Pushed*: `Session._look` hands over the note paths `shells.ShellEvent`
+    has carried since the stream parser was written and which no surface has
+    ever drawn. Those become the screenshots pasted into them, and a place
+    note becomes a map of where it is. This is the half that runs *in
+    parallel with the answer*: the paths arrive while the model is still
+    writing, so the picture is on screen before the sentence about it is.
+
+    **The two feeds of note paths are not the same signal, and the first
+    version of this spent them as if they were.** `rel` is what a call named
+    in its own argument — `vault_read(rel=X)` means the model chose X.
+    `rels` is every `NN - ….md` scraped out of what came back, which for a
+    `Glob` over a folder is a *directory listing*. On 2026-09-08 a question
+    about three places globbed `09 - …/05 - Locations/`, and this class read
+    the twelve alphabetically-first cafés in the vault as twelve notes the
+    answer was about: nine maps of places nobody had mentioned, and nine
+    Neshan requests to draw them.
+
+    So a listed path buys less than a chosen one. A chosen note — or one the
+    answer *cited*, which is V's own statement of what it used — can become a
+    map. A listed one gets images only: those are a local file read, they
+    cost nothing, and a search that happens to surface a bug report with a
+    screenshot in it is exactly the ambient case this was built for. Three of
+    them per turn, because past that a result set has stopped being an answer
+    and gone back to being a list.
+
+    *Polled*: `media.Spool`, which is how a chart rendered inside an MCP
+    subprocess — a different process, with no handle on this one — reaches
+    the viewport.
+
+    Deliberately a thread and not the engine thread. A `place_map` is a
+    network round trip to Neshan; on `_progress`'s thread that would be
+    latency added to the answer in order to decorate it. Nothing here can
+    fail loudly either: a picture that could not be found is a frame that
+    does not appear, never a fault in the header for something nobody asked
+    for out loud.
+    """
+
+    def __init__(self, s: Settings, session: Session):
+        self.s = s
+        self.session = session
+        self.q: queue.Queue = queue.Queue(maxsize=64)
+        self.spool = media_mod.Spool(s)
+        self.cache: dict = {}          # the attachment index, TTL'd inside
+        self.seen: set[str] = set()    # notes already scouted this turn
+        self.loose = 0                 # of those, how many came from a list
+        self.maps = 0                  # and how many Neshan calls it cost
+        self.stop_flag = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True,
+                                       name="hud-scout")
+        self.thread.start()
+
+    def saw(self, chosen, listed) -> None:
+        """Called from the turn's thread. Never blocks it: a full queue means
+        the scout is behind, and a dropped picture is not worth a millisecond
+        of the answer. `(None, None)` is the new-turn sentinel."""
+        try:
+            self.q.put_nowait((chosen, listed))
+        except queue.Full:
+            pass
+
+    def _run(self) -> None:
+        while not self.stop_flag.is_set():
+            chosen: list = []
+            listed: list = []
+            try:
+                chosen, listed = self.q.get(timeout=SPOOL_POLL)
+            except queue.Empty:
+                pass
+            else:
+                if chosen is None:     # a new turn: forget the last one's notes
+                    self.seen.clear()
+                    self.loose = self.maps = 0
+                    chosen, listed = [], []
+            try:
+                found = self._pictures(chosen or [], listed or [])
+                if found:
+                    self.session.show(found)
+                items = self.spool.take()
+                if items:
+                    self.session.show(items)
+            except Exception:          # noqa: BLE001 — see the class docstring
+                pass
+
+    def _pictures(self, chosen, listed) -> list:
+        """`chosen` may become a map; `listed` may only ever become images.
+
+        The asymmetry is the whole point — see the class docstring for the
+        Monday it was written on.
+        """
+        out = []
+        for rel in chosen:
+            out.extend(self._one(rel, may_map=True))
+        for rel in listed:
+            if self.loose >= N_LOOSE:
+                break
+            if rel in self.seen:
+                continue
+            self.loose += 1
+            out.extend(self._one(rel, may_map=False))
+        return out
+
+    def _one(self, rel: str, *, may_map: bool) -> list:
+        if rel in self.seen or len(self.seen) >= N_SCOUT:
+            return []
+        self.seen.add(rel)
+        if media_mod.is_place(self.s, rel):
+            if not may_map or self.maps >= N_MAPS:
+                return []
+            self.maps += 1
+            found = media_mod.place_map(self.s, rel)
+            return [found] if found is not None else []
+        return media_mod.images_in_note(self.s, rel, cache=self.cache)
+
+    def stop(self) -> None:
+        self.stop_flag.set()
+
+
 class Hud:
     """The application. Owns the engine thread, the session and the caches."""
 
     def __init__(self, s: Settings | None = None):
         self.s = s or default_settings
         self.session = Session()
+        self.scout = _Scout(self.s, self.session)
+        self.session.watch = self.scout.saw
         self.bridge = _Bridge(self.s, self.session)
         self.caches: dict = {}
         self._snap: dict | None = None
@@ -838,6 +1543,14 @@ class Hud:
                              for r in res.rows]}
         return self.bridge.call(work)
 
+    def tasks(self, view: str = "open") -> dict:
+        """The TASK surface. Free — SQL over the mirror, like every other read
+        on this page."""
+        if view not in TASK_VIEWS:
+            raise HudError(400, f"unknown view {view!r}")
+        return self.bridge.call(
+            lambda e: _task_view(e, dt.date.today(), view))
+
     # ---- writes -------------------------------------------------------
     def chat(self, text: str) -> dict:
         """One turn. The session is updated on the way in and on the way out
@@ -873,6 +1586,17 @@ class Hud:
         self.session.landed(turn, wrote=str(data.get("target") or "")
                             if data.get("commit") else "",
                             confidence=data.get("confidence"))
+        # The citations, as well as the tool stream. A structured answer —
+        # "where is Kaboom?", answered from SQL — runs no shell and so emits
+        # no `ShellEvent` at all, and the citation is the only trace it leaves
+        # of which note it read. Without this the viewport would be blind to
+        # exactly the cheap, instant questions it is best at illustrating.
+        if self.session.watch is not None:
+            cites = [media_mod.rel_from_citation(c) for c in turn.cites]
+            # Chosen, not listed: a citation is V's own statement of what it
+            # used, which is the strongest signal on the page that a note is
+            # what the answer was actually about.
+            self.session.watch([c for c in cites if c], [])
         return {"turn": turn.json(), "live": self.session.live()}
 
     def _say(self, text: str, *, state: str = "speaking",
@@ -929,6 +1653,28 @@ class Hud:
             return self._land(self.bridge.call(lambda e: e.evening(),
                                                timeout=CHAT_TIMEOUT))
         if cmd == "nudges":
+            # The same three verbs the REPL and the `⊗` button have. Typed
+            # here mainly to restore something: silencing has a button on the
+            # panel, and the panel is right there.
+            verb, _, key = rest.partition(" ")
+            verb, key = verb.strip(), key.strip()
+            if verb == "off" and key:
+                with self._snap_lock:
+                    self._snap = None       # the panel just lost a row
+                return self._land(self.bridge.call(
+                    lambda e: e.nudge_silence(key), timeout=60))
+            if verb == "off":
+                return self._land(self.bridge.call(
+                    lambda e: e.nudges_silenced(), timeout=60))
+            if verb == "on" and key:
+                with self._snap_lock:
+                    self._snap = None       # …and just gained one back
+                return self._land(self.bridge.call(
+                    lambda e: e.nudge_restore(key), timeout=60))
+            if verb:
+                return self._say("`/nudges` · `/nudges off [key]` · "
+                                 "`/nudges on <key>`", state="refused",
+                                 route="—")
             return self._land(self.bridge.call(lambda e: e.nudge_digest(),
                                                timeout=120))
         if cmd in ("tasks", "mem"):
@@ -971,11 +1717,17 @@ class Hud:
         if cmd == "cost":
             live = self.session.live()["session"]
             cap = float(getattr(self.s, "daily_budget_usd", 2.0)) or 2.0
+            day = spend_today(self.s)
             return self._say(
-                f"**${live['spent']:.4f}** this session over {live['turns']} "
-                f"turn{'s' if live['turns'] != 1 else ''}, "
-                f"{live['local']} of them free. Cap is ${cap:.2f} a day.\n\n"
-                f"The gauges on the left are the same numbers, live.")
+                f"**${day['used']:.4f} today** of a ${cap:.2f} cap, over "
+                f"{day['turns']} turn{'s' if day['turns'] != 1 else ''} on "
+                f"every surface — this window, the terminal and Telegram all "
+                f"spend from it.\n\n"
+                f"**${live['spent']:.4f} this conversation** over "
+                f"{live['turns']} turn{'s' if live['turns'] != 1 else ''}, "
+                f"{live['local']} of them free. `/new` resets that half and "
+                f"leaves the day's alone.\n\n"
+                f"The gauge on the left is the same pair of numbers, live.")
 
         if f"/{cmd}" in known:
             # In the table, handled in the page. Reaching here means the
@@ -984,31 +1736,215 @@ class Hud:
         return self._say(f"Unknown command `/{cmd}` — press `/` for the list.",
                          state="refused", route="—")
 
-    def task(self, task_id: int, state: str) -> dict:
-        """The design's checkbox, wired to the real one.
+    def task(self, state: str, *, task_id: int = 0, key: str = "") -> dict:
+        """The design's checkbox, wired to the real one — and to the two other
+        things that can happen to a task.
 
-        Goes through `tasks.complete` — which rewrites the checkbox in the
-        note, commits it per-path as `[bot]` and is revertible with `v undo` —
-        rather than flipping a row in the index, because the Markdown is the
-        source of truth and an index the vault disagrees with is the bug this
-        whole package is built to avoid.
+        `done` · `dropped` · `open` · `doing` go through `tasks.complete`,
+        which rewrites the checkbox in the note, commits it per-path as
+        `[bot]` and is revertible with `v undo` — rather than flipping a row
+        in the index, because the Markdown is the source of truth and an index
+        the vault disagrees with is the bug this whole package is built to
+        avoid.
+
+        `ignored` · `unignored` write to `task_ignores` and touch **no note
+        at all**. That separation is the feature: a task can be got rid of
+        without editing a page the user wrote by hand, which is what made
+        pruning the backlog something he would actually do. The two paths are
+        deliberately not merged into one "state" column for the same reason —
+        one of them is a fact about the vault and the other is an instruction
+        to V, and conflating them is how "I don't want to hear about this"
+        turns into a silent edit of a daily note from July.
+
+        `key` addresses a task the way the silence list does — by its
+        normalised text — so un-ignoring works for an entry whose checkbox has
+        since moved, been rewritten, or had its note deleted. Every other verb
+        needs a line to write to, so it needs an id.
         """
         def work(engine):
             from . import tasks as tasks_mod
+            store = engine.q.tasks
+            if state not in TASK_ACTIONS:
+                raise HudError(400, f"unknown state {state!r}")
+
+            if state == "unignored":
+                target = key or (store.get(task_id).norm_key
+                                 if task_id and store.get(task_id) else "")
+                if not target:
+                    raise HudError(400, "unignore needs a key or a live task")
+                return {"ok": True, "unchanged": not store.unignore(target),
+                        "state": state}
+
+            if state == "ignored":
+                if key and not task_id:
+                    # An entry re-silenced from the ignored list — no live
+                    # checkbox behind it, so there is only the phrase.
+                    store.ignore(key, reason="hud")
+                    return {"ok": True, "unchanged": False, "state": state}
+                t = store.get(task_id)
+                if t is None:
+                    raise HudError(404, f"no task {task_id}")
+                if store.is_ignored(t):
+                    return {"ok": True, "unchanged": True, "state": state}
+                store.ignore(t, reason="hud")
+                return {"ok": True, "unchanged": False, "state": state,
+                        "key": t.norm_key}
+
             valid = {"done": tasks_mod.DONE, "open": tasks_mod.OPEN,
                      "doing": tasks_mod.DOING, "dropped": tasks_mod.DROPPED}
-            if state not in valid:
-                raise HudError(400, f"unknown state {state!r}")
-            t = engine.q.tasks.get(task_id)
+            t = store.get(task_id)
             if t is None:
                 raise HudError(404, f"no task {task_id}")
             if t.state == valid[state]:
-                return {"ok": True, "unchanged": True}
-            engine.q.tasks.complete(t, engine.vault, state=valid[state],
-                                    today=dt.date.today())
-            return {"ok": True, "unchanged": False}
+                return {"ok": True, "unchanged": True, "state": state}
+            store.complete(t, engine.vault, state=valid[state],
+                           today=dt.date.today())
+            return {"ok": True, "unchanged": False, "state": state}
         out = self.bridge.call(work, timeout=60)
         self.caches.pop("drift", None)     # the note just moved under the index
+        return out
+
+    def block(self, action: str, body: dict) -> dict:
+        """Add, move or drop one time block, from the WEEK view.
+
+        The same three verbs the CLI and the MCP tools have, reached from a
+        click instead of a sentence. Every one of them is a `[bot]` commit on
+        one note and reverts with `v undo`, exactly like a tick on a checkbox
+        from the TASKS view — this surface has never been read-only, and a
+        calendar you can only look at is a screenshot.
+
+        `line` is the block's own written text, which is how the browser names
+        it. That is deliberate: `vault.edit` refuses a line it cannot find
+        exactly once, so a stale tab trying to move a block somebody already
+        moved fails loudly instead of clobbering its neighbour.
+        """
+        def work(engine):
+            from . import weekplan as wp_mod
+            wp = engine.q.weekplan
+
+            def as_date(value, field):
+                got = notes_mod.as_date(value) if value else None
+                if got is None:
+                    raise HudError(400, f"{field} must be YYYY-MM-DD")
+                return got
+
+            def as_time(value, field):
+                got = wp_mod._parse_time(str(value or ""))
+                if got is None:
+                    raise HudError(400, f"{field} must be HH:MM")
+                return got
+
+            if action == "add":
+                day = as_date(body.get("date"), "date")
+                kind = str(body.get("kind") or "").lower()
+                if kind not in wp_mod.KINDS:
+                    raise HudError(400, "kind must be one of: "
+                                        + ", ".join(wp_mod.KINDS))
+                start = as_time(body.get("from"), "from")
+                end = as_time(body.get("to"), "to")
+                if wp_mod._minutes(end) <= wp_mod._minutes(start):
+                    raise HudError(400, "a block has to end after it starts")
+                label, where = wp_mod._split_location(
+                    str(body.get("label") or "").strip())
+                said = wp.add(wp_mod.Block(day, start, end, kind, label,
+                                           where or str(body.get("where") or "")))
+                wp.sync_daily_note(day)
+                return {"ok": True, "said": said}
+
+            line = str(body.get("line") or "")
+            if not line.strip():
+                raise HudError(400, "line is required — it names the block")
+            day = as_date(body.get("date"), "date")
+
+            if action == "drop":
+                try:
+                    said = wp.remove(day, line)
+                except ValueError as exc:
+                    raise HudError(409, str(exc))
+                wp.sync_daily_note(day)
+                return {"ok": True, "said": said}
+
+            if action == "move":
+                changes = {}
+                if body.get("to_date"):
+                    changes["date"] = as_date(body["to_date"], "to_date")
+                if body.get("from"):
+                    changes["start"] = as_time(body["from"], "from")
+                if body.get("to"):
+                    changes["end"] = as_time(body["to"], "to")
+                if body.get("kind"):
+                    changes["kind"] = str(body["kind"]).lower()
+                if body.get("label") is not None:
+                    # The form shows `label @where` as one field, so what it
+                    # sends back is the whole truth about both — including an
+                    # `@location` that has been deleted. Setting location only
+                    # when one was typed made it sticky and invisible: rename
+                    # "draft intro @home" to "reread Turpin" and the block
+                    # kept a location the form had never shown you.
+                    label, where = wp_mod._split_location(str(body["label"]).strip())
+                    changes["label"] = label
+                    changes["location"] = where
+                if not changes:
+                    raise HudError(400, "nothing to change")
+                try:
+                    said = wp.move(day, line, **changes)
+                except ValueError as exc:
+                    raise HudError(409, str(exc))
+                wp.sync_daily_note(day)
+                moved = changes.get("date")
+                if moved and moved != day:
+                    wp.sync_daily_note(moved)
+                return {"ok": True, "said": said}
+
+            raise HudError(400, "action must be add, move or drop")
+
+        out = self.bridge.call(work, timeout=60)
+        with self._snap_lock:
+            self._snap = None              # the week just changed under the panel
+        self.caches.pop("drift", None)
+        return out
+
+    def nudge(self, action: str, key: str) -> dict:
+        """`⊗` on a nudge, and `↺` on the silence list under it.
+
+        The shape is `task`'s `ignored`/`unignored` pair and the reasoning is
+        the same one, arrived at from the other end: a task is silenced
+        without editing the note it lives on, and a nudge has no note to edit
+        in the first place — it is a *reading* of the vault, recomputed every
+        four seconds. So this endpoint cannot damage anything, and the only
+        thing it can get wrong is hiding something the user wanted, which the
+        list right under the panel exists to make visible and one click to
+        undo.
+
+        Silences are permanent until restored rather than timed. A snooze was
+        the obvious alternative and was not chosen: "remind me in a week"
+        against a check that fires on a *threshold* — five days without a
+        workout, three days in the inbox — is a promise to raise it again in a
+        week whether or not anything changed, which is the behaviour being
+        complained about with an extra step in front of it.
+        """
+        if action not in ("silence", "restore"):
+            raise HudError(400, "action must be 'silence' or 'restore'")
+        key = key.strip()
+        if not key:
+            raise HudError(400, "key is required")
+
+        def work(engine):
+            if action == "restore":
+                return {"ok": True, "action": action, "key": key,
+                        "unchanged": not engine.nudges.restore(key)}
+            try:
+                engine.nudges.silence(key, reason="hud")
+            except ValueError as exc:
+                raise HudError(400, str(exc))
+            return {"ok": True, "action": action, "key": key,
+                    "unchanged": False}
+        out = self.bridge.call(work, timeout=60)
+        # The panel is drawn from the cached snapshot, so without this the
+        # nudge stays on screen until the next poll and the click reads as
+        # having done nothing.
+        with self._snap_lock:
+            self._snap = None
         return out
 
     def agent(self, key: str) -> dict:
@@ -1021,6 +1957,8 @@ class Hud:
         return self.bridge.call(work, timeout=60)
 
     def stop(self) -> None:
+        if self.scout is not None:
+            self.scout.stop()
         self.bridge.stop()
 
 
@@ -1042,6 +1980,36 @@ def _voice_state(resp) -> str:
 # --------------------------------------------------------------------------
 # the wire
 
+#: The HUD's own policy. Everything it needs is on this origin.
+PAGE_CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; "
+            "font-src 'self'; object-src 'none'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'")
+
+#: The policy for a rendered artifact shown *inside* the viewport, and the
+#: only place this server serves a document it did not write itself.
+#:
+#: Three things it must allow that the HUD's own policy does not, each of
+#: them a fact about `render.py` rather than a loosening on principle:
+#: inline `<style>` and `<script>`, because a self-contained chart is
+#: inline by construction; `data:` images, for the same reason; and
+#: `*.neshan.org`, because `place_html` is that module's one documented CDN
+#: exception and a map with no tile server under it is a grey box.
+#:
+#: This is still strictly tighter than what these files get today, which is
+#: `webbrowser.open()` — a real tab, with no policy at all. And the frame
+#: carries `sandbox="allow-scripts"`, so the document runs in an opaque
+#: origin: it can draw itself and reach Neshan, and it can read nothing of
+#: the HUD's — not the DOM around it, not its storage, not its cookies.
+ARTIFACT_CSP = (
+    "default-src 'none'; "
+    "style-src 'unsafe-inline' https://static.neshan.org; "
+    "script-src 'unsafe-inline' https://static.neshan.org; "
+    "img-src data: blob: https://*.neshan.org; "
+    "font-src data: https://static.neshan.org; "
+    "connect-src https://*.neshan.org; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'self'")
+
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     server_version = "v-hud"
@@ -1058,7 +2026,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     def _send(self, status: int, body: bytes, ctype: str,
-              extra: dict | None = None) -> None:
+              extra: dict | None = None, *, csp: str = "",
+              cache: str = "no-store") -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -1066,14 +2035,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # line and it is what makes "a browser tab" an acceptable place to
         # render a vault: no font CDN, no analytics, no exfiltration path for
         # a note that ends up in the DOM.
-        self.send_header("Content-Security-Policy",
-                         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-                         "img-src 'self' data:; connect-src 'self'; "
-                         "font-src 'self'; object-src 'none'; base-uri 'none'; "
-                         "form-action 'none'; frame-ancestors 'none'")
+        #
+        # `csp` overrides it for exactly one response — a rendered chart or
+        # map framed in the viewport, which is a *document* and needs its own
+        # rules. See `ARTIFACT_CSP`.
+        self.send_header("Content-Security-Policy", csp or PAGE_CSP)
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1142,10 +2111,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     {"cmd": c, "what": what, "said": said}
                     for c, what, said in commands_mod.COMMANDS
                     if c not in commands_mod.NOT_ON_HUD]})
+            if path == "/api/tasks":
+                from urllib.parse import parse_qs
+                view = (parse_qs(query).get("view") or ["open"])[0]
+                return self._json(self.app.tasks(view))
             if path == "/api/search":
                 from urllib.parse import parse_qs, unquote
                 q = (parse_qs(query).get("q") or [""])[0]
                 return self._json(self.app.search(unquote(q)))
+            if path == "/api/media":
+                from urllib.parse import parse_qs
+                return self._media((parse_qs(query).get("id") or [""])[0])
             if path == "/api/events":
                 return self._events()
             if "/" not in path[1:] and path.endswith((".css", ".js")):
@@ -1166,13 +2142,48 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     raise HudError(400, "text is required")
                 return self._json(self.app.chat(text))
             if path == "/api/task":
-                return self._json(self.app.task(int(body.get("id") or 0),
-                                                body.get("state") or "done"))
+                # No default. This is a write endpoint, and `or "done"` meant
+                # a body that failed to parse — a bad request, a truncated
+                # POST — was read as "tick a task", which is the one verb here
+                # that should never be reached by accident. Watched it happen
+                # seventeen times from a malformed client; it only did no harm
+                # because the id defaulted to 0 as well.
+                state = body.get("state")
+                if not isinstance(state, str) or not state:
+                    raise HudError(400, "state is required: "
+                                        + ", ".join(TASK_ACTIONS))
+                return self._json(self.app.task(
+                    state,
+                    task_id=int(body.get("id") or 0),
+                    key=str(body.get("key") or "")))
             if path == "/api/command":
                 text = (body.get("text") or "").strip()
                 if not text.startswith("/"):
                     raise HudError(400, "not a command")
                 return self._json(self.app.command(text))
+            if path == "/api/frames":
+                # One verb, and it is the only one there can be: the viewport
+                # is a *view*, so a frame is not something to delete — the
+                # file is still where it was and the note still embeds it.
+                # This says "stop showing me these", nothing more.
+                if body.get("action") != "clear":
+                    raise HudError(400, "action must be 'clear'")
+                self.app.session.clear_frames()
+                return self._json({"ok": True,
+                                   "live": self.app.session.live()})
+            if path == "/api/nudge":
+                # No default on the action, same rule as `/api/task`: a
+                # truncated POST must not be readable as "hide this".
+                action = body.get("action")
+                if not isinstance(action, str) or not action:
+                    raise HudError(400, "action is required: silence, restore")
+                return self._json(self.app.nudge(
+                    action, str(body.get("key") or "")))
+            if path == "/api/block":
+                action = body.get("action")
+                if not isinstance(action, str) or not action:
+                    raise HudError(400, "action is required: add, move, drop")
+                return self._json(self.app.block(action, body))
             if path == "/api/agent":
                 return self._json(self.app.agent(body.get("key") or "v"))
             if path == "/api/typing":
@@ -1197,6 +2208,34 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if ctype.startswith("text/") or ctype.endswith(("javascript", "json")):
             ctype += "; charset=utf-8"
         self._send(200, path.read_bytes(), ctype)
+
+    def _media(self, fid: str) -> None:
+        """One frame's bytes, addressed by handle rather than by path.
+
+        There is no filename anywhere in this request. `id` is a hash, and it
+        is looked up in a registry the session filled when it decided to show
+        the picture — so this endpoint cannot be pointed at a file the HUD did
+        not already put on screen, and path traversal is not defended against
+        so much as unsayable.
+
+        A rendered chart or map is a document and is framed rather than drawn,
+        so it gets `ARTIFACT_CSP` instead of the HUD's own; everything else is
+        an image and gets the ordinary one. `max-age` is short and private:
+        these are immutable files with timestamped names, and re-fetching one
+        every time the filmstrip is clicked back and forth is the one thing on
+        this page that would touch the disk for no reason.
+        """
+        path = self.app.session.media_path(fid) if fid else None
+        if path is None or not path.is_file():
+            return self._json({"error": "no such frame"}, status=404)
+        kind = media_mod.kind_for(path)
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            return self._json({"error": f"unreadable: {exc}"}, status=404)
+        self._send(200, body, media_mod.mime_for(path),
+                   csp=ARTIFACT_CSP if kind == "page" else "",
+                   cache="private, max-age=300")
 
     # ---- SSE ----------------------------------------------------------
     def _events(self) -> None:
