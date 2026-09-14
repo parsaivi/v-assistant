@@ -31,6 +31,15 @@ wrong artifact for a route: `vault_route` now opens the route on Google Maps
 (neshan.org cannot be deep-linked at all — see `mapsearch.directions_url`),
 sends `route_png` to Telegram, and draws that same PNG in the terminal.
 
+**Everything saved here announces itself.** `save()` and `save_bytes()` are
+the one place every artifact in this codebase passes through, so they call
+`media.announce()` — a line in a spool file that any surface with a screen
+can tail. That is how a chart rendered inside an MCP subprocess reaches the
+HUD's viewport (`hud.Frame`) without either half knowing the other exists,
+and why a render added next year gets the same for free. Best effort by
+contract: an artifact that fails to announce itself is still an artifact, and
+this module does not check.
+
 Palette, mark specs (rounded bar ends, 2px lines, ≥8px markers) and the
 color-by-job rule (one hue for a single measured series, the categorical
 order only when color itself carries identity — a place's category) are the
@@ -49,6 +58,7 @@ import time
 import webbrowser
 from pathlib import Path
 
+from . import media
 from .config import Settings, settings as default_settings
 
 
@@ -85,10 +95,22 @@ PLACE_CATEGORIES = ["cafe", "restaurant", "park", "bar", "bookstore", "other"]
 
 
 def _css_vars() -> str:
+    """The palette, as custom properties, in all three theme states.
+
+    Defined on `:root` rather than on `.viz-root`, and that is a fix rather
+    than a preference: `_shell` paints `body { background: var(--surface-1) }`,
+    and `body` is the *parent* of `.viz-root`, so scoped to the inner element
+    the variable did not resolve there. The page kept a white body while the
+    tokens inside it went dark — which in a dark-preference browser meant
+    white `--text-primary` on a white background, i.e. every chart title and
+    value label invisible. Found when the HUD's viewport started drawing these
+    files on a screen instead of `webbrowser.open()`ing them into a tab
+    nobody looked at twice. `color-scheme` belongs on the root anyway.
+    """
     light = [f"--series-{i + 1}: {c};" for i, c in enumerate(SERIES_LIGHT)]
     dark = [f"--series-{i + 1}: {c};" for i, c in enumerate(SERIES_DARK)]
     return f"""
-  .viz-root {{
+  :root {{
     color-scheme: light;
     --surface-1: {SURFACE_LIGHT};
     --text-primary: {INK_LIGHT};
@@ -100,7 +122,7 @@ def _css_vars() -> str:
     {' '.join(light)}
   }}
   @media (prefers-color-scheme: dark) {{
-    :root:where(:not([data-theme="light"])) .viz-root {{
+    :root:where(:not([data-theme="light"])) {{
       color-scheme: dark;
       --surface-1: {SURFACE_DARK};
       --text-primary: {INK_DARK};
@@ -112,7 +134,7 @@ def _css_vars() -> str:
       {' '.join(dark)}
     }}
   }}
-  :root[data-theme="dark"] .viz-root {{
+  :root[data-theme="dark"] {{
     color-scheme: dark;
     --surface-1: {SURFACE_DARK};
     --text-primary: {INK_DARK};
@@ -586,17 +608,21 @@ def _caption(draw, text: str, width: int, height: int) -> None:
 
 
 # ---- save / open ---------------------------------------------------------
-def save(html_str: str, *, slug: str, settings: Settings | None = None) -> Path:
+def save(html_str: str, *, slug: str, title: str = "", caption: str = "",
+         settings: Settings | None = None) -> Path:
     s = settings or default_settings
     out_dir = s.state_dir / "renders"
     out_dir.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-") or "chart"
     path = out_dir / f"{safe}-{int(time.time())}.html"
     path.write_text(html_str, encoding="utf-8")
+    media.announce(path, kind="page", title=title or slug, caption=caption,
+                   settings=s)
     return path
 
 
 def save_bytes(blob: bytes, *, slug: str, suffix: str = ".png",
+               title: str = "", caption: str = "",
                settings: Settings | None = None) -> Path:
     """`save()` for something already rendered to bytes — the route PNG. Same
     directory and same naming, so `renders/` stays one place to look."""
@@ -606,6 +632,7 @@ def save_bytes(blob: bytes, *, slug: str, suffix: str = ".png",
     safe = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-") or "render"
     path = out_dir / f"{safe}-{int(time.time())}{suffix}"
     path.write_bytes(blob)
+    media.announce(path, title=title or slug, caption=caption, settings=s)
     return path
 
 

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>V · HUD</title>
+<link rel="stylesheet" href="/hud.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='none' stroke='%236FE3FF' stroke-width='2'/><circle cx='16' cy='16' r='5' fill='%236FE3FF'/></svg>">
+</head>
+<body>
+
+<div id="hud" data-agent="v">
+  <div class="bg" id="bg1"></div>
+  <div class="bg" id="bg2"></div>
+  <div class="bg bg-glow"></div>
+  <div class="bg bg-vig"></div>
+  <div class="bg bg-scan"></div>
+  <div class="bg bg-lines"></div>
+
+  <div class="bezel">
+    <i class="c c1"></i><i class="c c2"></i><i class="c c3"></i><i class="c c4"></i>
+    <i class="t"></i><i class="b"></i><i class="l"></i><i class="r"></i>
+  </div>
+  <div id="alarm" hidden></div>
+
+  <div class="shell">
+
+    <!-- header ------------------------------------------------------- -->
+    <header class="head">
+      <div class="brand">
+        <div class="mark"><div class="ring"></div><div class="dash"></div><div class="core"></div></div>
+        <div>
+          <div class="name">V</div>
+          <div class="sub" id="tagline">AMBIENT ASSISTANT</div>
+        </div>
+      </div>
+
+      <div class="vr"></div>
+
+      <div class="pill" id="pill">
+        <span class="led"></span>
+        <span class="word" id="stword">IDLE</span>
+        <span class="detail" id="stdetail">connecting…</span>
+      </div>
+
+      <div id="alarmchip" hidden>
+        <span class="led"></span><span class="txt" id="alarmtxt"></span>
+      </div>
+
+      <div class="chips">
+        <div class="rule"></div>
+        <div class="chip"><span class="k">MODEL</span><span class="v" id="c-model">—</span></div>
+        <div class="chip"><span class="k">LAT</span><span class="v" id="c-lat">—</span></div>
+        <div class="chip"><span class="k">TURNS</span><span class="v" id="c-turns">0</span></div>
+        <div class="chip"><span class="k">MEM</span><span class="v" id="c-mem">—</span></div>
+        <div class="chip"><span class="k">SPEND</span><span class="v" id="c-spend">$0.00</span></div>
+      </div>
+
+      <div class="vr"></div>
+      <!-- Two clocks, one instant: the time V files notes on, and the date
+           Parsa's year is actually counted in. `#jdate` is filled from the
+           snapshot, never from the browser's locale — see `hud._jalali`. -->
+      <div id="when">
+        <div id="clock">--:--:--</div>
+        <div id="jdate" data-off="0"><span class="d"></span><span class="off">تعطیل</span></div>
+      </div>
+    </header>
+
+    <!-- three columns ------------------------------------------------- -->
+    <div class="body">
+
+      <!-- left rail -->
+      <aside class="rail-l">
+        <section>
+          <div class="cap"><span>SURFACES</span><span class="fill"></span></div>
+          <nav class="nav" id="nav"></nav>
+        </section>
+
+        <section>
+          <div class="cap"><span>AMBIENT STATE</span><span class="fill"></span></div>
+          <div class="states" id="states"></div>
+        </section>
+
+        <section>
+          <div class="cap"><span>TELEMETRY</span><span class="fill"></span></div>
+          <div class="gauges" id="gauges"></div>
+        </section>
+
+        <div style="flex:none;height:6px"></div>
+
+        <div class="rail-foot">
+          <div><span>VAULT</span><b id="f-vault">—</b></div>
+          <div><span>INDEX</span><b id="f-index">—</b></div>
+          <div><span>NETWORK</span><b id="f-net">—</b></div>
+          <div><span>SESSION</span><b id="f-session">—</b></div>
+        </div>
+      </aside>
+
+      <!-- centre -->
+      <main class="centre">
+
+        <div class="stage">
+          <div class="field"></div>
+          <div class="floor"></div>
+          <div class="tick tl"></div><div class="tick tr"></div>
+          <div class="edge l">APERTURE</div>
+          <div class="edge r" id="stcode">STANDBY</div>
+
+          <div class="aperture">
+            <div class="rim"></div>
+            <div class="ticks"></div>
+            <div class="arc" data-arc="vault"></div>
+            <div class="arc" data-arc="cal"></div>
+            <div class="arc" data-arc="msg"></div>
+            <div class="arc" data-arc="mem"></div>
+            <div class="arclabel" data-label="vault">VLT</div>
+            <div class="arclabel" data-label="cal">CAL</div>
+            <div class="arclabel" data-label="msg">MSG</div>
+            <div class="arclabel" data-label="mem">MEM</div>
+            <div class="gyro"></div>
+            <div class="inner"></div>
+            <div class="halo"></div>
+            <div class="ping"></div>
+            <div class="core"><span id="stabbr">V</span></div>
+          </div>
+
+          <div class="wave" id="wave"></div>
+        </div>
+
+        <div class="route">
+          <div class="strip">
+            <span class="lab">ROUTE</span>
+            <div id="hops" style="display:flex;align-items:center;gap:9px"></div>
+            <span class="gap"></span>
+            <button class="why" id="why" aria-pressed="false" title="the route, cost and tools behind the last answer">/why</button>
+          </div>
+          <div class="trace" id="trace" hidden></div>
+        </div>
+
+        <div class="panehead">
+          <span class="t" id="pane-t">CONVERSATION</span>
+          <span class="m" id="pane-m"></span>
+          <span class="rule"></span>
+          <span class="r" id="pane-r"></span>
+        </div>
+
+        <!-- the conversation, and the viewport that floats over it -->
+        <div class="panewrap">
+          <div class="pane" id="pane"></div>
+
+          <!-- VIEWPORT · the pictures a turn is about. Built by paintFrames();
+               everything inside is replaced wholesale, so nothing here is
+               content — it is the empty frame. -->
+          <div id="viewport" hidden>
+            <i class="wire"></i>
+            <div class="vp">
+              <div class="head">
+                <span class="led"></span>
+                <span class="title">VIEWPORT</span>
+                <span class="fill"></span>
+                <span class="tag" id="vp-count"></span>
+                <button type="button" class="x" id="vp-close"
+                        title="clear the viewport — the files stay where they are"
+                        aria-label="clear the viewport">✕</button>
+              </div>
+              <div class="glass" id="vp-glass">
+                <div class="scan"></div>
+                <div class="corner tl"></div><div class="corner tr"></div>
+                <div class="corner bl"></div><div class="corner br"></div>
+              </div>
+              <div class="meta">
+                <div class="t" id="vp-title"></div>
+                <div class="s" id="vp-sub"></div>
+              </div>
+              <div class="strip" id="vp-strip"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="foot">
+          <div class="palette" id="palette" hidden role="listbox" aria-label="commands"></div>
+          <form class="prompt" id="form" autocomplete="off">
+            <span class="caret">&gt;</span>
+            <input id="input" placeholder="ask V anything · / for commands"
+                   aria-label="ask V" spellcheck="false">
+            <span class="blink" id="blink"></span>
+            <button type="submit" id="send">SEND</button>
+          </form>
+          <div class="quick" id="quick"></div>
+        </div>
+      </main>
+
+      <!-- right rail -->
+      <aside class="rail-r">
+        <section class="card">
+          <div class="head"><span class="led"></span><span class="title">TODAY</span>
+            <span class="fill"></span><span class="tag" id="tag-today">M-01</span></div>
+          <div class="rows" id="p-today"></div>
+        </section>
+
+        <section class="card">
+          <div class="head"><span class="led" style="background:var(--amber);box-shadow:0 0 8px var(--amber)"></span>
+            <span class="title">TASKS</span><span class="fill"></span>
+            <span class="tag" id="tag-tasks">M-02 · RANKED</span></div>
+          <div class="rows" id="p-tasks" style="gap:3px"></div>
+        </section>
+
+        <section class="card warn" id="card-dl">
+          <div class="head"><span class="led"></span><span class="title">DEADLINES</span>
+            <span class="fill"></span><span class="tag" id="tag-dl">M-03 · QUERA</span></div>
+          <div class="rows" id="p-dl" style="gap:6px"></div>
+        </section>
+
+        <section class="card">
+          <div class="head"><span class="led"></span><span class="title">INBOX</span>
+            <span class="fill"></span><span class="tag" id="tag-mail">M-04</span></div>
+          <div class="rows" id="p-mail" style="gap:5px"></div>
+        </section>
+
+        <section class="card mem-card">
+          <div class="head"><span class="led"></span><span class="title">WRITES</span>
+            <span class="fill"></span><span class="tag" id="tag-writes">M-05</span></div>
+          <div class="rows" id="p-writes" style="gap:9px"></div>
+        </section>
+
+        <section class="card">
+          <div class="head"><span class="led" style="background:var(--green);box-shadow:0 0 8px var(--green)"></span>
+            <span class="title">NUDGES</span><span class="fill"></span>
+            <span class="tag" id="tag-nudges">M-06</span></div>
+          <div class="rows" id="p-nudges" style="gap:7px"></div>
+        </section>
+
+        <div class="tiles">
+          <div class="tile"><div class="k">SPEND TODAY</div>
+            <div class="v" id="t-spend">$0.00</div><div class="s" id="t-cap">of $2.00 cap</div></div>
+          <div class="tile"><div class="k">MEMORIES</div>
+            <div class="v" id="t-mem">—</div><div class="s" id="t-memsub">active</div></div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- tool bus ------------------------------------------------------ -->
+    <footer class="bus">
+      <span class="lab">TOOL BUS</span>
+      <span class="led" id="bus-led"></span>
+      <div class="win"><div class="tape" id="tape"></div></div>
+      <div class="spark" id="spark"></div>
+      <span class="tail" id="bus-tail">—</span>
+    </footer>
+  </div>
+
+  <div id="probe" hidden>
+    <div class="dot"></div><div class="wire"></div>
+    <div class="box">
+      <div class="top"><span class="kind"></span><i></i></div>
+      <div class="title"></div>
+      <div class="rows"></div>
+    </div>
+  </div>
+
+  <!-- a frame, at the size the picture actually is -->
+  <div id="lightbox" hidden>
+    <div class="sheet">
+      <div class="bar">
+        <span class="kind" id="lb-kind"></span>
+        <span class="t" id="lb-title"></span>
+        <span class="fill"></span>
+        <span class="s" id="lb-sub"></span>
+        <button type="button" class="x" id="lb-close" aria-label="close">✕</button>
+      </div>
+      <div class="stagearea" id="lb-stage"></div>
+    </div>
+  </div>
+
+  <!-- The block editor. Outside `#pane` on purpose: the pane is rebuilt by
+       the four-second poll, and a form rebuilt under the cursor eats the
+       keystroke you were in the middle of. -->
+  <div id="blockedit" hidden></div>
+
+  <div id="offline" hidden>LINK DOWN · RETRYING</div>
+</div>
+
+<script src="/hud.js"></script>
+</body>
+</html>

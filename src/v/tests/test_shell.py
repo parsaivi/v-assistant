@@ -32,12 +32,15 @@ from v.tests.test_core import make_vault
 
 # The real checked-in settings file, not a fixture: the deny rules in it are
 # half of what makes granting Write/Edit safe, so the test has to read the one
-# the CLI actually passes with `--setting-sources project,local`.
-# Resolved from the configured vault, not from this file's location.
-# V no longer lives inside the vault, so `parents[2]` is the package
-# root and not the notes — the same coupling `config.resolve_vault()`
-# exists to break.
-VAULT_SETTINGS = config.settings.vault / ".claude" / "settings.json"
+# the CLI actually passes.
+#
+# That is no longer the vault's `.claude/settings.json`. The append-only rules
+# moved into V's own `guard.settings.json` on 2026-09-13 and ride in on
+# `--settings`, because the vault file binds every Claude Code session opened
+# here — Parsa's included — and these rules are about V. Nothing else changed:
+# the patterns are still vault-relative, and `ClaudeCodeShell` still runs with
+# the vault as cwd.
+VAULT_SETTINGS = shells.GUARD_SETTINGS
 
 PASS, FAIL = [], []
 
@@ -83,11 +86,12 @@ class FakeShell(shells.Shell):
 
     def run(self, prompt, *, session_id=None, allow_writes=False, timeout=None,
             model=None, effort=None, memory="", agent="v", tier_floor=None,
-            on_event=None):
+            surface="", on_event=None):
         self.calls.append({"prompt": prompt, "session_id": session_id,
                            "allow_writes": allow_writes, "model": model,
                            "effort": effort, "memory": memory, "agent": agent,
-                           "tier_floor": tier_floor, "on_event": on_event})
+                           "tier_floor": tier_floor, "surface": surface,
+                           "on_event": on_event})
         if self.fail:
             raise ShellUnavailable("nope")
         # Surfaces are entitled to progress from any shell, so a double that
@@ -795,14 +799,71 @@ def a_broken_progress_callback_cannot_cost_an_answer():
 
 @test
 def each_tier_gets_its_own_patience():
-    """One flat ceiling meant a two-word lookup could hang for five minutes."""
+    """One flat budget meant a two-word lookup could hang for five minutes."""
     root, s = make_vault()
     try:
-        light = shells.timeout_for(shells.LIGHT, s)
-        heavy = shells.timeout_for(shells.HEAVY, s)
+        light = shells.idle_for(shells.LIGHT, s)
+        heavy = shells.idle_for(shells.HEAVY, s)
         ok(light < heavy, f"light {light}s should be under heavy {heavy}s")
-        eq(shells.timeout_for("nonsense-tier", s), s.shell_timeout,
-           "an unknown tier falls back to the flat ceiling")
+        eq(shells.idle_for("nonsense-tier", s), s.shell_idle,
+           "an unknown tier falls back to the flat budget")
+    finally:
+        shutil.rmtree(root)
+
+
+def _emitter(script: str):
+    """A fake `claude` that writes stream-json on a schedule of our choosing."""
+    return [sys.executable, "-u", "-c", script]
+
+
+@test
+def a_run_that_keeps_talking_is_never_killed_for_taking_long():
+    """The bug this replaces: twelve real runs killed mid-work by a total
+    ceiling, every one of them still producing events when it died.
+
+    The run below outlives its budget four times over and must survive, because
+    it never goes quiet for longer than the budget.
+    """
+    root, s = make_vault()
+    try:
+        shell = ClaudeCodeShell(s)
+        # 20 events, 0.2s apart — 4s of run against a 1s idle budget.
+        final, live, err = shell._stream(_emitter(
+            "import json,time,sys\n"
+            "for i in range(20):\n"
+            "    print(json.dumps({'type':'stream_event','event':{"
+            "'type':'content_block_delta','index':0,"
+            "'delta':{'type':'text_delta','text':'x'}}}))\n"
+            "    time.sleep(0.2)\n"
+            "print(json.dumps({'type':'result','result':'done',"
+            "'session_id':'s1'}))\n"
+        ), os.environ.copy(), 1, None)
+        eq(err, "", f"a talking run was killed anyway: {err!r}")
+        ok(final is not None, "the final payload never arrived")
+        eq(final.get("result"), "done")
+        eq(live.text, "x" * 20, "every delta should have landed")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_run_that_goes_quiet_is_killed_and_keeps_what_it_said():
+    """The guard the idle budget still has to provide: a hung child dies, and
+    the half-answer it had already written survives it."""
+    root, s = make_vault()
+    try:
+        shell = ClaudeCodeShell(s)
+        final, live, err = shell._stream(_emitter(
+            "import json,time,sys\n"
+            "print(json.dumps({'type':'stream_event','event':{"
+            "'type':'content_block_delta','index':0,"
+            "'delta':{'type':'text_delta','text':'half an answer'}}}))\n"
+            "time.sleep(300)\n"
+        ), os.environ.copy(), 1, None)
+        ok(final is None, "a killed run has no final payload")
+        ok("stalled" in err, f"the error should name the stall, not a duration: {err!r}")
+        eq(live.text, "half an answer",
+           "what the run had written is worth more than the local fallback")
     finally:
         shutil.rmtree(root)
 

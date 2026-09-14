@@ -34,6 +34,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from v.core import calendar as calendar_mod  # noqa: E402
+from v.core import commands as commands_mod  # noqa: E402
 from v.core import config, index, schema, shells, stt, ui  # noqa: E402
 from v.core import notes as notes_mod  # noqa: E402
 from v.core import persona  # noqa: E402
@@ -137,33 +138,12 @@ def _print(resp, animate: bool = False) -> None:
 # is the contract: a command may not exist here unless V already understands it
 # spoken, because the moment the shortcut is the only way in, the assistant has
 # quietly become a CLI with a chat prompt attached.
-COMMANDS: list[tuple[str, str, str]] = [
-    ("/why", "the route, cost and notes behind the last answer", "why did you say that"),
-    ("/cost", "today, this session, and where it went", "what have you cost me"),
-    ("/undo", "revert the last thing written to the vault", "no, take that back"),
-    ("/mem", "what I hold about a person or a project", "what do you know about x"),
-    ("/quiet", "no unprompted messages until tomorrow", "leave me alone"),
-    ("/local", "local answers only until further notice", "stay offline"),
-    ("/brief", "the morning brief", "what does my day look like"),
-    ("/tasks", "what is actually on your plate", "what should I do today"),
-    ("/nudges", "what the vault says you have let slip", "anything I am forgetting"),
-    ("/evening", "the close-out draft for today", "what did I get done"),
-    ("/status", "the vault, the indexes, the shell", "how are you doing"),
-    ("/new", "end this conversation, write it up, start fresh", "that's it for now"),
-    ("/copy", "put the last answer on the clipboard", ""),
-    ("/clear", "clear the screen", ""),
-    ("/help", "this", "what can you do"),
-    ("/quit", "or Ctrl-D", "goodbye"),
-]
-
-REPL_HELP = """Anything that is not a command is a message to V — and every
-command below is a shortcut for something you could have just said.
-
-Tab completes, ↑/↓ walk the history, ←/→ and Ctrl-A/E/W edit the line.
-In the window the wheel scrolls the transcript and dragging over it
-copies what you dragged across — the text alone, without the frame
-around it. Shift-drag is your terminal's own selection, and `/mouse`
-hands the mouse back for good."""
+# The table itself lives in `core/commands.py` — `v hud` has a prompt too, and
+# a command list only the terminal can see is a command that becomes a paid
+# model turn everywhere else. Re-exported here because this module's own name
+# for it is what `setup_readline` and `tui` are handed.
+COMMANDS = commands_mod.COMMANDS
+REPL_HELP = commands_mod.REPL_HELP
 
 _COMPLETIONS = [c for c, _, _ in COMMANDS] + ["/exit"]
 
@@ -486,33 +466,14 @@ def _thinking(fn, *a, engine=None, **kw):
                 engine.progress = None
 
 
-def _prefs_path(engine: Engine) -> Path:
-    return engine.s.state_dir / "surface.json"
-
-
+# `/quiet` and `/local` are read by the scheduler and written by whichever
+# prompt you typed into, so they live in `core/commands.py` next to the table.
 def _prefs(engine: Engine) -> dict:
-    """`/quiet` and `/local`, on disk.
-
-    On disk rather than in the process because the two things they govern —
-    proactive messages and escalation — are decided by the scheduler, which is
-    a different process. A quiet switch that only quiets the window you typed
-    it into is not a quiet switch.
-    """
-    try:
-        return json.loads(_prefs_path(engine).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return commands_mod.prefs(engine.s.state_dir)
 
 
 def _save_prefs(engine: Engine, **kw) -> dict:
-    data = _prefs(engine)
-    data.update(kw)
-    try:
-        _prefs_path(engine).write_text(json.dumps(data, indent=2),
-                                       encoding="utf-8")
-    except OSError:
-        pass
-    return data
+    return commands_mod.save_prefs(engine.s.state_dir, **kw)
 
 
 def _why(engine: Engine) -> None:
@@ -666,7 +627,22 @@ def _repl_command(line: str, engine: Engine) -> bool:
     elif cmd == "evening":
         _print(_thinking(engine.evening), animate=True)
     elif cmd == "nudges":
-        _print(_thinking(engine.nudge_digest), animate=True)
+        # `/nudges` is the digest; `/nudges off` is what it is not telling
+        # you, and `/nudges off <key>` / `/nudges on <key>` move things
+        # between the two. Positional rather than flags because this is a
+        # prompt, not a shell.
+        verb, _, key = rest.partition(" ")
+        verb, key = verb.strip(), key.strip()
+        if verb == "off" and key:
+            _print(engine.nudge_silence(key))
+        elif verb == "off":
+            _print(engine.nudges_silenced())
+        elif verb == "on" and key:
+            _print(engine.nudge_restore(key))
+        elif verb:
+            print(ui.error("/nudges · /nudges off [key] · /nudges on <key>"))
+        else:
+            _print(_thinking(engine.nudge_digest), animate=True)
     elif cmd == "tasks":
         _print(_thinking(engine.handle, "what should I do today",
                          engine=engine), animate=True)
@@ -818,7 +794,21 @@ def cmd_evening(args, engine: Engine) -> int:
 
 
 def cmd_nudges(args, engine: Engine) -> int:
-    _print(_thinking(engine.nudge_digest), animate=True)
+    """The digest, and the three verbs that decide what is in it.
+
+    Silencing lives here rather than only on the HUD because the HUD is a
+    surface you have to be sitting in front of, and "stop telling me this" is
+    most often said in the second after being told — which is as likely to be
+    in the terminal or over Telegram.
+    """
+    if args.silence:
+        _print(engine.nudge_silence(args.silence, reason=args.reason or ""))
+    elif args.restore:
+        _print(engine.nudge_restore(args.restore))
+    elif args.silenced:
+        _print(engine.nudges_silenced())
+    else:
+        _print(_thinking(engine.nudge_digest), animate=True)
     return 0
 
 
@@ -923,6 +913,60 @@ def cmd_tasks(args, engine: Engine) -> int:
             hits[0][0], _dt.datetime.combine(day, _dt.time())).text))
         return 0
 
+    if args.ignore:
+        hits = engine.q.find_task(args.ignore)
+        if not hits:
+            print(ui.error(f"no open task matching {args.ignore!r}"))
+            return 1
+        if len(hits) > 1 and hits[0][1] - hits[1][1] < 0.15:
+            print(ui.note(f"ambiguous — {args.ignore!r} matches:"))
+            for t, sc in hits[:5]:
+                print(f"{ui.INDENT}  {ui.DIM}[{t.id}] {sc:.2f}{ui.RESET} "
+                      f"{t.render()}")
+            return 1
+        t = hits[0][0]
+        engine.q.tasks.ignore(t, reason="cli")
+        print(ui.ok(f"Ignored **{t.text}**. The note is untouched — it just "
+                    f"stops showing up in priorities, overdue and the "
+                    f"backlog. `v tasks --unignore` brings it back."))
+        return 0
+
+    if args.unignore:
+        if engine.q.tasks.unignore(args.unignore):
+            print(ui.ok(f"**{args.unignore}** is back in the lists."))
+            return 0
+        # `--ignore` matched fuzzily to get here, so `--unignore` has to as
+        # well. Exact-only made this a one-way door: a task silenced by typing
+        # four of its words could not be brought back by typing the same four.
+        hits = engine.q.tasks.find_ignored(args.unignore)
+        if not hits:
+            print(ui.error(f"nothing ignored matching {args.unignore!r} — "
+                           "`v tasks --ignored` lists them"))
+            return 1
+        if len(hits) > 1 and hits[0][1] - hits[1][1] < 0.15:
+            print(ui.note(f"ambiguous — {args.unignore!r} matches:"))
+            for i, sc in hits[:5]:
+                print(f"{ui.INDENT}  {ui.DIM}{sc:.2f}{ui.RESET} {i.text}")
+            return 1
+        engine.q.tasks.unignore(hits[0][0].norm)
+        print(ui.ok(f"**{hits[0][0].text}** is back in the lists."))
+        return 0
+
+    if args.ignored:
+        rows = engine.q.tasks.ignored()
+        if not rows:
+            print(ui.note("nothing ignored — V is tracking every task."))
+            return 0
+        print(ui.markdown(f"{len(rows)} ignored task"
+                          f"{'s' if len(rows) != 1 else ''}"))
+        print()
+        for i in rows:
+            live = (f"hiding {i.live} open" if i.live else "no live copy left")
+            print(f"{ui.INDENT}{ui.DIM}⊗{ui.RESET} {i.text}")
+            print(f"{ui.INDENT}  {ui.DIM}{i.age_days()}d ago · {live}"
+                  f"{' · ' + i.rel if i.rel else ''}{ui.RESET}")
+        return 0
+
     if args.backlog:
         r = engine.q.backlog(day)
         print(ui.markdown(r.answer))
@@ -985,6 +1029,141 @@ def cmd_calendar(args, engine: Engine) -> int:
     if r.rows:
         print()
         print(ui.markdown(r.table(50)))
+    return 0
+
+
+def cmd_week(args, engine: Engine) -> int:
+    """The week's shape — read it, seed it, add to it, or find the gaps.
+
+    `cmd_calendar` is the sibling of this and the split is deliberate: that one
+    answers "what is scheduled", this one answers "where do my hours go". They
+    read different files and only this one can tell you what is *free*.
+    """
+    import datetime as _dt
+    from .core import weekplan as wp_mod
+    wp = engine.q.weekplan
+    day = _dt.date.fromisoformat(args.day) if args.day else _dt.date.today()
+
+    if args.init:
+        done = wp_mod.install(engine.s)
+        if not done:
+            print(ui.note("already installed — nothing to write"))
+        for line in done:
+            print(ui.ok(line))
+        return 0
+
+    if args.add:
+        block = wp_mod.parse_natural(" ".join(args.add), today=day)
+        if not block:
+            print(ui.error("couldn't find a time in that — try "
+                           "'class compiler tuesday 10:30-12:00'"))
+            return 1
+        print(ui.ok(wp.add(block)))
+        wp.sync_daily_note(block.date)
+        return 0
+
+    if args.drop or args.move:
+        # Blocks are addressed the way Parsa would say one out loud — a date
+        # and a start time — not by their written line. A line is exact and
+        # unforgiving and nobody has one to hand.
+        when_raw, at = (args.drop or args.move)
+        when = _dt.date.fromisoformat(when_raw)
+        found = [b for b in wp.on(when)
+                 if b.start == wp_mod._parse_time(at)]
+        if not found:
+            listed = ", ".join(f"{b.time_label} {b.title}" for b in wp.on(when))
+            print(ui.error(f"nothing starts at {at} on {when}"
+                           + (f" — that day has: {listed}" if listed else "")))
+            return 1
+        if len(found) > 1:
+            print(ui.error(f"{len(found)} blocks start at {at} on {when} — "
+                           "edit the week note directly"))
+            return 1
+        line = found[0].line()
+        try:
+            if args.drop:
+                print(ui.ok(wp.remove(when, line)))
+            else:
+                changes: dict = {}
+                if args.to_day:
+                    changes["date"] = _dt.date.fromisoformat(args.to_day)
+                if args.to:
+                    span = args.to.split("-", 1)
+                    changes["start"] = wp_mod._parse_time(span[0])
+                    if len(span) > 1:
+                        changes["end"] = wp_mod._parse_time(span[1])
+                    if changes["start"] is None:
+                        print(ui.error(f"couldn't read {args.to!r} — "
+                                       "use HH:MM or HH:MM-HH:MM"))
+                        return 1
+                if args.kind:
+                    changes["kind"] = args.kind
+                if args.label is not None:
+                    changes["label"] = args.label
+                if not changes:
+                    print(ui.error("nothing to change — pass --to, --to-day, "
+                                   "--kind or --label"))
+                    return 1
+                print(ui.ok(wp.move(when, line, **changes)))
+        except ValueError as exc:
+            print(ui.error(str(exc)))
+            return 1
+        wp.sync_daily_note(when)
+        return 0
+
+    if args.ensure:
+        rel = wp.ensure_week(day)
+        print(ui.ok(f"week note ready: {rel}"))
+        return 0
+
+    if args.reseed:
+        n = wp.reseed(day)
+        print(ui.ok(f"added {n} repeating block(s) to {wp.week_rel(day)}"
+                    if n else "nothing missing — the week is already seeded"))
+        return 0
+
+    if args.sync:
+        n = 0
+        with ui.Spinner("syncing daily notes"):
+            for i in range(args.days):
+                if wp.sync_daily_note(day + _dt.timedelta(days=i)):
+                    n += 1
+        print(ui.ok(f"synced {n} daily note(s)"))
+        return 0
+
+    if args.now:
+        block = wp.now_block()
+        if block:
+            print(ui.markdown(f"**now** · {block.render()}"))
+        else:
+            nxt = wp.next_free(30)
+            print(ui.markdown("**now** · nothing scheduled — the hour is yours"))
+            if nxt and nxt.date == _dt.date.today():
+                print(ui.note(f"free until {nxt.end.strftime('%H:%M')}"))
+        return 0
+
+    if args.free:
+        r = engine.q.free_time(day, days=args.days, min_minutes=args.min_minutes)
+        print(ui.markdown(r.answer))
+        if r.rows:
+            print()
+            print(ui.markdown(r.table(50)))
+        return 0
+
+    # Default: the whole week the day falls in, so `v week` means the week.
+    days = args.days if args.days > 1 else 7
+    start = day if args.day else wp_mod.week_start_of(day)
+    r = engine.q.schedule(start, days=days)
+    print(ui.markdown(r.answer))
+    if r.rows:
+        print()
+        print(ui.markdown(r.table(80)))
+    load = wp.load(start)
+    if load:
+        print()
+        print(ui.markdown(" · ".join(
+            f"**{k}** {wp_mod.human_span(v)}"
+            for k, v in sorted(load.items(), key=lambda kv: -kv[1]))))
     return 0
 
 
@@ -1167,6 +1346,12 @@ def cmd_reminders(args, engine: Engine) -> int:
             print(ui.hint("nothing due"))
         for r in fired:
             print(ui.markdown(r.render()))
+            # Settled only now, after it is on screen — the terminal is a
+            # surface like any other, and `due_reminders` no longer settles
+            # anything it merely composed.
+            rid = (r.data or {}).get("reminder_id")
+            if rid is not None:
+                engine.settle_reminder(rid)
         return 0
     pending = engine.reminders.pending()
     print(ui.hint(f"{len(pending)} pending"))
@@ -1520,6 +1705,43 @@ def cmd_serve(args, engine: Engine) -> int:
         print(ui.error(exc.message))
         return 1
     return 0
+
+
+def cmd_hud(args, engine: Engine) -> int:
+    """The wide desktop surface, in a browser on this machine.
+
+    `repl` draws one conversation in a window. This draws the day: the same
+    conversation next to the agenda, the ranked tasks, the deadlines, what V
+    has learned and what it wrote — which is a layout problem, and a terminal
+    has nowhere to put it.
+    """
+    from v.core import hud as hud_mod
+
+    s = engine.s
+    # Same reason as `cmd_serve`: the engine that answers is the one
+    # `hud._Bridge` opens on its own thread, so this one is a second idle
+    # sqlite connection for however long the HUD is left open.
+    engine.close()
+    try:
+        port = args.port if args.port else hud_mod.free_port()
+    except hud_mod.HudError as exc:
+        print(ui.error(exc.message))
+        return 1
+
+    def ready(url, _srv):
+        print(ui.hint(f"HUD on {url}"))
+        print(ui.hint("loopback only · Ctrl-C to stop"))
+
+    try:
+        code = hud_mod.serve(s, port=port, open_browser=not args.no_open,
+                             verbose=args.verbose, on_ready=ready)
+    except OSError as exc:
+        # A `finally` here would print "stopped" under the error too, which
+        # reads as though it had been running.
+        print(ui.error(f"could not listen on 127.0.0.1:{port}: {exc}"))
+        return 1
+    print("\nstopped")
+    return code
 
 
 def cmd_stt(args, engine: Engine) -> int:
@@ -1929,7 +2151,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("brief").set_defaults(fn=cmd_brief)
     sub.add_parser("evening").set_defaults(fn=cmd_evening)
-    sub.add_parser("nudges").set_defaults(fn=cmd_nudges)
+    s = sub.add_parser("nudges", help="what the vault knows that you don't")
+    # The key, not the text: a nudge's words are a number the vault recomputes
+    # ("in 5 days" is 6 tomorrow), so the check's id is the only stable handle.
+    # `v nudges --silenced` prints them.
+    s.add_argument("--silence", metavar="KEY",
+                   help="stop raising this check until it is restored")
+    s.add_argument("--restore", metavar="KEY",
+                   help="put a silenced check back in every list")
+    s.add_argument("--silenced", action="store_true",
+                   help="what is currently hidden, and since when")
+    s.add_argument("--reason", default="",
+                   help="a note to your future self, shown with --silenced")
+    s.set_defaults(fn=cmd_nudges)
 
     s = sub.add_parser("briefing", help="the standing 10:00 morning push")
     s.add_argument("--push", action="store_true",
@@ -1961,6 +2195,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--overdue", action="store_true")
     s.add_argument("--backlog", action="store_true", help="how far behind")
     s.add_argument("--done", metavar="TEXT", help="tick a task off by name")
+    # The third answer to a task, next to the one that ticks it. Writes
+    # nothing to the vault — see `tasks.IGNORES_SCHEMA` for why that is the
+    # point rather than a shortcut.
+    s.add_argument("--ignore", metavar="TEXT",
+                   help="stop V bringing a task up, without touching the note")
+    s.add_argument("--unignore", metavar="TEXT", help="undo an --ignore")
+    s.add_argument("--ignored", action="store_true",
+                   help="list what V has been told to stop bringing up")
     s.add_argument("--area", help="Work / University / Life")
     s.add_argument("--day", help="YYYY-MM-DD (default today)")
     s.add_argument("--limit", type=int, default=12)
@@ -1976,6 +2218,34 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--day", help="YYYY-MM-DD (default today)")
     s.add_argument("--days", type=int, default=1)
     s.set_defaults(fn=cmd_calendar)
+
+    s = sub.add_parser("week", help="the week's shape — hours, not tasks")
+    s.add_argument("--day", help="YYYY-MM-DD (default: this week)")
+    s.add_argument("--days", type=int, default=1)
+    s.add_argument("--free", action="store_true", help="the gaps, not the blocks")
+    s.add_argument("--min-minutes", type=int, default=30, dest="min_minutes",
+                   help="shortest gap worth reporting (default 30)")
+    s.add_argument("--now", action="store_true", help="what you are in the middle of")
+    s.add_argument("--add", nargs="+", metavar="TEXT",
+                   help="e.g. --add gym tuesday 19:00-20:30")
+    s.add_argument("--drop", nargs=2, metavar=("DAY", "HH:MM"),
+                   help="remove the block starting then, e.g. --drop 2026-09-20 10:30")
+    s.add_argument("--move", nargs=2, metavar=("DAY", "HH:MM"),
+                   help="change that block; say how with --to/--to-day/--kind/--label")
+    s.add_argument("--to", metavar="HH:MM[-HH:MM]", help="its new time")
+    s.add_argument("--to-day", dest="to_day", metavar="YYYY-MM-DD",
+                   help="its new date")
+    s.add_argument("--kind", help="its new kind (class, work, gym, paper, …)")
+    s.add_argument("--label", help="its new label")
+    s.add_argument("--ensure", action="store_true",
+                   help="create the week note, seeded with what repeats")
+    s.add_argument("--reseed", action="store_true",
+                   help="add repeating blocks missing from an existing week")
+    s.add_argument("--sync", action="store_true",
+                   help="render the schedule into daily notes")
+    s.add_argument("--init", action="store_true",
+                   help="write the vault side: seed template, sections, dashboard")
+    s.set_defaults(fn=cmd_week)
 
     s = sub.add_parser("gcal", help="the live Google Calendar, yours and others'")
     s.add_argument("action", nargs="?", default="list",
@@ -2042,6 +2312,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="don't run reminders/brief/nudges from this process")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("hud", help="the wide desktop surface — the day on one "
+                       "screen, in a browser on this machine")
+    s.add_argument("--port", type=int, default=None,
+                   help=f"port on 127.0.0.1 (default: {7717} or the next free one)")
+    s.add_argument("--no-open", action="store_true",
+                   help="don't open a browser window")
+    s.add_argument("-v", "--verbose", action="store_true",
+                   help="log every request")
+    s.set_defaults(fn=cmd_hud)
 
     s = sub.add_parser("phone", help="certificates for the phone surface")
     s.add_argument("action", nargs="?", default="status",

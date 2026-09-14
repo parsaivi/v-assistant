@@ -47,6 +47,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .config import Settings, settings as default_settings
 
@@ -232,19 +233,25 @@ def tier_settings(tier: str, s: Settings) -> tuple[str, str]:
     }.get(tier, (s.tier_normal_model, s.tier_normal_effort))
 
 
-def timeout_for(tier: str, s: Settings) -> int:
-    """How long this tier is allowed to take before it counts as stuck.
+def idle_for(tier: str, s: Settings) -> int:
+    """How long this tier may go silent before it counts as stuck.
 
-    One flat ceiling made "stuck" mean the same thing for a two-word lookup and
-    a vault-wide audit, which in practice meant a `light` question could hold
-    the prompt for five minutes before admitting it had failed.
+    An idle budget, not a ceiling on the run. The distinction is the whole
+    point: the thing worth killing is a run that has stopped doing anything,
+    and total runtime cannot see that — it kills the long job and the hung one
+    with equal confidence. Under the streaming reader, silence can be measured
+    directly, so it is.
+
+    Tiered anyway, because the longest legitimate gap between events does scale
+    a little with the work: a lookup that says nothing for a minute is stuck,
+    whereas an audit may sit inside one slow tool call for longer than that.
     """
     return {
-        TRIVIAL: s.shell_timeout_trivial,
-        LIGHT: s.shell_timeout_light,
-        NORMAL: s.shell_timeout_normal,
-        HEAVY: s.shell_timeout_heavy,
-    }.get(tier) or s.shell_timeout
+        TRIVIAL: s.shell_idle_trivial,
+        LIGHT: s.shell_idle_light,
+        NORMAL: s.shell_idle_normal,
+        HEAVY: s.shell_idle_heavy,
+    }.get(tier) or s.shell_idle
 
 
 @dataclass
@@ -312,7 +319,7 @@ class Shell(ABC):
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
             memory: str = "", agent: str = "v", tier_floor: str | None = None,
-            on_event: Progress = None) -> ShellResult: ...
+            surface: str = "", on_event: Progress = None) -> ShellResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +375,10 @@ READ_TOOLS = [
     "mcp__vault__vault_validate", "mcp__vault__vault_status",
     "mcp__vault__vault_standup", "mcp__vault__vault_reminders",
     "mcp__vault__vault_tasks", "mcp__vault__vault_calendar",
+    # The week's shape, and the gaps in it. Read-only and free — and the only
+    # tools that can answer "when am I free", which the calendar cannot.
+    "mcp__vault__vault_schedule_week", "mcp__vault__vault_free_time",
+    "mcp__vault__vault_now",
     "mcp__vault__vault_memory_list", "mcp__vault__vault_voice_list",
     # Emails and phone numbers out of `10 - Personal CRM`, and nothing else
     # from it. On the read list rather than the write one because it changes
@@ -401,6 +412,14 @@ READ_TOOLS = [
     # Live POI search (Neshan), for places not yet in the vault. Read-only —
     # nothing is saved without going through vault_create separately.
     "mcp__vault__vault_places_search",
+    # The two lookups either side of a coordinate. `vault_address` is the
+    # only thing V can reach that knows whether somewhere is inside طرح
+    # ترافیک or زوج/فرد — Google models neither — so without it in reach,
+    # "can I drive to Omlet Sara today" gets answered from nothing, which is
+    # the same failure `vault_route` was added for. `vault_geocode` is the
+    # other direction and is here for one job: getting the `location` field
+    # for a new place note. Both read-only; neither writes anything.
+    "mcp__vault__vault_address", "mcp__vault__vault_geocode",
     # Whether the university deadlines are current. Read-only: it fetches
     # Quera's open-deadline list and diffs it against the assignment notes,
     # writing nothing. On every run rather than behind the write flag for the
@@ -409,13 +428,35 @@ READ_TOOLS = [
     # record were "no Quera access is set up for me" and "I cannot verify the
     # live Quera sync", both said about a sync that had run that morning.
     "mcp__vault__vault_quera_status",
+    # The Persian calendar. Read-only, and here rather than left to the model
+    # because a Jalali date computed from memory is wrong at every leap year
+    # and looks exactly as confident as a right one. It is also the only
+    # thing in reach that knows whether tomorrow is تعطیل, which is not
+    # derivable from anything local except a Friday.
+    "mcp__vault__vault_jalali",
+    # What things cost, new and used, in toman. Read-only — both are
+    # searches, neither writes anything, and a price is never filed as a
+    # ledger line without Parsa saying so. Here for the same reason
+    # `vault_route` is: without them, "is 3 million reasonable for this" is
+    # answered from a model's recollection of Iranian prices, which is a
+    # guess wearing the authority of a lookup, in a currency that moves
+    # every week.
+    "mcp__vault__vault_digikala", "mcp__vault__vault_divar",
     "Read", "Grep", "Glob",
 ] + BROWSER_TOOLS
 WRITE_TOOLS = [
     "mcp__vault__vault_append", "mcp__vault__vault_create",
     "mcp__vault__vault_remind", "mcp__vault__vault_undo",
     "mcp__vault__vault_task_done", "mcp__vault__vault_add_task",
-    "mcp__vault__vault_schedule",
+    "mcp__vault__vault_schedule", "mcp__vault__vault_add_block",
+    # Changing a block that already exists. These *are* edits, and they are
+    # here rather than in `EDIT_TOOLS` on purpose: they take a date and a
+    # time, can only rewrite one line of one `## Schedule` section, check the
+    # kind against a closed vocabulary first, and refuse a line they cannot
+    # find exactly once. "My class was cancelled" is the most obvious thing
+    # to say to V from a phone, and gating it to the terminal would make the
+    # schedule the one thing V can add to but never correct.
+    "mcp__vault__vault_remove_block", "mcp__vault__vault_move_block",
     # Creating a Google event is the one write here that leaves the machine:
     # it emails the guests, and `vault_undo` does not reach it. Behind the
     # write flag like everything else, and the tool description says to
@@ -454,8 +495,9 @@ WRITE_TOOLS = [
 # `WRITE_TOOLS` on purpose: every other agent is append-only *by construction*
 # rather than by instruction — these names never enter its allowlist, so no
 # prompt and no misread instruction can produce a modification. Added only for
-# an agent whose `Persona.edits` is true, which today is EDITH and only at the
-# terminal.
+# an agent whose `Persona.may_edit(surface)` is true: EDITH, who only ever runs
+# at the terminal, and V when the words arrived at the terminal or the HUD.
+# Telegram and the phone never see these names, whoever is asking.
 EDIT_TOOLS = [
     "mcp__vault__vault_edit",       # one exact, unique string
     "mcp__vault__vault_set_meta",   # frontmatter only, body untouched
@@ -488,6 +530,16 @@ HOST_TOOLS = [
 # rules on `NN - Folder/**/*.md`, so these reach the scripts and configs at the
 # vault root but not a single note — vault prose stays on the vaultfs path.
 HOST_WRITE_TOOLS = ["Write", "Edit", "NotebookEdit"]
+
+# Where those deny rules now live. They sat in the vault's
+# `.claude/settings.json` until 2026-09-13, which meant every Claude Code
+# session opened in the vault inherited them — Parsa's own interactive ones
+# included, where they were never the point. `ClaudeCodeShell` passes this
+# file with `--settings` so the fence binds V and nothing else; the privacy
+# half stays in the vault settings, because *that* half should bind everyone.
+# `tests/test_shell.py` and `tests/test_mcp.py` assert this file still covers
+# every granted file writer and every numbered folder on disk.
+GUARD_SETTINGS = Path(__file__).with_name("guard.settings.json")
 
 
 def _emit(on_event: Progress, event: ShellEvent) -> None:
@@ -677,7 +729,7 @@ class ClaudeCodeShell(Shell):
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
             memory: str = "", agent: str = "v", tier_floor: str | None = None,
-            on_event: Progress = None) -> ShellResult:
+            surface: str = "", on_event: Progress = None) -> ShellResult:
         if not self.available:
             raise ShellUnavailable(
                 "the `claude` CLI is not on PATH — install Claude Code first")
@@ -686,7 +738,7 @@ class ClaudeCodeShell(Shell):
         default_model, default_effort = tier_settings(tier, self.s)
         model = model or default_model
         effort = effort or default_effort
-        limit = timeout or timeout_for(tier, self.s)
+        idle = timeout or idle_for(tier, self.s)
 
         # What is fixed goes in the system prompt; what changes per question
         # goes in the turn. That ordering is the whole point.
@@ -715,10 +767,13 @@ class ClaudeCodeShell(Shell):
         turn = f"{memory.strip()}\n\n---\n\n{prompt}" if memory.strip() else prompt
         tools = READ_TOOLS + HOST_TOOLS + (
             WRITE_TOOLS + HOST_WRITE_TOOLS if allow_writes else [])
-        # Editing is a capability of the agent, not of the run. A read-only run
-        # gets none of it either way; a writing run gets it only if whoever is
-        # asking is allowed to modify existing notes.
-        if allow_writes and persona.get(agent).edits:
+        # Editing is a capability of the agent *on a surface*. A read-only run
+        # gets none of it either way; a writing run gets it only if this agent
+        # may modify existing notes **and** the words arrived somewhere it is
+        # trusted to. `surface` defaults to empty, which no persona lists, so a
+        # caller that forgets to pass it gets the append-only toolset rather
+        # than the permissive one — the safe direction to fail in.
+        if allow_writes and persona.get(agent).may_edit(surface):
             tools += EDIT_TOOLS
         sid = session_id or str(uuid.uuid4())
         cmd = [
@@ -732,6 +787,19 @@ class ClaudeCodeShell(Shell):
             "--allowed-tools", *tools,
             "--append-system-prompt", system,
             "--setting-sources", "project,local",
+            # The append-only half of the guard, and the reason it is passed
+            # here rather than left in the vault's `.claude/settings.json`
+            # beside the privacy half: that file is read by *every* Claude Code
+            # session opened in the vault, Parsa's own included, and the rules
+            # are about V, not about a human at the keyboard.
+            #
+            # It cannot be split by setting source. The line above loads
+            # `project,local`; an interactive session loads `user,project,
+            # local`. V's sources are a strict subset of his, so no source
+            # exists that V reads and he does not. `--settings` is the seam
+            # that does separate them — an additional file, highest
+            # precedence, named only here.
+            "--settings", str(GUARD_SETTINGS),
             # This account also has claude.ai's own generic Google
             # Calendar/Gmail/Drive connectors attached (`claude mcp list`),
             # unrelated to the vault and gated by their own OAuth. Without
@@ -786,8 +854,13 @@ class ClaudeCodeShell(Shell):
         # without this it would open its memory store at the default scope and
         # every tool call EDITH made would write into V's beliefs, quietly
         # undoing the isolation one level below where it is enforced.
+        # …and where it is being asked from, for the same reason: the second
+        # edit gate in `mcp/server.py` re-checks the persona in its own
+        # process, and since V now edits on some surfaces and not others, that
+        # check needs the surface or it degrades to "is this V?" — which is
+        # true on Telegram too.
         env = dict(os.environ, CLAUDE_CONFIG_DIR=self.s.claude_config_dir,
-                   V_AGENT=agent or "v")
+                   V_AGENT=agent or "v", V_SURFACE=surface or "")
 
         streaming = self.s.shell_stream
         if streaming:
@@ -802,7 +875,7 @@ class ClaudeCodeShell(Shell):
         t0 = time.time()
         read = self._stream if streaming else self._blob
         try:
-            data, live, err = read(cmd, env, limit, on_event)
+            data, live, err = read(cmd, env, idle, on_event)
         except OSError as exc:
             return ShellResult("", self.name, ms=(time.time() - t0) * 1000,
                                billing=self.billing, tier=tier, model=model,
@@ -810,10 +883,10 @@ class ClaudeCodeShell(Shell):
         ms = (time.time() - t0) * 1000
 
         if data is None:
-            # No final payload — timed out, crashed, or wrote something that
+            # No final payload — stalled, crashed, or wrote something that
             # was not JSON. `live` is whatever the run had said by then, and
             # keeping it is the difference between a wasted four minutes and a
-            # half-finished answer: the timeouts on record were long, expensive
+            # half-finished answer: the kills on record were long, expensive
             # runs that had already done most of the work.
             return ShellResult(
                 text=(live.text or "").strip()[:8000], provider=self.name,
@@ -821,7 +894,7 @@ class ClaudeCodeShell(Shell):
                 session_id=live.session_id or sid, turns=live.turns,
                 tools_used=live.tools, rate_limit=live.rate_limit,
                 partial=bool(live.text.strip()),
-                error=err or f"timed out after {limit}s")
+                error=err or f"stalled — no output for {idle}s")
 
         usage = data.get("modelUsage") or {}
         if usage:
@@ -864,7 +937,7 @@ class ClaudeCodeShell(Shell):
         )
 
     # ---- reading the run ------------------------------------------------
-    def _blob(self, cmd, env, limit, on_event):
+    def _blob(self, cmd, env, idle, on_event):
         """One JSON object at the end. The old behaviour, kept whole.
 
         Nothing is known until the process exits, so a timeout here really does
@@ -872,15 +945,19 @@ class ClaudeCodeShell(Shell):
         `on_event` and ignores it for the same reason: a surface should not
         have to ask which reader is running to know whether to draw progress;
         it simply gets none here.
+
+        It also cannot tell working from hung — that is what the stream is for
+        — so the idle budget is spent here as a flat ceiling on the whole run.
+        A blob reader that waits forever on a hung child has no way back.
         """
         del on_event
         try:
             proc = subprocess.run(
                 cmd, cwd=self.s.vault, capture_output=True, text=True,
-                timeout=limit, env=env, stdin=subprocess.DEVNULL,
+                timeout=idle, env=env, stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
-            return None, _Live(), f"timed out after {limit}s"
+            return None, _Live(), f"timed out after {idle}s"
         if proc.returncode != 0 and not proc.stdout.strip():
             return None, _Live(), (proc.stderr or
                                    f"claude exited {proc.returncode}").strip()[:500]
@@ -891,15 +968,21 @@ class ClaudeCodeShell(Shell):
             live.text = proc.stdout.strip()[:4000]
             return None, live, "could not parse the CLI's JSON output"
 
-    def _stream(self, cmd, env, limit, on_event):
+    def _stream(self, cmd, env, idle, on_event):
         """Read the run as it happens, and keep what it said if it is cut off.
 
-        The deadline is enforced against the *whole* run rather than per line,
-        because a run that is stuck mid-tool emits nothing at all and one that
-        is writing a long answer emits constantly; only the total is a
-        meaningful budget. A reader thread does the blocking read so the
-        deadline stays enforceable — `readline()` on a hung child is
-        uninterruptible, and a timeout you cannot enforce is a comment.
+        The deadline is against *silence*, not against the length of the run.
+        A run that is stuck mid-tool emits nothing at all and one that is
+        working emits constantly — tool calls, tool results, message deltas —
+        so the gap between events is the signal, and the total is not: it
+        cannot separate a job that legitimately takes eight minutes from a
+        child that died holding the pipe open. Every event pushes the deadline
+        out, which means a run is killed for being stuck and never merely for
+        being long.
+
+        A reader thread does the blocking read so the deadline stays
+        enforceable — `readline()` on a hung child is uninterruptible, and a
+        timeout you cannot enforce is a comment.
         """
         proc = subprocess.Popen(
             cmd, cwd=self.s.vault, stdout=subprocess.PIPE,
@@ -934,13 +1017,16 @@ class ClaudeCodeShell(Shell):
         threading.Thread(target=drain, daemon=True).start()
 
         live = _Live()
-        deadline = time.time() + limit
+        # Reset by every line the child produces, parseable or not: a stray log
+        # line is not an answer, but it is proof the process is alive, which is
+        # the only thing this deadline is asking about.
+        last_seen = time.time()
         final, err = None, ""
         while True:
-            left = deadline - time.time()
+            left = (last_seen + idle) - time.time()
             if left <= 0:
                 proc.kill()
-                err = f"timed out after {limit}s"
+                err = f"stalled — no output for {idle}s"
                 break
             try:
                 line = lines.get(timeout=min(left, 1.0))
@@ -948,6 +1034,7 @@ class ClaudeCodeShell(Shell):
                 continue
             if line is None:                      # stdout closed: run is over
                 break
+            last_seen = time.time()
             line = line.strip()
             if not line:
                 continue
@@ -996,8 +1083,8 @@ class HermesShell(Shell):
             allow_writes: bool = False, timeout: int | None = None,
             model: str | None = None, effort: str | None = None,
             memory: str = "", agent: str = "v", tier_floor: str | None = None,
-            on_event: Progress = None) -> ShellResult:
-        del memory, on_event  # unverified sketch; see the class docstring
+            surface: str = "", on_event: Progress = None) -> ShellResult:
+        del memory, surface, on_event  # unverified sketch; see the docstring
         if not self.available:
             raise ShellUnavailable(
                 "the `hermes` CLI is not installed. Install it with:\n"
@@ -1014,7 +1101,7 @@ class HermesShell(Shell):
         try:
             proc = subprocess.run(cmd, cwd=self.s.vault, capture_output=True,
                                   text=True,
-                                  timeout=timeout or self.s.shell_timeout)
+                                  timeout=timeout or self.s.shell_idle)
         except subprocess.TimeoutExpired:
             return ShellResult("", self.name, ms=(time.time() - t0) * 1000,
                                error="timed out")

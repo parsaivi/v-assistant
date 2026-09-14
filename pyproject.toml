@@ -38,6 +38,15 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# `v hud` serves these three files off disk. They are data rather than modules
+# on purpose — a 600-line stylesheet inside a Python string is one no editor
+# will highlight — which also means the wheel drops them unless it is told.
+# `guard.settings.json` rides along for the same reason: `ClaudeCodeShell`
+# hands it to the CLI by path with `--settings`, so it has to exist on disk
+# beside the module in an installed copy, not only in the repo.
+[tool.setuptools.package-data]
+"v.core" = ["hud/*.html", "hud/*.css", "hud/*.js", "guard.settings.json"]
+
 # Tests live inside the package so they stay runnable as `python -m v.tests.x`
 # against an installed copy, but they are not part of the wheel.
 [tool.setuptools.exclude-package-data]

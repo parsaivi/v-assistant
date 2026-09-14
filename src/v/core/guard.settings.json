@@ -1,0 +1,37 @@
+{
+  "$comment": [
+    "The append-only half of the guard, for V's headless runs only.",
+    "",
+    "This used to live in the vault's `.claude/settings.json`, next to the",
+    "privacy half. That put it on every Claude Code session opened in the",
+    "vault, including Parsa's own interactive ones, which was never the",
+    "intent: the rules exist to keep *V* off the in-place edit path, not to",
+    "stop a human at the keyboard from writing a note.",
+    "",
+    "It cannot be split by setting source. `ClaudeCodeShell` runs with",
+    "`--setting-sources project,local`, and an interactive session loads",
+    "`user,project,local` — V's sources are a strict subset of Parsa's, so no",
+    "source exists that V reads and he does not. `--settings` is the way out:",
+    "it loads an *additional* file at highest precedence, and only V passes it.",
+    "",
+    "Why the rules are needed at all: `shells.HOST_WRITE_TOOLS` grants Write,",
+    "Edit and NotebookEdit on any writing run, so V can touch the scripts and",
+    "configs at the vault root. Nothing else stops those same tools from",
+    "rewriting a note in place — no `[bot]` commit, no `v undo`. These four",
+    "patterns are that stop. `tests/test_shell.py` and `tests/test_mcp.py`",
+    "assert they stay in agreement with the granted tool list and with the",
+    "numbered folders actually on disk.",
+    "",
+    "Scoped to the numbered vault folders rather than `**/*.md`, because the",
+    "broad pattern also caught developer docs — files that are code, not",
+    "notes, and have no append-only guarantee to protect."
+  ],
+  "permissions": {
+    "deny": [
+      "Write(./[0-9][0-9] - */**/*.md)",
+      "Edit(./[0-9][0-9] - */**/*.md)",
+      "Write(./[0-9][0-9] - */*.md)",
+      "Edit(./[0-9][0-9] - */*.md)"
+    ]
+  }
+}

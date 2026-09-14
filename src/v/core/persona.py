@@ -62,8 +62,15 @@ TUI = "tui"            # `v repl`, fancy or plain — a keyboard on this machine
 CLI = "cli"            # one-shot `v ask` / `v send`
 TELEGRAM = "telegram"  # a chat that anyone holding the account could send to
 PHONE = "phone"        # the Android client over mutual TLS
+# `v hud`, in a browser on this machine. Loopback-only, and still not `tui`:
+# a TTY is held by the person sitting at it, while a port on 127.0.0.1 is
+# reachable by every process on the box — a stray script, a page in another
+# tab. EDITH's whole justification is "physically at the terminal", so she is
+# refused here and V answers instead, which is exactly what `_agent_for`
+# already does for Telegram.
+HUD = "hud"
 SCHEDULER = "scheduler"  # nobody is present at all
-SURFACES = (TUI, CLI, TELEGRAM, PHONE, SCHEDULER)
+SURFACES = (TUI, CLI, TELEGRAM, PHONE, HUD, SCHEDULER)
 
 # Where a summons outlives the session. Only the terminal, and the asymmetry is
 # the point: on the phone the summons *is* the wake word, and the wake word
@@ -158,6 +165,17 @@ class Persona:
     # the damage is bounded — but "bounded" is doing less work here than
     # "Parsa is sitting in front of it when it happens".
     edits: bool = False
+    # …and *where* it may. Empty means "anywhere this agent is allowed to
+    # answer", which is what EDITH wants — she is already `surfaces=(TUI,)`,
+    # so the two gates would say the same thing twice.
+    #
+    # V is the case this field exists for. V answers everywhere, so `edits`
+    # alone would have handed `vault_rewrite` to whoever can send a Telegram
+    # message, and the guarantee being given up there is not "V might make a
+    # mistake" — it is that a message from a network Parsa does not control
+    # end to end could rewrite a note with nobody watching. Naming the
+    # surfaces keeps the capability where he is actually sitting.
+    edit_surfaces: tuple[str, ...] = ()
 
     @property
     def scope(self) -> str:
@@ -165,6 +183,18 @@ class Persona:
 
     def allows(self, surface: str) -> bool:
         return not self.surfaces or surface in self.surfaces
+
+    def may_edit(self, surface: str) -> bool:
+        """Whether this agent gets the edit tools on `surface`.
+
+        Two gates, both of which have to pass: the agent must be one that
+        edits at all, and the words must have arrived somewhere it is trusted
+        to. An unknown surface fails closed — a new front-end has to be added
+        to `edit_surfaces` deliberately, not inherit edit rights by existing.
+        """
+        if not self.edits:
+            return False
+        return not self.edit_surfaces or surface in self.edit_surfaces
 
     def line(self, flavour: str, *, name: str, **fields: object) -> str:
         """One smalltalk line, or the sign-off for anything unrecognised —
@@ -290,6 +320,15 @@ V = Persona(
     ),
     # No `surfaces` — V answers everywhere, and is what every other agent
     # falls back to when it may not.
+    #
+    # …which is exactly why `edit_surfaces` is not empty. V may modify an
+    # existing note, but only where Parsa is at the machine: the terminal and
+    # the HUD. Telegram and the phone stay append-only by construction, so a
+    # message arriving over either still cannot change a line he wrote. `cli`
+    # is deliberately not here — a one-shot `v ask` is what scripts and cron
+    # reach for, so it is not reliably a person at a keyboard.
+    edits=True,
+    edit_surfaces=(TUI, HUD),
     memory_scope="v",
     smalltalk={
         "greeting": "{when}, {address}. {tail} `/brief` for the rest.",

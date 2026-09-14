@@ -717,7 +717,7 @@ class Engine:
             voice_block = self.traits.block()
             if voice_block:
                 context = (context + "\n\n" if context else "") + voice_block
-            if self.persona.edits:
+            if self.persona.may_edit(self.surface):
                 # The system prompt tells every agent that writes are
                 # append-only and that nothing may touch existing prose. For
                 # this one agent that is no longer true, and the correction
@@ -727,9 +727,12 @@ class Engine:
                 context = (context + "\n\n" if context else "") + (
                     "Editing: you have `vault_edit`, `vault_set_meta` and "
                     "`vault_rewrite`, which the system prompt above says do "
-                    "not exist. They do, for you, because you only ever run "
-                    "at Parsa's own terminal. That paragraph is otherwise "
-                    "still correct — it is describing every other agent.\n"
+                    "not exist. They do, for you, on this surface "
+                    f"(`{self.surface}`), because Parsa is at the machine. "
+                    "That paragraph is otherwise still correct — it describes "
+                    "every other agent, and it describes you everywhere "
+                    "else: the same tools are absent when the question "
+                    "arrives over Telegram or the phone.\n"
                     "Read a note with `vault_read` in this same turn before "
                     "you edit it; never edit from what you remember of it "
                     "earlier in the conversation. Prefer `vault_set_meta` for "
@@ -779,6 +782,10 @@ class Engine:
             r = self.hermes.ask(question, memory=context,
                                 allow_writes=allow_writes,
                                 continue_=continue_,
+                                # Where the words came from, so the shell can
+                                # decide whether this agent gets the edit
+                                # tools here. See `Persona.may_edit`.
+                                surface=self.surface,
                                 # A floor, not a preference: an agent reached
                                 # deliberately and rarely should not be tiered
                                 # down to haiku for a question that merely
@@ -1175,11 +1182,8 @@ class Engine:
         1on1, update my goals and create a todo list" matched the noun "goals",
         printed a table of goal note titles in 0ms for $0, and stopped. Free
         and instant is only a virtue when the answer is right.
-
-        The agent gets the current task and calendar state up front so it
-        doesn't spend turns rediscovering what a SELECT already knows.
         """
-        state = self._working_state(now)
+        del now  # the state dump this used to print was its only reader
         # Writes are on for this path only. The router reached COMPOUND because
         # the message carries an action verb — "update", "create", "mark" — so
         # the user has asked for a change, and an agent that can only read
@@ -1190,13 +1194,16 @@ class Engine:
             text, evidence=self.rag.search(text), allow_writes=True, voice=voice)
         if escalated:
             return escalated
-        lines = []
-        if failure:
-            lines += [failure, ""]
-        lines += ["That needs more than a lookup — several things at once — "
-                  "and no model is available to do it. Here's the state it "
-                  "would have worked from:", "", state]
-        return Response("\n".join(lines), route="compound:unserved")
+        # Nothing but the reason. This used to print `_working_state` — the
+        # backlog shape, the top five tasks, the next seven days — on the
+        # theory that state was better than nothing. It is not: the question
+        # was "do the job I told you", and twenty lines of tasks answer a
+        # question nobody asked while burying the one line that matters. It
+        # also read as though the failure had been handled.
+        return Response(
+            failure or "That needs more than a lookup — several things at "
+                       "once — and no model is available to do it.",
+            route="compound:unserved")
 
     def _working_state(self, now: dt.datetime) -> str:
         s = self.q.tasks.backlog_shape(now.date())
@@ -1227,6 +1234,23 @@ class Engine:
                         data={"reminder_id": rem.id}, route="reminder")
 
     def due_reminders(self, now: dt.datetime | None = None) -> list[Response]:
+        """Everything due, as messages — and **nothing is marked fired here.**
+
+        This used to settle each reminder in the same loop that built its text,
+        which meant a push that failed afterwards — Telegram unreachable, an
+        SSE bus nobody was holding — left a row the table swore had been
+        delivered and no human had ever seen. `telegram.send_message` is
+        documented "best-effort — never raises" and returns `False`, so the
+        loss was silent by construction, and `pending()` (hence `v reminders`
+        and the HUD panel) hid the evidence because it filters on `fired IS
+        NULL`.
+
+        Composing and delivering are two different facts. Only the second one
+        is allowed to write to the row: `Scheduler._deliver` settles what its
+        sink confirms, and anything unconfirmed stays due and is retried on
+        the next one-minute tick. Late, never lost — which is what this
+        module's header has always claimed.
+        """
         out = []
         for rem in self.reminders.due_now(now):
             late = rem.overdue_by
@@ -1238,8 +1262,14 @@ class Engine:
                                 buttons=[Button("Snooze 30m", "snooze",
                                                 {"id": rem.id, "minutes": 30})],
                                 data={"reminder_id": rem.id}, route="reminder:fire"))
-            self.reminders.mark_fired(rem, now=now)
         return out
+
+    def settle_reminder(self, rid: int, now: dt.datetime | None = None) -> bool:
+        """Mark one reminder delivered, by id. Safe to call twice."""
+        rem = self.reminders.get(rid)
+        if rem is None:
+            return False
+        return self.reminders.settle(rem, now=now)
 
     # ---- questions the window refused --------------------------------
     def answer_deferred(self, now: dt.datetime | None = None) -> list[Response]:
@@ -1360,8 +1390,47 @@ class Engine:
 
     def nudge_digest(self) -> Response:
         items = self.nudges.all()
-        return Response(nudges.digest(items, max_items=12),
-                        data={"count": len(items)}, route="nudges")
+        off = self.nudges.silenced()
+        text = nudges.digest(items, max_items=12)
+        if off:
+            # Said every time, not just when the list is empty. A silence list
+            # nobody is reminded of is how "nothing needs you" quietly becomes
+            # a lie — the whole reason this is cheap to undo is that you can
+            # see it is there.
+            text += (f"\n\n_{len(off)} check{'s' if len(off) != 1 else ''} "
+                     f"silenced — `/nudges off` lists them, "
+                     f"`/nudges on <key>` brings one back._")
+        return Response(text, data={"count": len(items),
+                                    "silenced": len(off)}, route="nudges")
+
+    def nudge_silence(self, key: str, *, reason: str = "") -> Response:
+        """Stop volunteering one check. Touches no note, so there is nothing
+        for `v undo` to revert — `nudge_restore` is the undo."""
+        try:
+            self.nudges.silence(key, reason=reason)
+        except ValueError as exc:
+            return Response(str(exc), route="nudges", decision="refused")
+        return Response(f"Silenced `{key}`. I won't raise it again until you "
+                        f"restore it.", route="nudges")
+
+    def nudge_restore(self, key: str) -> Response:
+        if self.nudges.restore(key):
+            return Response(f"`{key}` is back in every list I build.",
+                            route="nudges")
+        return Response(f"`{key}` wasn't silenced.", route="nudges",
+                        decision="no-op")
+
+    def nudges_silenced(self) -> Response:
+        off = self.nudges.silenced()
+        if not off:
+            return Response("Nothing silenced. Every check is live.",
+                            data={"silenced": 0}, route="nudges")
+        lines = [f"⊗ `{s.key}`" + (f" — {s.text}" if s.text else "")
+                 + f"\n   silenced {s.at[:10]}"
+                 + (f" · {s.reason}" if s.reason else "")
+                 for s in off]
+        return Response("\n".join(lines), data={"silenced": len(off)},
+                        route="nudges")
 
     def evening(self, now: dt.datetime | None = None) -> Response:
         """Draft today's daily note from what actually happened. Confirm to write."""
@@ -1621,9 +1690,11 @@ def _shell_excuse(error: str) -> str:
     if "authenticate" in low or "oauth" in low or "expired" in low:
         return ("_The Claude Code session has expired — run `claude` once to "
                 "log back in. Falling back to local search._")
-    if "timed out" in low:
-        return ("_The agent timed out, so this is local search instead. A "
-                "narrower question usually gets through._")
+    if "stalled" in low or "timed out" in low:
+        # Not "it took too long" — a run is no longer stopped for being long,
+        # only for going silent, so saying "ask something narrower" would be
+        # advice against the wrong cause.
+        return "_The agent went quiet and was stopped. Nothing was written._"
     return f"_The agent couldn't run ({error.strip()[:120]}), so this is local search._"
 
 

@@ -682,6 +682,31 @@ def the_scheduler_sink_publishes_whatever_a_job_hands_it():
 
 
 @test
+def a_reminder_is_not_published_into_an_empty_room():
+    """The backlog is a reconnect buffer, not a mailbox — in memory, bounded,
+    and gone when the process restarts. Settling a reminder against it would
+    lose it for anyone whose phone simply wasn't running that morning, so with
+    no listener the sink declines and leaves the row due for the next tick."""
+    bus = httpapi.Broadcast()
+    sink = httpapi.build_sink(bus)
+    rem = FakeResponse(text="Dentist at four, sir.", route="reminder:fire",
+                       data={"reminder_id": 7})
+
+    ok(sink("reminders", rem) is False, "nobody is holding the socket")
+    eq(bus.subscribe().qsize(), 0, "and nothing was queued for a ghost")
+
+    q = bus.subscribe()
+    ok(sink("reminders", rem) is not False, "a live listener takes it")
+    eq(q.qsize(), 1)
+
+    # Everything that is not a reminder keeps the old behaviour: the backlog
+    # is exactly right for a brief a phone can pick up whenever it reconnects.
+    bus2 = httpapi.Broadcast()
+    httpapi.build_sink(bus2)("nudges", FakeResponse(text="Eleven days."))
+    eq(bus2.subscribe().qsize(), 1)
+
+
+@test
 def the_bind_address_is_never_a_wildcard():
     """mTLS stops a hostile client getting a request through, but it can still
     reach the port, and a port that answers is a port worth attacking."""

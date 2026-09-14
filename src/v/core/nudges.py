@@ -12,6 +12,7 @@ or review — which forces the question "am I allowed to act here?" at design ti
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -30,6 +31,17 @@ class Nudge:
     detail: str = ""
     links: list[str] = field(default_factory=list)
     cost: float = 0.0
+    #: What this instance is *about*, when one check speaks about many things.
+    #: `birthdays` emits one nudge per person and `stale_projects` one per
+    #: folder, all under the same `id`; without a discriminator, silencing one
+    #: birthday would silence every birthday. Empty for the checks that emit a
+    #: single nudge, where the id already names the whole subject.
+    subject: str = ""
+
+    @property
+    def key(self) -> str:
+        """What a silence is stored against. See `IGNORES_SCHEMA`."""
+        return f"{self.id}:{self.subject}" if self.subject else self.id
 
     def render(self, with_links: bool = True) -> str:
         icon = {0: "·", 1: "•", 2: "!", 3: "!!"}[self.urgency]
@@ -41,6 +53,49 @@ class Nudge:
         return out
 
 
+@dataclass
+class Silenced:
+    """One row of `nudge_ignores` — a decision, with the words that prompted
+    it kept so the list is readable months later."""
+    key: str
+    text: str
+    at: str
+    reason: str = ""
+
+
+# Keyed on `Nudge.key` — the check plus, where a check speaks about many
+# things, which one — and deliberately **not** on the nudge's text.
+#
+# The text is the part that moves: "No workout logged in 5 days" becomes six
+# days tomorrow, so a text-keyed silence would evaporate overnight and the
+# nudge would be back the morning after it was dismissed. That is the opposite
+# of the `task_ignores` decision next door, and for the opposite reason — a
+# task's text is what the user typed and never changes on its own, while a
+# nudge's text is a number the vault recomputes. Both key on the thing that
+# holds still.
+#
+# What it costs, stated because it is real: silencing `gym.gap` silences it at
+# every gap length, so a check dismissed at five days stays dismissed at
+# thirty. `ignored()` lists exactly what is hidden and `unignore` is one call
+# — the same two guarantees that made the task list's version survivable — and
+# nothing here is ever silenced by V, only by the user asking.
+IGNORES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS nudge_ignores (
+    key    TEXT PRIMARY KEY,
+    text   TEXT NOT NULL DEFAULT '',
+    at     TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT ''
+);
+"""
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Same standing as `task_ignores` and `memories`: a decision the user
+    made, held nowhere else, so it lives outside every table `v index --full`
+    is allowed to drop and refill."""
+    conn.executescript(IGNORES_SCHEMA)
+
+
 class NudgeEngine:
     """All checks are independent; one failing must never hide the rest."""
 
@@ -48,6 +103,12 @@ class NudgeEngine:
                  q: query.QueryEngine | None = None):
         self.s = settings or default_settings
         self.q = q or query.QueryEngine(self.s)
+        try:
+            ensure_schema(self.q.conn)
+        except sqlite3.Error:
+            # A read-only or half-built database must not stop the checks from
+            # running; it only means nothing can be silenced from here.
+            pass
 
     # Named so the count is quotable elsewhere without re-listing it. V
     # publishes "N vault-state checks" on its skills page, and that number
@@ -63,7 +124,15 @@ class NudgeEngine:
         "protein_shortfall", "weight_trend",
     )
 
-    def all(self, *, today: dt.date | None = None) -> list[Nudge]:
+    def all(self, *, today: dt.date | None = None,
+            include_silenced: bool = False) -> list[Nudge]:
+        """Every check, minus what the user has told V to stop bringing up.
+
+        The filter is here rather than in each surface because "stop showing
+        me this" has to mean everywhere — the brief, the digest, the HUD panel
+        and the Telegram push are all this one call. `include_silenced` exists
+        for the one screen whose job is to show what is hidden.
+        """
         today = today or dt.date.today()
         checks: list[Callable[[dt.date], list[Nudge]]] = [
             getattr(self, name) for name in self.CHECKS
@@ -75,8 +144,81 @@ class NudgeEngine:
             except Exception as exc:  # a broken check must not kill the brief
                 out.append(Nudge(f"error.{check.__name__}", NOTIFY, 0,
                                  f"nudge check '{check.__name__}' failed: {exc}"))
+        if not include_silenced:
+            # A check that *failed* is never silenceable: `error.*` keys are
+            # not offered to the user, so this can only ever hide a working
+            # check the user chose to hide.
+            off = self.silenced_keys()
+            if off:
+                out = [n for n in out if n.key not in off]
         out.sort(key=lambda n: -n.urgency)
         return out
+
+    # ---- silencing -----------------------------------------------------
+    def silenced(self) -> list[Silenced]:
+        """What is hidden, newest decision first."""
+        try:
+            rows = self.q.conn.execute(
+                "SELECT key, text, at, reason FROM nudge_ignores"
+                " ORDER BY at DESC").fetchall()
+        except sqlite3.Error:
+            return []
+        return [Silenced(r["key"], r["text"], r["at"], r["reason"] or "")
+                for r in rows]
+
+    def silenced_keys(self) -> set[str]:
+        try:
+            return {r[0] for r in
+                    self.q.conn.execute("SELECT key FROM nudge_ignores")}
+        except sqlite3.Error:
+            return set()
+
+    def silence(self, nudge: Nudge | str, *, text: str = "",
+                reason: str = "", now: dt.datetime | None = None) -> str:
+        """Stop volunteering this check. Writes nothing to the vault, and
+        changes no note — a nudge is a *reading* of the vault, so there is
+        nothing there to change. Returns the key `restore` takes back.
+
+        Re-silencing something already silenced refreshes the reason and the
+        timestamp rather than erroring: the second ask is the same intent as
+        the first.
+        """
+        key = nudge if isinstance(nudge, str) else nudge.key
+        key = key.strip()
+        if not key:
+            raise ValueError("nothing to silence — the nudge has no key")
+        if key.startswith("error."):
+            # A check that is crashing is a bug report, not a preference. It
+            # would also come back under a different key the moment the
+            # traceback changed, so silencing it is a promise V cannot keep.
+            raise ValueError("a failing check can't be silenced — fix it")
+        words = text or ("" if isinstance(nudge, str) else nudge.text)
+        if not words:
+            # Silenced by key — from `/api/nudge`, `v nudges --silence`, or a
+            # sentence. The key alone makes an unreadable silence list a month
+            # later (`uni.overdue:03 - University/Assignments/…`), so the
+            # sentence that was on screen is recovered while the check is
+            # still firing. Free: `all()` is SQL over the index either way.
+            try:
+                words = next((n.text for n in self.all(include_silenced=True)
+                              if n.key == key), "")
+            except Exception:
+                words = ""
+        self.q.conn.execute(
+            "INSERT OR REPLACE INTO nudge_ignores (key, text, at, reason)"
+            " VALUES (?,?,?,?)",
+            (key, words.strip(),
+             (now or dt.datetime.now()).isoformat(timespec="seconds"),
+             reason.strip()))
+        self.q.conn.commit()
+        return key
+
+    def restore(self, key: str) -> bool:
+        """Bring a check back. Returns whether anything was actually hidden."""
+        cur = self.q.conn.execute("DELETE FROM nudge_ignores WHERE key=?",
+                                  (key.strip(),))
+        self.q.conn.commit()
+        return cur.rowcount > 0
 
     # ---- gym ---------------------------------------------------------
     def gym_gap(self, today: dt.date, threshold: int = 5) -> list[Nudge]:
@@ -177,7 +319,8 @@ class NudgeEngine:
             if due_in < 0:
                 out.append(Nudge("uni.overdue", NOTIFY, 3,
                                  f"'{r.get('title')}' was due {-due_in} days ago "
-                                 f"and is still `{status}`.", links=[r.link()]))
+                                 f"and is still `{status}`.", links=[r.link()],
+                                 subject=r.rel))
             elif due_in <= within:
                 body = self.q.conn.execute(
                     "SELECT words FROM notes WHERE rel=?", (r.rel,)).fetchone()
@@ -186,7 +329,7 @@ class NudgeEngine:
                     "uni.due", NOTIFY, 3 if due_in <= 1 else 2,
                     f"'{r.get('title')}' due in {due_in} day(s).",
                     "the note is still essentially empty" if empty else "",
-                    [r.link()]))
+                    [r.link()], subject=r.rel))
         return out
 
     # ---- periodic ----------------------------------------------------
@@ -233,7 +376,8 @@ class NudgeEngine:
             d = r.extra["in_days"]
             when = "today" if d == 0 else "tomorrow" if d == 1 else f"in {d} days"
             out.append(Nudge("crm.birthday", NOTIFY, 3 if d <= 1 else 1,
-                             f"{r.title}'s birthday is {when}.", links=[r.link()]))
+                             f"{r.title}'s birthday is {when}.",
+                             links=[r.link()], subject=r.rel))
         return out
 
     # ---- vault hygiene ------------------------------------------------
@@ -370,7 +514,8 @@ class NudgeEngine:
             if row["m"] < cutoff:
                 age = int((dt.datetime.now().timestamp() - row["m"]) / 86400)
                 out.append(Nudge("project.stale", NOTIFY, 0,
-                                 f"{folder} hasn't been touched in {age} days."))
+                                 f"{folder} hasn't been touched in {age} days.",
+                                 subject=folder))
         return out
 
 

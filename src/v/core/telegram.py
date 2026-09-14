@@ -322,17 +322,23 @@ def build_sink(s: Settings):
     same as `Scheduler._default_sink` prints. This one just changes where the
     text goes, same contract, no job needs to know the difference.
     """
-    def sink(source: str, item) -> None:
+    def sink(source: str, item) -> bool:
+        """Returns False if anything here failed to reach Telegram, so that
+        `Scheduler._deliver` leaves the reminder due instead of settling a
+        message nobody received. `send_message` never raises and returns a
+        bool — this is the caller that finally reads it."""
         name, payload = item if isinstance(item, tuple) else (source, item)
         items = payload if isinstance(payload, list) else [payload]
+        ok = True
         for p in items:
             if p is None:
                 continue
             text = getattr(p, "render", lambda: str(p))()
             if not text or not text.strip():
                 continue
-            send_message(s, s.telegram_owner_id, text,
-                        buttons=getattr(p, "buttons", None))
+            ok = send_message(s, s.telegram_owner_id, text,
+                              buttons=getattr(p, "buttons", None)) and ok
+        return ok
     return sink
 
 

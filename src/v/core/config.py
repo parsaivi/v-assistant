@@ -275,21 +275,37 @@ class Settings:
     # no per-token bill. It draws on the same plan allowance as the chat app,
     # which is the real budget to watch on a Pro plan.
     shell_provider: str = "null"        # null | claude-code | hermes
-    shell_timeout: int = 300
-    # …but a flat ceiling is the wrong shape, and the log says so: four runs
-    # hit 300s and were thrown away whole, and one of them was a `light`
-    # question that should have been answered in fifteen seconds. A timeout is
-    # a statement about what "stuck" means, and that differs per tier — so the
-    # flat value above is now only the fallback for a tier not named here.
-    shell_timeout_trivial: int = 60
-    shell_timeout_light: int = 90
-    shell_timeout_normal: int = 240
-    shell_timeout_heavy: int = 600
+    # How long the run may say *nothing* before it counts as stuck — an idle
+    # deadline, not a ceiling on the whole run. A total ceiling cannot tell a
+    # run that is working from one that is hung, and the log is unambiguous
+    # about which one it kept killing: twelve runs died at their tier limit
+    # having emitted no text at all, every one of them mid-tool on real work,
+    # and the identical request re-sent minutes later finished in 83s. Under a
+    # streaming reader the distinction is free — a working run emits tool
+    # calls and message deltas continuously, a hung one emits nothing — so
+    # "stuck" is now measured as silence, and a long job is simply allowed to
+    # be long. `shell_idle` is the fallback for a tier not named here.
+    #
+    # Sized above the longest legitimate gap between events (one slow tool
+    # call), not above the length of the job.
+    shell_idle: int = 150
+    shell_idle_trivial: int = 45
+    shell_idle_light: int = 60
+    shell_idle_normal: int = 150
+    shell_idle_heavy: int = 240
     # A ceiling on one run, enforced by the CLI. Checked at the turn boundary,
     # so it stops a run that keeps going — the most expensive on record was
     # $0.92 over 16 turns, shopping for a desk mat — and cannot stop a single
     # expensive turn. Set to 0 to lift it.
     shell_max_budget_usd: float = 0.60
+    # A ceiling on the *day*, across every surface — the HUD's budget gauge
+    # fills against it. Not enforced: nothing refuses a turn for crossing it,
+    # because the one thing worse than an expensive Tuesday is V going silent
+    # in the middle of one. It is a number to notice, and the gauge turns
+    # amber at 80% of it. Read `hermes.jsonl`, so what fills it is plan
+    # allowance consumed — the figure that matters on a subscription, where
+    # `Response.cost` is 0.0 by design and would draw a permanently empty bar.
+    daily_budget_usd: float = 2.00
     # When the tier's model is overloaded or unavailable, drop to this rather
     # than failing the turn. Retried at the start of each user turn, so a
     # blip costs one cheap turn and not the conversation.

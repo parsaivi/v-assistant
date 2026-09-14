@@ -554,6 +554,15 @@ def build_sink_renders_and_sends_each_item():
             sink("nudges", ("nudges", "just a string"))
             sink("brag", ("brag", [None]))
             eq(len(sent), 2)
+
+            # The return value is what `Scheduler._deliver` settles on, so a
+            # send that Telegram refused has to come back False — otherwise a
+            # reminder is marked delivered on the strength of a dropped POST.
+            ok(sink("reminders", ("reminders", [Fake()])) is not False,
+               "a successful push reports success")
+            telegram.send_message = lambda s_, chat, text, **kw: False
+            ok(sink("reminders", ("reminders", [Fake()])) is False,
+               "a failed push must be reported, not swallowed")
         finally:
             telegram.send_message = orig
     finally:

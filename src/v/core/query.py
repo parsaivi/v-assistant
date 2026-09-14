@@ -128,6 +128,7 @@ class QueryEngine:
         self.conn = conn or index.connect(self.s)
         self._tasks = None
         self._calendar = None
+        self._weekplan = None
 
     # ---- primitives -------------------------------------------------
     def by_type(self, type_name: str, *, include_templates: bool = False,
@@ -851,6 +852,64 @@ class QueryEngine:
             answer = (f"{len(evs)} events between {day} and {end}" if evs
                       else f"Nothing scheduled between {day} and {end}.")
         return Result("events", rows, answer, ("date", "when", "what", "where"))
+
+    # ---- the week's shape --------------------------------------------
+    @property
+    def weekplan(self):
+        if self._weekplan is None:
+            from .weekplan import WeekPlan
+            self._weekplan = WeekPlan(self.s)
+        return self._weekplan
+
+    def schedule(self, day: dt.date | None = None, *, days: int = 1) -> Result:
+        """Hour-by-hour: what claims each day, calendar events folded in."""
+        from .weekplan import human_span
+        day = day or dt.date.today()
+        wp = self.weekplan
+        rows, total = [], 0
+        for i in range(max(1, days)):
+            d = day + dt.timedelta(days=i)
+            for b in wp.busy(d):
+                total += b.minutes
+                # `what` is the label alone: the kind is already its own
+                # column, and `gym │ gym` is a row that says one thing twice.
+                rows.append(Row(wp.week_rel(d), b.title, {},
+                                {"date": d.isoformat(), "when": b.time_label,
+                                 "kind": b.kind, "what": b.label or "—",
+                                 "where": b.location or "—"}))
+        if not rows:
+            label = "today" if day == dt.date.today() else day.isoformat()
+            answer = (f"Nothing scheduled {label} — the whole day is yours."
+                      if days == 1 else
+                      f"Nothing scheduled in the {days} days from {day}.")
+        else:
+            when = ("today" if days == 1 and day == dt.date.today()
+                    else day.isoformat())
+            answer = (f"{len(rows)} block{'s' if len(rows) != 1 else ''} "
+                      f"from {when} · {human_span(total)} spoken for")
+        return Result("schedule", rows, answer,
+                      ("date", "when", "kind", "what", "where"))
+
+    def free_time(self, day: dt.date | None = None, *, days: int = 1,
+                  min_minutes: int = 30) -> Result:
+        """The gaps — the question the calendar alone could never answer."""
+        from .weekplan import human_span
+        day = day or dt.date.today()
+        wp = self.weekplan
+        rows, total = [], 0
+        for i in range(max(1, days)):
+            d = day + dt.timedelta(days=i)
+            for g in wp.free(d, min_minutes=min_minutes):
+                total += g.minutes
+                rows.append(Row(wp.week_rel(d), g.render(), {},
+                                {"date": d.isoformat(),
+                                 "from": g.start.strftime("%H:%M"),
+                                 "to": g.end.strftime("%H:%M"),
+                                 "for": human_span(g.minutes)}))
+        answer = (f"{human_span(total)} free across {len(rows)} "
+                  f"slot{'s' if len(rows) != 1 else ''}" if rows
+                  else f"No free slot of {min_minutes}+ minutes.")
+        return Result("free", rows, answer, ("date", "from", "to", "for"))
 
     # ---- keyword search (FTS, still $0) ------------------------------
     def search(self, text: str, limit: int = 10) -> Result:

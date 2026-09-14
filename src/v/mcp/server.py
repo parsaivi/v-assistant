@@ -24,7 +24,10 @@ one.** The shell only ever gets text back from this whole process (see
 through. These tools do the entire job themselves: build a self-contained
 HTML file (`core/render.py`), save it, and open it in the browser. The model
 never sees the HTML and should not try to describe its contents — it just
-reports what it opened.
+reports what it opened. Saving also announces the artifact (`core/media.py`),
+so if the HUD is open it appears in its viewport at the same moment — again
+without the model being told, because a surface it cannot see is not
+something it should be reasoning about.
 """
 
 from __future__ import annotations
@@ -42,7 +45,8 @@ from ..core import mapsearch
 from ..core import memory as memory_mod
 from ..core import persona as persona_mod
 from ..core import traits as traits_mod
-from ..core import (contacts, index, notes, nudges as nudges_mod, query, rag,
+from ..core import (bazaar, contacts, index, jalali, notes,
+                    nudges as nudges_mod, query, rag,
                     reminders, render, schema, work)
 from ..core.config import settings as S
 from ..core.vaultfs import Vault, VaultError
@@ -360,11 +364,15 @@ def vault_standup() -> str:
         "  open       — all open commitments\n"
         "  overdue    — past their date\n"
         "  backlog    — the counts behind 'how far behind am I'\n"
-        "  search     — find a task by text (pass `text`)\n\n"
+        "  search     — find a task by text (pass `text`)\n"
+        "  ignored    — what Parsa has told V to stop bringing up\n\n"
         "Only real commitments are returned. Template checklists (MR review "
         "boxes), lesson-note bullets, and rituals repeated in every daily note "
         "are classified out; a task copied across several days is collapsed to "
-        "one. `day` is YYYY-MM-DD and defaults to today."
+        "one. Tasks Parsa has ignored are left out of every view except "
+        "`ignored` and `search` — that is deliberate, not a gap, and their "
+        "`- [ ]` lines are still in the notes. `day` is YYYY-MM-DD and "
+        "defaults to today."
     )
 )
 def vault_tasks(view: str = "priorities", text: str | None = None,
@@ -375,6 +383,18 @@ def vault_tasks(view: str = "priorities", text: str | None = None,
     if view == "backlog":
         r = e.q.backlog(when)
         return r.answer + "\n\n" + r.table(20)
+    if view == "ignored":
+        rows = e.q.tasks.ignored()
+        if not rows:
+            return "Nothing is ignored — V is tracking every task."
+        lines = [f"{len(rows)} ignored task{'s' if len(rows) != 1 else ''} — "
+                 "left out of every other view on purpose. "
+                 "vault_task_done(state='unignored') brings one back.", ""]
+        for i in rows:
+            live = f"hiding {i.live} open" if i.live else "no live copy left"
+            where = f" — {i.link()}" if i.rel else ""
+            lines.append(f"- {i.text} ({i.age_days()}d ago · {live}){where}")
+        return "\n".join(lines)
     if view == "search":
         if not text:
             return _err("view='search' needs `text`")
@@ -389,7 +409,7 @@ def vault_tasks(view: str = "priorities", text: str | None = None,
              "overdue": lambda: e.q.overdue_tasks(when, limit=limit)}
     if view not in kinds:
         return _err(f"unknown view {view!r}. Valid: "
-                    "priorities, open, overdue, backlog, search")
+                    "priorities, open, overdue, backlog, search, ignored")
     r = kinds[view]()
     if not r.rows:
         return r.answer
@@ -418,6 +438,225 @@ def vault_calendar(day: str | None = None, days: int = 1) -> str:
         return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
     r = E().q.events(when, days=days)
     return r.answer + ("\n\n" + r.table(30) if r.rows else "")
+
+
+# ------------------------------------------------------------------- the week --
+# Three read tools and one write, and they are deliberately not folded into the
+# calendar tools above. The calendar answers "what is scheduled"; these answer
+# "where do my hours go" — which is a different file, a different question, and
+# the only one of the two that can say what is *free*.
+@mcp.tool(
+    description=(
+        "Parsa's hour-by-hour schedule — where his time actually goes, from "
+        "the '## Schedule' section of that week's note at "
+        "'01 - Daily Notes/Weekly/YYYY/YYYY-Www.md'. One-off events from the "
+        "vault calendar are folded in, so this is the complete picture of a "
+        "day.\n\n"
+        "Each block has a kind: class · work · commute · gym · sleep · study · "
+        "paper · personal · event. Use this to answer 'am I in class now?', "
+        "'what does Tuesday look like?', 'how much am I working this week?'\n\n"
+        "`day` is YYYY-MM-DD (default today); `days` widens the window (7 for "
+        "the whole week). An empty result means that day is unscheduled, not "
+        "that there is no schedule."
+    )
+)
+def vault_schedule_week(day: str | None = None, days: int = 1) -> str:
+    when = notes.as_date(day) if day else dt.date.today()
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    r = E().q.schedule(when, days=days)
+    return r.answer + ("\n\n" + r.table(50) if r.rows else "")
+
+
+@mcp.tool(
+    description=(
+        "When Parsa is FREE — the gaps left after class, work, commute, gym, "
+        "sleep and every calendar event are subtracted from the waking day. "
+        "Nothing in the vault records free time; it is computed here.\n\n"
+        "This is the tool for 'when can I work on the paper?', 'do I have two "
+        "hours tomorrow?', 'when should we meet?'. Prefer it over reading the "
+        "schedule and doing the arithmetic yourself.\n\n"
+        "`day` is YYYY-MM-DD (default today), `days` widens the window, and "
+        "`min_minutes` sets the shortest gap worth reporting."
+    )
+)
+def vault_free_time(day: str | None = None, days: int = 1,
+                    min_minutes: int = 30) -> str:
+    when = notes.as_date(day) if day else dt.date.today()
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    r = E().q.free_time(when, days=days, min_minutes=min_minutes)
+    return r.answer + ("\n\n" + r.table(50) if r.rows else "")
+
+
+@mcp.tool(
+    description=(
+        "What Parsa is in the middle of right now, and how long until he is "
+        "free. Answers 'is he busy?', 'can he talk?' without reading a whole "
+        "day's schedule."
+    )
+)
+def vault_now() -> str:
+    wp = E().q.weekplan
+    now = dt.datetime.now()
+    block = wp.now_block(now)
+    if block:
+        out = f"now ({now:%H:%M}) · {block.render()}"
+        gap = wp.next_free(15, start=now)
+        if gap and gap.date == now.date():
+            out += f"\nfree from {gap.start:%H:%M}"
+        return out
+    gap = next((g for g in wp.free(now.date(), min_minutes=15,
+                                   after=now.time())), None)
+    if gap:
+        return (f"now ({now:%H:%M}) · nothing scheduled — free until "
+                f"{gap.end:%H:%M}")
+    return f"now ({now:%H:%M}) · nothing scheduled"
+
+
+@mcp.tool(
+    description=(
+        "Add a time block to a week's schedule — 'gym tuesday 19:00-20:30', "
+        "'class 2026-09-20 10:30-12:00 Compiler @204', 'paper friday "
+        "10:00-13:00'. Use this for TIME (a stretch of the day that is spoken "
+        "for), and vault_add_task for a TODO.\n\n"
+        "Recognises a kind (class · work · commute · gym · sleep · study · "
+        "paper · personal · event) anywhere in the text; the rest becomes the "
+        "label. Appends to that week's note only — other weeks are untouched, "
+        "which is the point of the design. Commits as [bot] and is undoable. "
+        "For something that should repeat every week, tell Parsa to add it to "
+        "'05 - Templates/Week Schedule.md' instead."
+    )
+)
+def vault_add_block(text: str) -> str:
+    from ..core import weekplan as wp_mod
+    block = wp_mod.parse_natural(text, today=dt.date.today())
+    if not block:
+        return _err("couldn't find a time in that. Try "
+                    "'gym tuesday 19:00-20:30'.")
+    e = E()
+    said = e.q.weekplan.add(block)
+    e.q.weekplan.sync_daily_note(block.date)
+    return f"{block.date.isoformat()} · {said}"
+
+
+# The two verbs that change a block that already exists. They are *edits*,
+# and they are deliberately not behind `Persona.edit_surfaces` with
+# `vault_edit`/`vault_rewrite`: those take arbitrary text and can touch any
+# line of any note, which is why they are gated to the machine Parsa is
+# sitting at. These take a date and a time, can only ever rewrite one line in
+# one `## Schedule` section, validate the kind against a closed vocabulary
+# before writing, and refuse a line they cannot find exactly once. "My class
+# was cancelled" is the single most obvious thing to say to V from a phone,
+# and it would be absurd for that to be the one thing it cannot do.
+@mcp.tool(
+    description=(
+        "Remove a time block from Parsa's schedule — a cancelled class, a "
+        "meeting that is off, a gym session he skipped.\n\n"
+        "`day` is the date the block is on (YYYY-MM-DD) and `at` is its start "
+        "time (HH:MM). Call vault_schedule_week first if you are not certain "
+        "of both — this refuses rather than guessing, and a wrong guess "
+        "deletes the wrong hour.\n\n"
+        "Writes one line out of that week's note, commits as [bot], and is "
+        "undoable with vault_undo. To cancel something only this once, this "
+        "is the right tool; to stop it repeating every week, tell Parsa to "
+        "edit '05 - Templates/Week Schedule.md' instead."
+    )
+)
+def vault_remove_block(day: str, at: str) -> str:
+    e = E()
+    when = notes.as_date(day)
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    found = _block_at(e, when, at)
+    if isinstance(found, str):
+        return found
+    try:
+        return e.q.weekplan.remove(when, found.line())
+    except Exception as exc:
+        return _err(str(exc))
+    finally:
+        e.q.weekplan.sync_daily_note(when)
+
+
+@mcp.tool(
+    description=(
+        "Move or change a time block that is already on the schedule — push a "
+        "meeting an hour later, shift a gym session to another day, rename it, "
+        "or change its kind.\n\n"
+        "`day` + `at` name the block as it stands now (call vault_schedule_week "
+        "if unsure). Everything else is optional and only what you pass is "
+        "changed: `to_day` (YYYY-MM-DD), `to_start`/`to_end` (HH:MM), `kind` "
+        "(class · work · commute · gym · sleep · study · paper · personal · "
+        "event), `label`.\n\n"
+        "Rewrites the line in place so the note stays in time order, commits "
+        "as [bot], and is undoable with vault_undo."
+    )
+)
+def vault_move_block(day: str, at: str, to_day: str | None = None,
+                     to_start: str | None = None, to_end: str | None = None,
+                     kind: str | None = None, label: str | None = None) -> str:
+    from ..core import weekplan as wp_mod
+    e = E()
+    when = notes.as_date(day)
+    if when is None:
+        return _err(f"couldn't read {day!r} as a date — use YYYY-MM-DD")
+    found = _block_at(e, when, at)
+    if isinstance(found, str):
+        return found
+
+    changes: dict = {}
+    if to_day:
+        moved = notes.as_date(to_day)
+        if moved is None:
+            return _err(f"couldn't read {to_day!r} as a date — use YYYY-MM-DD")
+        changes["date"] = moved
+    for key, raw in (("start", to_start), ("end", to_end)):
+        if raw:
+            parsed = wp_mod._parse_time(raw)
+            if parsed is None:
+                return _err(f"couldn't read {raw!r} as a time — use HH:MM")
+            changes[key] = parsed
+    if kind:
+        changes["kind"] = kind
+    if label is not None:
+        changes["label"] = label
+    if not changes:
+        return _err("nothing to change — pass to_day, to_start, to_end, "
+                    "kind or label")
+    try:
+        said = e.q.weekplan.move(when, found.line(), **changes)
+    except Exception as exc:
+        return _err(str(exc))
+    e.q.weekplan.sync_daily_note(when)
+    if changes.get("date") and changes["date"] != when:
+        e.q.weekplan.sync_daily_note(changes["date"])
+    return said
+
+
+def _block_at(engine, day: dt.date, at: str):
+    """The one block starting at `at` on `day`, or an error string saying why not.
+
+    Addressed by start time rather than by its written line, because a model
+    holding a whole line is a model that has to reproduce it byte-perfectly —
+    including the `·` separators and an `@location` it may not have been shown.
+    A time is what Parsa would say out loud.
+    """
+    from ..core import weekplan as wp_mod
+    want = wp_mod._parse_time(at or "")
+    if want is None:
+        return _err(f"couldn't read {at!r} as a time — use HH:MM")
+    on_day = [b for b in engine.q.weekplan.on(day) if b.start == want]
+    if not on_day:
+        listed = ", ".join(f"{b.time_label} {b.title}"
+                           for b in engine.q.weekplan.on(day)) or "nothing"
+        return _err(f"nothing starts at {at} on {day.isoformat()}. "
+                    f"That day has: {listed}.")
+    if len(on_day) > 1:
+        listed = ", ".join(f"{b.kind} {b.title}" for b in on_day)
+        return _err(f"{len(on_day)} blocks start at {at} on {day.isoformat()} "
+                    f"({listed}) — this tool can't tell which you mean.")
+    return on_day[0]
 
 
 # ------------------------------------------------------------------ contacts --
@@ -805,7 +1044,8 @@ def vault_chart(labels: list[str], values: list[float], kind: str = "bar",
                                           title=title, unit=unit)
     except ValueError as exc:
         return _err(str(exc))
-    path = render.save(page, slug=title or kind, settings=S)
+    path = render.save(page, slug=title or kind, title=title or f"{kind} chart",
+                       caption=f"{len(labels)} points · vault_chart", settings=S)
     render.open_file(path)
     sent = _send_to_telegram(path, caption=title)
     return (f"Opened a {kind} chart"
@@ -860,7 +1100,8 @@ def vault_trend(series: str, days: int = 14, month: str | None = None) -> str:
                         "carbs, fiber, category-spend")
     except ValueError as exc:
         return _err(str(exc))
-    path = render.save(page, slug=series, settings=S)
+    path = render.save(page, slug=series, title=f"{series} trend",
+                       caption=f"last {days} days · vault_trend", settings=S)
     render.open_file(path)
     sent = _send_to_telegram(path, caption=f"{series} trend")
     return (f"Opened the {series} trend in your browser ({path})."
@@ -901,7 +1142,8 @@ def vault_map(category: str | None = None, min_rating: int | None = None,
         page = render.place_html(points, web_key=S.neshan_web_key, title="Places")
     else:
         page = render.map_html(points, title="Places")
-    path = render.save(page, slug="places-map", settings=S)
+    path = render.save(page, slug="places-map", title="Places",
+                       caption=f"{len(points)} places · vault_map", settings=S)
     render.open_file(path)
     sent = _send_to_telegram(path, caption="Places")
     return (f"Opened a map of {len(points)} places in your browser ({path})."
@@ -941,10 +1183,16 @@ def vault_route(origin: str, destination: str, mode: str = "car") -> str:
     try:
         route = mapsearch.route((o_lat, o_lng), (d_lat, d_lng),
                                 origin_label=o_label, dest_label=d_label,
-                                mode=mode, settings=S)
+                                # The second number a person actually wants:
+                                # "33 minutes" is a fact, "33 minutes, 15 of
+                                # them road" is the reason to leave later.
+                                mode=mode, free_flow=True, settings=S)
     except mapsearch.MapSearchError as exc:
         return _err(str(exc))
     if route is None:
+        # `None` now means exactly one thing — no key. A route Neshan refuses
+        # raises instead and is reported above with Neshan's own words, so
+        # this line can no longer be printed about a key that is working.
         return (f"Routing isn't configured (no NESHAN_API_KEY), so there is "
                 f"no measured time from {o_label} to {d_label}. Say any "
                 f"number you give is an estimate, and don't call it a "
@@ -963,16 +1211,35 @@ def vault_route(origin: str, destination: str, mode: str = "car") -> str:
         png = None                      # static-map service not on the key
     sent = False
     if png:
-        png_path = render.save_bytes(png, slug=slug, settings=S)
+        png_path = render.save_bytes(
+            png, slug=slug, title=f"{o_label} → {d_label}",
+            caption=f"{route.distance_km} km · {route.duration_min} min "
+                    f"by {route.mode}", settings=S)
         sent = _send_to_telegram(
             png_path, caption=f"{o_label} → {d_label} · {route.distance_km} km, "
                               f"{route.duration_min} min")
 
     via = f" via {route.summary}" if route.summary else ""
+    # What was actually honoured, not what was asked for. Neshan refuses some
+    # cross-town Tehran routes outright with both restrictions on, so one may
+    # have been dropped to get an answer at all — and a زوج/فرد route quoted
+    # as if it avoided زوج/فرد is the one wrong sentence this tool can say.
+    if not route.relaxed:
+        avoided = "avoiding طرح ترافیک and زوج/فرد"
+    else:
+        why = route.relaxed_why or "Neshan had no route that did"
+        avoided = (f"avoiding طرح ترافیک; NOT avoiding {route.relaxed} — "
+                   f"{why}. Check the plate rule for today before treating "
+                   f"this as legal")
+    # Traffic as a number rather than an adjective. `duration` alone cannot
+    # say whether 33 minutes is a long way or a bad hour, and "leave now or
+    # leave at eight" is the question actually being asked.
+    delta = (f" — {route.duration_free_min} min of that is road, "
+             f"{route.traffic_min} min is traffic"
+             if route.traffic_min else "")
     return (f"{o_label} → {d_label}: {route.distance_km} km, "
             f"{route.duration_min} min by {route.mode}{via} (current "
-            f"traffic, avoiding طرح ترافیک and زوج/فرد). Opened it on the "
-            f"map."
+            f"traffic, {avoided}){delta}. Opened it on the map."
            + (" Sent it to Telegram too." if sent else ""))
 
 
@@ -1019,6 +1286,268 @@ def vault_places_search(term: str, anchor: str, limit: int = 8) -> str:
         cat = f" [{h.category}]" if h.category else ""
         lines.append(f"- {h.title}{cat}{addr} · {h.distance_km}km · "
                      f"{h.lat},{h.lng}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    description=(
+        "What is at a point, and — the part worth calling this for — whether "
+        "driving there is restricted today. Takes a place note's name "
+        "('Home', 'Divar', 'Omlet Sara', anything under 09 - .../Locations) "
+        "or a raw 'lat,lng'.\n\n"
+        "Returns the street address plus Tehran's two driving restrictions at "
+        "that point: طرح ترافیک (in_traffic_zone) and زوج/فرد "
+        "(in_odd_even_zone). NOTHING ELSE V CAN REACH KNOWS THESE — Google "
+        "Maps does not model either one — so for 'can I drive to X', 'is X in "
+        "the zone', 'do I need to check my plate', this is the only source "
+        "with an answer, and an answer given without it is a guess.\n\n"
+        "Two honest limits, both of which belong in what you say back: the "
+        "zone flags describe the *place*, not today's calendar — whether "
+        "زوج/فرد is enforced on a given date, and for which plate digit, is "
+        "not something this returns. And it names the street, not the "
+        "business: a café's address, not its opening hours."
+    )
+)
+def vault_address(place: str) -> str:
+    resolved = E().q.resolve_anchor(place)
+    if resolved is None:
+        return _err(f"don't know where {place!r} is — no place note by that "
+                    "name and it doesn't parse as \"lat,lng\" either.")
+    lat, lng, label = resolved
+    try:
+        found = mapsearch.reverse(lat, lng, settings=S)
+    except mapsearch.MapSearchError as exc:
+        return _err(str(exc))
+    if found is None:
+        return ("Reverse geocoding isn't configured (no NESHAN_API_KEY), so "
+                f"there is no address for {label}. Say so rather than "
+                "describing the area from memory.")
+    lines = [f"**{label}** — {found.address or found.route_name or 'no street name'}"]
+    where = " · ".join(x for x in (found.neighbourhood, found.city,
+                                   found.state) if x)
+    if where:
+        lines.append(f"  {where}")
+    lines.append(f"  {lat}, {lng}")
+    zones = found.zones
+    lines.append(f"  **Driving:** inside {zones} — check the plate rule for "
+                 f"today before driving in." if zones else
+                 "  **Driving:** outside both طرح ترافیک and زوج/فرد.")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    description=(
+        "An ADDRESS to coordinates — a street, a square, a district, with a "
+        "city on it: 'میدان ونک، تهران', 'تهران، خیابان ولیعصر'. Use it to "
+        "get the `location` field for a new place note.\n\n"
+        "DO NOT use it to look up a place by NAME. It is a street geocoder "
+        "matching words against a gazetteer, not a place finder, and given a "
+        "landmark it answers confidently with the wrong province: checked on "
+        "2026-09-09, 'دانشگاه صنعتی شریف' returns a point in استان فارس and "
+        "'برج میلاد تهران' one 70 km from the tower. The tool for 'where is "
+        "X' is vault_places_search, and if that reports its service is not "
+        "enabled, the honest answer is to say so and use WebSearch — NOT to "
+        "reach for this one instead.\n\n"
+        "Every result is verified by reverse-geocoding it back, so the "
+        "address actually found is in the reply. READ IT. If it names a city "
+        "or province you did not ask for, the lookup failed and the "
+        "coordinates are wrong, however plausible they look. Never write a "
+        "location into a note without showing Parsa the verified address "
+        "first."
+    )
+)
+def vault_geocode(address: str) -> str:
+    try:
+        found = mapsearch.geocode(address, settings=S)
+    except mapsearch.MapSearchError as exc:
+        return _err(str(exc))
+    if found is None:
+        return ("Geocoding isn't configured (no NESHAN_API_KEY), so there are "
+                f"no coordinates for {address!r}. Don't invent a pair.")
+    lines = [f"**{address}** →  `{found.lat}, {found.lng}`",
+             f"  Neshan places that at: {found.address or '(no street name)'}"]
+    where = " · ".join(x for x in (found.neighbourhood, found.city,
+                                   found.state) if x)
+    if where:
+        lines.append(f"  {where}")
+    if found.zones:
+        lines.append(f"  Inside {found.zones}.")
+    lines.append(f"  For a place note: `location: \"{found.lat},{found.lng}\"`")
+    lines.append("  Check the address above matches what was asked for before "
+                 "using these numbers.")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# The Iranian half of the world outside the vault: the calendar Parsa's year
+# is counted in, and the two marketplaces his money is spent in.
+
+
+@mcp.tool(
+    description=(
+        "The Persian (Jalali/Shamsi) date, and whether the country has the "
+        "day off. NOT vault_calendar — that one reads Parsa's own meetings; "
+        "this is the calendar itself.\n\n"
+        "Reach for it whenever a question is about the Persian date ('چندم "
+        "شهریوره', 'what's the date today'), about a day being off ('is "
+        "tomorrow a holiday', 'تعطیله فردا؟', 'can I book something for "
+        "Thursday'), or when you need the `jalali-month` value for a "
+        "Category Snapshot note — `month_key` in the reply is exactly that "
+        "field. Never convert a Jalali date in your head: the conversion "
+        "here is arithmetic that has been checked against 21,915 days and "
+        "the live service, and a remembered offset is off by a day at every "
+        "leap year.\n\n"
+        "`date` takes either calendar and works out which from the year — "
+        "'1405-06-18' and '2026-09-09' are the same day — plus 'today', "
+        "'tomorrow', 'yesterday'.\n\n"
+        "READ THE HOLIDAY LINE BEFORE ANSWERING. It has three states, not "
+        "two. 'holiday: unknown' means the service wasn't reachable and V "
+        "does NOT know — say that, and say Fridays are still known, rather "
+        "than reporting a working day. Events are what the day is marked "
+        "for; most of them are observances, not days off, so an event does "
+        "not imply a holiday."
+    )
+)
+def vault_jalali(date: str = "today") -> str:
+    try:
+        when = jalali.parse(date)
+    except ValueError as exc:
+        return _err(str(exc))
+    try:
+        day = jalali.lookup(when)
+    except jalali.CalendarError as exc:
+        # The date is still right — it never needed the network — so answer
+        # with it and be explicit about the half that is missing.
+        day = jalali.convert(when)
+        lines = [f"**{day.label}**  ·  {day.iso}  ·  {when.isoformat()}",
+                 f"  month_key (for a Category Snapshot): `{day.month_key}`",
+                 f"  Holiday: **unknown** — {exc}"]
+        if day.is_friday:
+            lines.append("  It is a Friday, so it is the weekend regardless.")
+        return "\n".join(lines)
+
+    lines = [f"**{day.label}**  ·  {day.iso}  ·  {when.isoformat()}",
+             f"  month_key (for a Category Snapshot): `{day.month_key}`"]
+    if day.holiday is None:
+        lines.append("  Holiday: **unknown** (the calendar service is off) — "
+                     + ("but it is a Friday, so it is off."
+                        if day.is_friday else "say so; don't assume it isn't."))
+    elif day.holiday:
+        why = "Friday — the weekend" if (day.is_friday and not day.events) else ""
+        lines.append(f"  **تعطیل — a day off.**{(' ' + why) if why else ''}")
+    else:
+        lines.append("  A working day.")
+    if day.events:
+        lines.append("  Marked: " + " · ".join(day.events))
+        lines.append("  (An event is not the same as a day off — the holiday "
+                     "line above is the one that answers that.)")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    description=(
+        "What something COSTS NEW, from Digikala — retail, in toman. The "
+        "vault records what Parsa spent; nothing in it knows what anything "
+        "is worth, so for 'is that a good price', 'how much is X', 'what "
+        "does a Y go for new', this is the source and vault_query is not.\n\n"
+        "Every price returned is **toman** (Digikala answers in rial; it is "
+        "divided by ten here), so a number from this drops straight into a "
+        "ledger line or a comparison against one without further "
+        "conversion.\n\n"
+        "For a SECOND-HAND price use vault_divar instead — they answer "
+        "different questions and a new-retail price is not what a used one "
+        "sells for.\n\n"
+        "This is Digikala's own front-end endpoint, not a documented public "
+        "API. It is keyless and it works, but say the price came from "
+        "Digikala just now rather than presenting it as a fact V holds, and "
+        "if it reports a failure do NOT fall back to a remembered price."
+    )
+)
+def vault_digikala(term: str, limit: int = 8) -> str:
+    try:
+        hits = bazaar.digikala(term, limit=max(1, min(limit, 20)))
+    except bazaar.BazaarError as exc:
+        return _err(str(exc))
+    if not hits:
+        return (f"Digikala has no results for {term!r}. That is the search "
+                f"finding nothing, not a failure — try a different wording "
+                f"(Persian usually beats English there) before concluding "
+                f"the thing doesn't exist.")
+    span = bazaar.price_range(hits)
+    head = f"**Digikala · {term!r} · {len(hits)} results** (live, in toman)"
+    if span and span[0] != span[1]:
+        head += (f"\n  Range: {bazaar.format_toman(span[0])} — "
+                 f"{bazaar.format_toman(span[1])}")
+    lines = [head]
+    for h in hits:
+        bits = [x for x in (h.note, h.where) if x]
+        tail = f" — {' · '.join(bits)}" if bits else ""
+        stock = "" if h.in_stock else " *(out of stock)*"
+        lines.append(f"- {bazaar.format_toman(h.price_toman)} · "
+                     f"{h.title}{stock}{tail}\n  {h.url}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    description=(
+        "What something SELLS FOR USED, from Divar's classifieds in one "
+        "city — in toman. The counterpart to vault_digikala: that one is "
+        "retail-new, this is the second-hand market, and for 'what's my old "
+        "X worth', 'what do people ask for a used Y', 'is this listing "
+        "overpriced' it is the only one of the two with an answer.\n\n"
+        "`city` is a Persian name or a slug ('تهران', 'tehran', 'مشهد') and "
+        "defaults to Tehran. It is deliberately one city: a used price is a "
+        "local fact, and a nationwide average is a number Parsa cannot act "
+        "on.\n\n"
+        "**No single listing is 'the price' — the RANGE is the answer**, "
+        "and the reply gives two of them. Listings marked SHOP are dealers "
+        "(فروشگاه), whose headline figure is often an instalment plan or a "
+        "starting price rather than what the item costs; the private-seller "
+        "range is the one to quote for 'what is this worth'. Say which one "
+        "you used.\n\n"
+        "This is the endpoint Divar's own app calls, not their documented "
+        "platform (that is Kenar, which attaches services to listings and "
+        "cannot search them). Keyless and working, but quote it as a live "
+        "lookup, and if it fails do not answer from memory."
+    )
+)
+def vault_divar(term: str, city: str = bazaar.DEFAULT_CITY,
+                limit: int = 8) -> str:
+    try:
+        hits = bazaar.divar(term, city=city, limit=max(1, min(limit, 25)))
+    except bazaar.BazaarError as exc:
+        return _err(str(exc))
+    if not hits:
+        return (f"Divar has no listings for {term!r} in {city}. Nothing is "
+                f"for sale under that wording right now — which is an "
+                f"answer, but try a different phrasing before treating it "
+                f"as one.")
+    everything = bazaar.price_range(hits)
+    private = bazaar.price_range(hits, private_only=True)
+    lines = [f"**Divar · {term!r} in {city} · {len(hits)} listings** "
+             f"(live, in toman)"]
+    rental = bazaar.looks_like_rental(hits)
+    if rental:
+        lines.append("  These are RENTALS. The range below is monthly رهن/"
+                     "اجاره, not what the properties cost, and each listing's "
+                     "ودیعه (deposit) is on its own line — a 100,000 T rent "
+                     "against a 4-billion deposit is a normal listing here, "
+                     "so never report the range as a price.")
+    if private:
+        lines.append(f"  Private sellers: {bazaar.format_toman(private[0])} — "
+                     f"{bazaar.format_toman(private[1])}  ← the going rate")
+    if everything and everything != private:
+        lines.append(f"  Including dealers: "
+                     f"{bazaar.format_toman(everything[0])} — "
+                     f"{bazaar.format_toman(everything[1])}")
+    if not everything:
+        lines.append("  Nothing here carried a readable price (توافقی, or a "
+                     "rental quoting two figures) — there is no range to give.")
+    for h in hits:
+        tag = "SHOP " if h.shop else ""
+        bits = [x for x in (h.note, h.where) if x]
+        tail = f" — {' · '.join(bits)}" if bits else ""
+        lines.append(f"- {tag}{h.price_text} · {h.title}{tail}\n  {h.url}")
     return "\n".join(lines)
 
 
@@ -1149,20 +1678,40 @@ def vault_create(rel: str, frontmatter: str, body: str = "") -> str:
         "vault_undo. This is the only way to close a task; Write and Edit are "
         "denied.\n\n"
         "state: done (default) · dropped (abandoned — struck through, not "
-        "deleted, so the record of having decided survives) · doing · open."
+        "deleted, so the record of having decided survives) · doing · open · "
+        "ignored · unignored.\n\n"
+        "`ignored` is the one that writes nothing to the vault: the checkbox "
+        "stays exactly as Parsa typed it and V stops counting, ranking or "
+        "mentioning it anywhere. Use it when he says a task is no longer "
+        "worth talking about, is stale, or should stop being brought up — "
+        "never `done`, which claims he did it, and prefer it over `dropped` "
+        "unless he wants the note itself to record that he gave up. "
+        "`unignored` undoes it."
     )
 )
 def vault_task_done(task_id: int, state: str = "done") -> str:
     import v.core.tasks as tasks_mod
     valid = {"done": tasks_mod.DONE, "dropped": tasks_mod.DROPPED,
              "doing": tasks_mod.DOING, "open": tasks_mod.OPEN}
-    if state not in valid:
-        return _err(f"unknown state {state!r}. Valid: {', '.join(valid)}")
+    if state not in valid and state not in ("ignored", "unignored"):
+        return _err(f"unknown state {state!r}. Valid: "
+                    f"{', '.join(list(valid) + ['ignored', 'unignored'])}")
     e = E()
     t = e.q.tasks.get(task_id)
     if not t:
         return _err(f"no task with id {task_id}. Use vault_tasks(view='search') "
                     "to find it — ids come from there.")
+    if state == "ignored":
+        if e.q.tasks.is_ignored(t):
+            return f"Already ignored: {t.text} — {t.link()}"
+        e.q.tasks.ignore(t, reason="asked")
+        return (f"Ignored: {t.text} — {t.link()}. The note is unchanged; it "
+                f"just stops appearing in priorities, overdue and the "
+                f"backlog. Say the words again to bring it back.")
+    if state == "unignored":
+        if not e.q.tasks.unignore(t.norm_key):
+            return f"Wasn't ignored: {t.text} — {t.link()}"
+        return f"Back in the lists: {t.text} — {t.link()}"
     if t.state == valid[state]:
         return f"Already {state}: {t.text} — {t.link()}"
     try:
@@ -1455,10 +2004,28 @@ def vault_voice_forget(trait_id: int, reason: str = "") -> str:
 
 
 def _may_edit() -> str:
-    """"" when the running agent may modify notes, else why not."""
-    agent = persona_mod.get(os.environ.get("V_AGENT", ""))
-    if agent.edits:
+    """"" when the running agent may modify notes here, else why not.
+
+    Two facts, not one: *who* is asking and *where from*. V edits at the
+    terminal and in the HUD and is append-only on Telegram and the phone, so a
+    gate that only knew the agent would read "this is V" and wave through a
+    rewrite requested by a chat message.
+    """
+    named = os.environ.get("V_AGENT", "").strip()
+    agent = persona_mod.get(named)
+    where = os.environ.get("V_SURFACE", "").strip()
+    # An unset `V_AGENT` means the server was started by something that did not
+    # say who was asking — `.mcp.json` launching it for a bare editor session,
+    # say. `persona.get("")` answers V, which is the right default for reading
+    # and the wrong one for editing, so an unnamed caller edits nothing.
+    if named and agent.may_edit(where):
         return ""
+    if agent.edits and where:
+        allowed = ", ".join(agent.edit_surfaces) or "nowhere"
+        return _err(
+            f"{agent.key} is append-only on {where}. Modifying a note that "
+            f"already exists is allowed from {allowed} only. Append with "
+            "vault_append, or ask Parsa to do it from the terminal.")
     return _err(
         f"{agent.key} is append-only. Modifying a note that already exists is "
         "EDITH's alone, and EDITH answers only at the terminal. Append to the "

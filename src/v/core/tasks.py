@@ -22,6 +22,25 @@ which is this vault.
 file, changes exactly one character range, and refuses to write if any other
 line moved. Ticking a box is the one structural edit worth making automatic;
 letting it silently reformat a hand-written note is not.
+
+**Not every task ends in the note.** A checkbox written in a daily note in
+July and never meant since is neither done nor dropped — it is over, and
+saying so should not require editing a note the user wrote by hand. That is
+what ignoring is: the line stays exactly as typed, and every list V generates
+skips it — the brief, the evening review, priorities, overdue, the backlog
+counts, the phone widget, and every answer V gives about tasks. It is the
+difference between a backlog and a graveyard, and it is reversible in one
+call.
+
+It is stored twice, and both halves are load-bearing. `task_ignores` is the
+**record**: a decision the user made, held nowhere else, which therefore has
+to outlive `v index --full` — so it sits outside the tables a rebuild wipes.
+`tasks.ignored` is the **flag**: the same fact denormalised onto every row it
+applies to, re-stamped by `apply_ignores` after every rebuild and by
+`replace_for_note` after every single-note resync. Keeping only the record
+would make "is this ignored?" a subquery that only the callers who remember
+it get right; keeping only the flag would lose the decision the first time a
+note was saved.
 """
 
 from __future__ import annotations
@@ -110,6 +129,7 @@ class Task:
     tags: list[str] = field(default_factory=list)
     kind: str = "task"     # task (a commitment) | reference (a checklist item)
     recurring: bool = False  # the same checkbox appears across many notes
+    ignored: bool = False    # the user said to stop bringing this one up
     carried: int = 1       # how many notes hold this same task (set by collapse)
     first_seen: dt.date | None = None
 
@@ -119,7 +139,11 @@ class Task:
 
     @property
     def norm_key(self) -> str:
-        return normalise_text(self.text) or self.text.lower()
+        # Delegated rather than repeated: this, `ignore_key` and `NORM_SQL`
+        # are one rule written three times, and the silence list is keyed on
+        # it — two of them drifting apart means an ignore written through one
+        # path is invisible to the other.
+        return ignore_key(self.text)
 
     @property
     def effective_date(self) -> dt.date | None:
@@ -219,6 +243,43 @@ class Task:
         """Open, undated, and older than two months — a backlog problem rather
         than a to-do. Surfaced as a count, not as a recommendation."""
         return self.is_open and not self.due and (self.age_days() or 0) > 60
+
+
+@dataclass
+class Ignored:
+    """One entry on the silence list.
+
+    `live` is the part worth having: how many open checkboxes this entry is
+    hiding *right now*. Without it the list is a set of phrases with no way to
+    tell a silenced task that is still written in three daily notes from one
+    whose note was deleted in June — and the second kind should be forgotten,
+    not kept forever in a list the user has to read.
+    """
+
+    norm: str
+    text: str
+    rel: str = ""
+    at: dt.datetime | None = None
+    reason: str = ""
+    live: int = 0
+
+    def age_days(self, now: dt.datetime | None = None) -> int:
+        if not self.at:
+            return 0
+        return max(0, ((now or dt.datetime.now()) - self.at).days)
+
+    def link(self) -> str:
+        if not self.rel:
+            return ""
+        stem = self.rel[:-3] if self.rel.endswith(".md") else self.rel
+        return f"[[{stem}]]"
+
+
+def ignore_key(text: str) -> str:
+    """The silence list's key for a phrase, whether it came from a parsed task
+    or from someone typing `v tasks --ignore "call the bank"`. Mirrors
+    `Task.norm_key`; see `NORM_SQL` for the SQL half of the same rule."""
+    return normalise_text(text) or text.strip().lower()
 
 
 # Task ids must survive a JSON round-trip through the MCP layer. JSON numbers
@@ -401,7 +462,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     tags      TEXT,
     norm      TEXT,
     kind      TEXT DEFAULT 'task',
-    recurring INTEGER DEFAULT 0
+    recurring INTEGER DEFAULT 0,
+    ignored   INTEGER DEFAULT 0
 );
 """
 
@@ -413,6 +475,49 @@ CREATE INDEX IF NOT EXISTS idx_tasks_rel   ON tasks(rel);
 CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_tasks_due   ON tasks(due);
 CREATE INDEX IF NOT EXISTS idx_tasks_norm  ON tasks(norm);
+CREATE INDEX IF NOT EXISTS idx_tasks_ign   ON tasks(ignored);
+"""
+
+#: The identity of a task, in SQL, matching `Task.norm_key` character for
+#: character. A checkbox whose text normalises to nothing — `- [ ] !!!` —
+#: falls back to its own lowercased text, and the Python property and this
+#: expression have to agree, or an ignore written through one is invisible to
+#: the other and the task comes back.
+NORM_SQL = "COALESCE(NULLIF(norm, ''), LOWER(text))"
+
+# Ignoring: the third answer to a task, after done and dropped.
+#
+# This vault accumulates checkboxes that were never decisions. A line written
+# in a daily note in July is still open in September, still ranked, still
+# counted in "how far behind am I", and still asked about — because nothing in
+# the system can represent *this one is over and I am not going to do it*.
+# `done` is a lie about it. `dropped` is honest but writes `- [-]` into a note
+# the user wrote by hand, which is a change he may not want and which he has
+# to make one note at a time. So there is a third answer, and this table is
+# it: the checkbox stays exactly as typed, and every list V generates skips it.
+#
+# **Keyed on the normalised text, not the task id.** An id is
+# `blake2b(rel|line)`, so it changes the moment a line moves inside its note —
+# an id-keyed ignore would evaporate on the next edit, silently, which is the
+# worst way for a silence list to fail. `norm` is also what `collapse()`
+# already treats as task identity, which buys the behaviour you want for
+# free: ignoring a task ignores the four copies of it carried forward into
+# four daily notes, because they were always one task.
+#
+# The cost of that choice, stated because it is real: writing the same words
+# again next month is ignored too. Three things make that survivable and were
+# the reason for choosing it anyway — `ignored()` lists exactly what is being
+# hidden and what it is hiding, un-ignoring is one call, and `find()` still
+# returns an ignored task when the user names it. The filter hides tasks from
+# lists V volunteers, never from a question that asks for one.
+IGNORES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS task_ignores (
+    norm   TEXT PRIMARY KEY,
+    text   TEXT NOT NULL,
+    rel    TEXT NOT NULL DEFAULT '',
+    at     TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT ''
+);
 """
 
 # How many distinct notes must carry the identical checkbox before it stops
@@ -429,10 +534,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # from being mandatory after an upgrade.
     have = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     for col, decl in (("norm", "TEXT"), ("kind", "TEXT DEFAULT 'task'"),
-                      ("recurring", "INTEGER DEFAULT 0")):
+                      ("recurring", "INTEGER DEFAULT 0"),
+                      ("ignored", "INTEGER DEFAULT 0")):
         if col not in have:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
     conn.executescript(INDEXES)
+    # Deliberately *not* in `SCHEMA`: everything above is a mirror of the
+    # Markdown and a rebuild may drop and refill it at will. This one is the
+    # user's own decision, held nowhere else — the same standing as the
+    # `memories` table it shares a database file with — so it has to survive
+    # `v index --full`, which is exactly what keeping it out of the derived
+    # tables' rebuild path means.
+    conn.executescript(IGNORES_SCHEMA)
 
 
 def classify_recurring(conn: sqlite3.Connection,
@@ -460,22 +573,59 @@ def classify_recurring(conn: sqlite3.Connection,
     return n
 
 
+def apply_ignores(conn: sqlite3.Connection) -> int:
+    """Stamp the silence list onto the mirror.
+
+    Two storage locations for one fact, and both are load-bearing:
+
+    `task_ignores` is the **record** — a decision the user made, which nothing
+    else holds and which therefore has to outlive `v index --full`. The
+    `tasks` table is a mirror of the Markdown; a rebuild deletes and refills
+    it, so a decision kept only there would evaporate the first time a note
+    was re-read.
+
+    `tasks.ignored` is the **flag** — the same fact denormalised onto every
+    row it applies to, recomputed here after every rebuild and every
+    single-note resync, exactly the way `classify_recurring` recomputes
+    `recurring`. Without it "is this ignored?" is a correlated subquery that
+    only the queries which remember to write it get right, and the guarantee
+    the user asked for — that an ignored task is gone from *everything*,
+    briefs and answers included — would rest on every future caller
+    remembering. With it, a task carries its own answer, and code that reads
+    the table directly cannot accidentally opt out.
+
+    Returns how many rows are now flagged.
+    """
+    conn.execute("UPDATE tasks SET ignored=0")
+    conn.execute(
+        f"UPDATE tasks SET ignored=1 WHERE {NORM_SQL} IN"
+        " (SELECT norm FROM task_ignores)")
+    n = conn.execute("SELECT COUNT(*) FROM tasks WHERE ignored=1").fetchone()[0]
+    conn.commit()
+    return n
+
+
 def replace_for_note(conn: sqlite3.Connection, rel: str,
                      tasks: Iterable[Task]) -> int:
     conn.execute("DELETE FROM tasks WHERE rel=?", (rel,))
+    # Re-read for every note rather than joined at query time: a note being
+    # re-indexed is the exact moment a silenced task would come back, because
+    # its row is being recreated from Markdown that knows nothing about the
+    # decision. Cheap — the silence list is tens of rows, not thousands.
+    silenced = {r[0] for r in conn.execute("SELECT norm FROM task_ignores")}
     n = 0
     for t in tasks:
         conn.execute(
             "INSERT OR REPLACE INTO tasks"
             " (id, rel, line, state, text, raw, section, area, due, done_on,"
-            "  note_date, priority, tags, norm, kind, recurring)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "  note_date, priority, tags, norm, kind, recurring, ignored)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (t.id, t.rel, t.line, t.state, t.text, t.raw, t.section, t.area,
              t.due.isoformat() if t.due else None,
              t.done_on.isoformat() if t.done_on else None,
              t.note_date.isoformat() if t.note_date else None,
              t.priority, ",".join(t.tags), normalise_text(t.text), t.kind,
-             int(t.recurring)))
+             int(t.recurring), int(t.norm_key in silenced)))
         n += 1
     return n
 
@@ -494,6 +644,7 @@ def _from_row(r: sqlite3.Row) -> Task:
         tags=[t for t in (r["tags"] or "").split(",") if t],
         kind=(r["kind"] if "kind" in r.keys() else None) or TASK,
         recurring=bool(r["recurring"] if "recurring" in r.keys() else 0),
+        ignored=bool(r["ignored"] if "ignored" in r.keys() else 0),
     )
 
 
@@ -589,13 +740,24 @@ class TaskStore:
 
     def open(self, *, area: str | None = None, folder: str | None = None,
              include_doing: bool = True,
-             include_recurring: bool = False) -> list[Task]:
+             include_recurring: bool = False,
+             include_ignored: bool = False) -> list[Task]:
         states = (OPEN, DOING) if include_doing else (OPEN,)
         where = f"state IN ({','.join('?' * len(states))})"
         params: list = list(states)
         if not include_recurring:
             where += " AND kind=? AND recurring=0"
             params.append(TASK)
+        # A column read, not a subquery against `task_ignores`, because the
+        # flag is stamped onto the row by `apply_ignores` — see its docstring
+        # for why the fact is stored twice. Every ranked, counted or
+        # volunteered task in this package reaches the vault through this one
+        # method (`priorities`, `overdue`, `backlog_shape`, `due_on`,
+        # `due_by`, and through them the brief, the evening review, the phone
+        # widget and every answer V gives about tasks), so this clause is the
+        # whole of "and stop bringing it up everywhere".
+        if not include_ignored:
+            where += " AND ignored=0"
         if area:
             where += " AND LOWER(area)=?"
             params.append(area.lower())
@@ -678,6 +840,10 @@ class TaskStore:
             "closed_last_7": len([t for t in self.done()
                                   if (t.done_on or t.note_date or dt.date.min)
                                   >= week_ago]),
+            # Counted and shown rather than left implicit: a backlog that
+            # looks healthy because 40 tasks were silenced is a number worth
+            # being able to argue with.
+            "ignored": len(self.ignored()),
             "by_area": _count_by(rows, "area"),
         }
 
@@ -692,11 +858,123 @@ class TaskStore:
     def find(self, text: str, *, limit: int = 5,
              threshold: float = 0.45,
              open_only: bool = True) -> list[tuple[Task, float]]:
-        pool = self.open() if open_only else self.all()
+        # `include_ignored` here and nowhere else. Ignoring a task means V
+        # stops volunteering it; it does not mean V pretends not to know it
+        # when Parsa types its name. "mark the bank thing done" has to find a
+        # silenced task, or the only way back from an ignore is the HUD.
+        pool = self.open(include_ignored=True) if open_only else self.all()
         scored = [(t, match_score(text, t)) for t in pool]
         scored = [(t, sc) for t, sc in scored if sc >= threshold]
         scored.sort(key=lambda p: (-p[1], p[0].rel))
         return scored[:limit]
+
+    # ---- the silence list -------------------------------------------
+    def ignored(self) -> list[Ignored]:
+        """Everything V has been told to stop bringing up, newest first.
+
+        One grouped query for `live` rather than one per row: this list is
+        rendered on a surface that polls, and N+1 queries over a table of a
+        few thousand checkboxes is how a free panel stops being free.
+        """
+        # The same population `open()` would have returned — commitments,
+        # not rituals or checklist bullets. Counting every checkbox instead
+        # made the number larger than the number of tasks the entry is
+        # actually keeping off the screen, which is the only thing it is for.
+        live: dict[str, int] = {
+            r["norm"]: r["n"] for r in self.conn.execute(
+                f"SELECT {NORM_SQL} AS norm, COUNT(*) AS n FROM tasks"
+                " WHERE state IN ('open','doing') AND kind=? AND recurring=0"
+                " GROUP BY 1", (TASK,))}
+        # Deliberately not filtered on `ignored`: these are the rows the entry
+        # is hiding, so of course they are flagged.
+        out = []
+        for r in self.conn.execute(
+                "SELECT * FROM task_ignores ORDER BY at DESC"):
+            try:
+                at = dt.datetime.fromisoformat(r["at"])
+            except (TypeError, ValueError):
+                at = None
+            out.append(Ignored(norm=r["norm"], text=r["text"],
+                               rel=r["rel"] or "", at=at,
+                               reason=r["reason"] or "",
+                               live=live.get(r["norm"], 0)))
+        return out
+
+    def ignored_keys(self) -> set[str]:
+        return {r[0] for r in self.conn.execute("SELECT norm FROM task_ignores")}
+
+    def is_ignored(self, task: Task) -> bool:
+        # The record, not the flag: `task` may have been read before the last
+        # `apply_ignores`, and the question being asked is "did the user
+        # silence this?", which only `task_ignores` can answer for certain.
+        return bool(self.conn.execute(
+            "SELECT 1 FROM task_ignores WHERE norm=?",
+            (task.norm_key,)).fetchone())
+
+    def ignore(self, task: Task | str, *, reason: str = "",
+               rel: str = "", now: dt.datetime | None = None) -> str:
+        """Stop volunteering this task. Writes nothing to the vault.
+
+        That is the entire point and the reason this is not `complete(state=
+        DROPPED)`: the note keeps the line exactly as the user typed it, so
+        the record of what he was thinking in July survives, and V stops
+        counting it against him in September. Returns the key, which is what
+        `unignore` takes back.
+
+        Re-ignoring an already-ignored task is not an error — it refreshes the
+        reason and the timestamp. `INSERT OR REPLACE` rather than a lookup and
+        a branch, because the second write is the same intent as the first.
+        """
+        text = task if isinstance(task, str) else task.text
+        key = ignore_key(text)
+        if not key:
+            raise ValueError("nothing to ignore — the task has no text")
+        where = rel or ("" if isinstance(task, str) else task.rel)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO task_ignores (norm, text, rel, at, reason)"
+            " VALUES (?,?,?,?,?)",
+            (key, text.strip(), where,
+             (now or dt.datetime.now()).isoformat(timespec="seconds"),
+             reason.strip()))
+        # Stamped now as well as on the next rebuild: the next question is
+        # usually the same question, and a decision that only takes effect
+        # after a re-index is a decision the user watches get ignored.
+        self.conn.execute(f"UPDATE tasks SET ignored=1 WHERE {NORM_SQL}=?",
+                          (key,))
+        self.conn.commit()
+        return key
+
+    def find_ignored(self, text: str, *,
+                     threshold: float = 0.45) -> list[tuple[Ignored, float]]:
+        """Which silenced entries a phrase names.
+
+        `ignore` takes a fuzzy name — it goes through `find()` — so `unignore`
+        has to as well, or the door only opens one way: a task silenced by
+        typing four of its words could only be brought back by reproducing its
+        text exactly, misspellings and all. Scored with `match_score`, the
+        same function that found the task in the first place.
+        """
+        probe = Task(0, "", 0, OPEN, "", "")
+        scored = []
+        for i in self.ignored():
+            probe.text = i.text
+            sc = match_score(text, probe)
+            if sc >= threshold:
+                scored.append((i, sc))
+        scored.sort(key=lambda p: -p[1])
+        return scored
+
+    def unignore(self, key: str) -> bool:
+        """Bring a task back. Takes either the stored key or the phrase itself,
+        because the HUD hands back the key it was given and a person at a
+        terminal types the words."""
+        keys = (key, ignore_key(key))
+        cur = self.conn.execute("DELETE FROM task_ignores WHERE norm IN (?,?)",
+                                keys)
+        self.conn.execute(
+            f"UPDATE tasks SET ignored=0 WHERE {NORM_SQL} IN (?,?)", keys)
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def get(self, task_id: int) -> Task | None:
         r = self.conn.execute("SELECT * FROM tasks WHERE id=?",
@@ -754,6 +1032,17 @@ class TaskStore:
             (state, new_line,
              (today or dt.date.today()).isoformat() if state == DONE else None,
              task.id))
+        # A task that reached the note has been answered in the note, so the
+        # silence list has nothing left to say about it. Leaving the entry
+        # behind would be invisible and wrong later, not now: writing the same
+        # words again next month would land pre-ignored by a decision made
+        # about a checkbox that has since been ticked.
+        if state in (DONE, DROPPED):
+            self.conn.execute("DELETE FROM task_ignores WHERE norm=?",
+                              (task.norm_key,))
+            self.conn.execute(
+                f"UPDATE tasks SET ignored=0 WHERE {NORM_SQL}=?",
+                (task.norm_key,))
         self.conn.commit()
         # The row is right, but `notes.mtime` is now behind the file, so
         # `is_stale()` would order a full rebuild on the next startup for a
