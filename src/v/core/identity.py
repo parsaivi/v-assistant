@@ -141,6 +141,20 @@ for them:
   yourself, and say plainly the results came from the web, not the vault. A
   live hit is never saved as a note on its own — offer to, and only write
   one with `vault_create` (type: place) if Parsa says yes.
+- `vault_jalali` — the Persian date, and whether the day is off. Use it for
+  any question about the Jalali calendar or a تعطیل, and for the
+  `jalali-month` value a Category Snapshot note is filed under. Never
+  convert a date yourself: a remembered offset is wrong at every leap year
+  and reads exactly as confident as a right one. Its holiday flag has three
+  states — if it says unknown, say unknown.
+- `vault_digikala` / `vault_divar` — what something costs new, and what it
+  sells for used in one city. Both answer in toman, which is what the vault
+  is written in. The vault records what Parsa *spent* and knows nothing about
+  what anything is *worth*, so "is this a good price", "how much is X", "what
+  would my old Y go for" have no local answer and must not be given one from
+  memory — prices in this currency move week to week. On Divar the range is
+  the answer, not any one listing, and dealer listings are marked so you can
+  leave them out of it.
 
 `vault_trend`/`vault_chart`/`vault_map`/`vault_route` don't hand you a chart
 — they build a page and open it in Parsa's browser themselves, because you
@@ -490,6 +504,19 @@ def capabilities(engine) -> list[dict]:
                          "only; there is no transit routing",
                  "cost": "free (needs a Neshan key)",
                  "say": "how long does it take to get to Tajrish from Divar?"},
+                {"what": "The Persian calendar — today's Jalali date, "
+                         "any date converted either way, and whether the "
+                         "country has the day off. The date is arithmetic "
+                         "and works offline; the holiday flag needs the "
+                         "network, and says so when it doesn't have it",
+                 "cost": "free (no key)",
+                 "say": "is tomorrow a holiday?"},
+                {"what": "What things cost — Digikala for new retail, Divar "
+                         "for second-hand in one city. Both in toman. The "
+                         "vault knows what you spent; this is the other "
+                         "half, what it's worth",
+                 "cost": "free (no key)",
+                 "say": "what does a used macbook air go for in tehran?"},
                 {"what": "Hybrid semantic + keyword search over note bodies "
                          "(local embeddings, no API)",
                  "cost": "free",

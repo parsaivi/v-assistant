@@ -18,6 +18,9 @@ import os
 # decider ships enabled, and every fixture here builds a real
 # Settings, so this has to be set before v.core is imported.
 os.environ["BRAIN_NO_MODEL"] = "1"
+# …and never reach the Persian calendar service. The two tests that exercise
+# that path set this themselves; nothing else here should touch the network.
+os.environ["BRAIN_NO_JALALI"] = "1"
 import shutil
 import sys
 import tempfile
@@ -599,6 +602,112 @@ def the_scheduler_last_run_is_readable_without_an_engine():
            "a corrupt state file must not take the tool down with it")
     finally:
         shutil.rmtree(root)
+
+
+# --- the Persian calendar and the marketplaces ------------------------
+@test
+def the_outward_lookups_are_registered_and_say_what_they_are_not():
+    """Three tools that leave the machine, and the thing each one must say
+    about itself. The calendar is not `vault_calendar` (that reads Parsa's
+    own meetings); the two marketplaces are not documented APIs and their
+    answers are live lookups, not facts V holds. A description that drops
+    those is how a model ends up quoting a remembered Iranian price as
+    though it had checked — in a currency that moves week to week."""
+    tools = {t.name: (t.description or "")
+             for t in asyncio.run(srv.mcp.list_tools())}
+    for name in ("vault_jalali", "vault_digikala", "vault_divar"):
+        ok(name in tools, f"{name} is not registered")
+    ok("NOT vault_calendar" in tools["vault_jalali"],
+       "it has to disown the tool it will otherwise be confused with")
+    ok("three states" in tools["vault_jalali"],
+       "and say the holiday flag can be unknown")
+    ok("toman" in tools["vault_digikala"] and "rial" in tools["vault_digikala"],
+       "the currency the vault is in, and the one Digikala answers in")
+    ok("not a documented public API" in tools["vault_digikala"])
+    ok("Kenar" in tools["vault_divar"],
+       "Divar's supported platform is a different thing and cannot search")
+    for name in ("vault_digikala", "vault_divar"):
+        ok("from memory" in tools[name] or "remembered" in tools[name],
+           f"{name} must forbid answering from memory on a failure")
+
+
+@test
+def an_unreachable_calendar_still_answers_with_the_date():
+    """The split in `jalali.py` earns its keep at this layer: the date is
+    arithmetic, so a dead service costs the holiday flag and nothing else.
+    The reply has to carry the date *and* say the flag is missing — reporting
+    a working day because a request timed out is the failure worth a test."""
+    import unittest.mock as mock
+    import httpx as httpx_mod
+    with mock.patch.dict(os.environ, {srv.jalali.NO_NETWORK_ENV: ""}), \
+            mock.patch("httpx.get",
+                       side_effect=httpx_mod.ConnectError("no route")):
+        out = call("vault_jalali", date="2026-09-09")
+    ok("۱۸ شهریور ۱۴۰۵" in out, f"the date must survive: {out[:200]}")
+    ok("1405-06-18" in out and "2026-09-09" in out, "both calendars")
+    ok("unknown" in out, "and the holiday flag must be reported missing")
+    ok("A working day" not in out, "never downgrade unknown to 'no'")
+
+
+@test
+def the_calendar_names_the_field_a_snapshot_note_is_filed_under():
+    """`month_key` is not decoration. `Category Snapshot` notes are keyed on
+    `jalali-month` and were written by hand because nothing here could
+    compute one; this is what closes that."""
+    with_switch = {srv.jalali.NO_NETWORK_ENV: "1"}
+    import unittest.mock as mock
+    with mock.patch.dict(os.environ, with_switch):
+        out = call("vault_jalali", date="2026-09-09")
+    ok("`1405-06`" in out, f"the jalali-month value is missing: {out[:200]}")
+    with mock.patch.dict(os.environ, with_switch):
+        bad = call("vault_jalali", date="the day before yesterday")
+    ok(bad.startswith("ERROR:"), "an unparseable date is refused, not guessed")
+
+
+@test
+def a_dead_marketplace_is_reported_rather_than_answered_around():
+    """Neither endpoint is documented, so a failure means either the network
+    or that it moved — and both are things to say out loud. The one thing
+    that must never come back is a plausible price, which is what a model
+    reaches for when a tool returns an empty-looking result."""
+    import unittest.mock as mock
+    import httpx as httpx_mod
+    err = httpx_mod.ConnectError("no route")
+    with mock.patch("httpx.get", side_effect=err):
+        out = call("vault_digikala", term="کتری")
+    ok(out.startswith("ERROR:"), f"a dead lookup must be an error: {out[:120]}")
+    ok("Digikala" in out and "moved" in out, "named, with what it might mean")
+    with mock.patch("httpx.post", side_effect=err):
+        out = call("vault_divar", term="دوچرخه")
+    ok(out.startswith("ERROR:") and "Divar" in out)
+
+
+@test
+def divar_quotes_the_private_range_and_marks_the_dealers():
+    """The answer to "what is this worth" is a range, and which listings it
+    is taken over changes it. Checked live on 2026-09-09: dealers advertise
+    an instalment headline an order of magnitude under what private sellers
+    ask for the same thing, so a single blended range describes nothing."""
+    import unittest.mock as mock
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"list_widgets": [
+        {"widget_type": "POST_ROW", "data": {
+            "title": "مک بوک ایر", "middle_description_text": "۲۶۰,۰۰۰,۰۰۰ تومان",
+            "bottom_description_text": "در جردن", "red_text": "",
+            "action": {"payload": {"token": "aaa"}}}},
+        {"widget_type": "POST_ROW", "data": {
+            "title": "اقساطی", "middle_description_text": "۱,۰۰۰,۰۰۰ تومان",
+            "bottom_description_text": "در شهرک غرب", "red_text": "فروشگاه",
+            "action": {"payload": {"token": "bbb"}}}},
+    ]}
+    with mock.patch("httpx.post", return_value=resp):
+        out = call("vault_divar", term="مک بوک", city="تهران")
+    ok("Private sellers: 260,000,000 T" in out,
+       f"the range that means something must lead: {out[:300]}")
+    ok("going rate" in out)
+    ok("Including dealers: 1,000,000 T" in out, "and the other one be shown")
+    ok("SHOP ۱,۰۰۰,۰۰۰ تومان" in out, "with the dealer marked in the list")
 
 
 # ---------------------------------------------------------------------

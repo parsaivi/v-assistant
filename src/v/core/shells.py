@@ -412,6 +412,14 @@ READ_TOOLS = [
     # Live POI search (Neshan), for places not yet in the vault. Read-only —
     # nothing is saved without going through vault_create separately.
     "mcp__vault__vault_places_search",
+    # The two lookups either side of a coordinate. `vault_address` is the
+    # only thing V can reach that knows whether somewhere is inside طرح
+    # ترافیک or زوج/فرد — Google models neither — so without it in reach,
+    # "can I drive to Omlet Sara today" gets answered from nothing, which is
+    # the same failure `vault_route` was added for. `vault_geocode` is the
+    # other direction and is here for one job: getting the `location` field
+    # for a new place note. Both read-only; neither writes anything.
+    "mcp__vault__vault_address", "mcp__vault__vault_geocode",
     # Whether the university deadlines are current. Read-only: it fetches
     # Quera's open-deadline list and diffs it against the assignment notes,
     # writing nothing. On every run rather than behind the write flag for the
@@ -420,6 +428,20 @@ READ_TOOLS = [
     # record were "no Quera access is set up for me" and "I cannot verify the
     # live Quera sync", both said about a sync that had run that morning.
     "mcp__vault__vault_quera_status",
+    # The Persian calendar. Read-only, and here rather than left to the model
+    # because a Jalali date computed from memory is wrong at every leap year
+    # and looks exactly as confident as a right one. It is also the only
+    # thing in reach that knows whether tomorrow is تعطیل, which is not
+    # derivable from anything local except a Friday.
+    "mcp__vault__vault_jalali",
+    # What things cost, new and used, in toman. Read-only — both are
+    # searches, neither writes anything, and a price is never filed as a
+    # ledger line without Parsa saying so. Here for the same reason
+    # `vault_route` is: without them, "is 3 million reasonable for this" is
+    # answered from a model's recollection of Iranian prices, which is a
+    # guess wearing the authority of a lookup, in a currency that moves
+    # every week.
+    "mcp__vault__vault_digikala", "mcp__vault__vault_divar",
     "Read", "Grep", "Glob",
 ] + BROWSER_TOOLS
 WRITE_TOOLS = [

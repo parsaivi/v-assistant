@@ -12,12 +12,36 @@ fallback is an estimate — which is exactly what V gave on 2026-09-02 ("20-35
 minutes, the range is all traffic. Estimate, not a routing result"), because
 nothing here wrapped `/v4/direction` yet.
 
+`reverse()` and `geocode()` are the two directions across a coordinate, and
+`reverse()` is the one that earns its place: it returns `in_traffic_zone`
+and `in_odd_even_zone` — طرح ترافیک and زوج/فرد — which decide whether a
+drive is legal this morning and which **nothing else V can reach knows**.
+Google's Maps URLs model neither, as `directions_url` says at length. Read
+`geocode`'s docstring before using it for anything that sounds like a place
+*name*; it is a street geocoder and it fails by confidently returning the
+wrong province.
+
+**Every service here is separately enabled on the key, and they are not all
+on.** Checked against Parsa's key on 2026-09-09:
+
+    /v5/reverse            ✓   /v1/search           ✗ 485
+    /v6/geocoding          ✓   /v1/distance-matrix  ✗ 485
+    /v4/direction          ✓   account-inquiry/*    ✗ 485
+    /v4/direction/no-traffic ✓ autocomplete, map-matching, trip — no such path
+    /v5/static             ✓
+
+So `search()` — the POI lookup this module opened with — is the one that is
+*off*, which is why `_get` turns a 485 into a sentence naming the service in
+Persian and pointing at the سرویس‌ها tab. The list will drift; the check that
+does not drift is calling the thing and reading what comes back.
+
 Deliberately thin and deliberately optional. With no `NESHAN_API_KEY` set,
-`search()` and `route()` return `None` rather than raising, and the caller
+every function here returns `None` rather than raising, and the caller
 (see `mcp/server.py`) turns that into an instruction for the model to fall
 back to `WebSearch`/`WebFetch` against Google Maps or Neshan's own site — a
 live search still happens, just through the shell's general-purpose tools
-instead of a structured API call.
+instead of a structured API call. `None` means *not configured* and nothing
+else: a service that is off, or a route Neshan refuses, raises.
 
 **Neshan does car and motorcycle only.** There is no transit mode and no
 walking mode at any key tier, so "how long by metro" is not a question this
@@ -25,6 +49,15 @@ module can answer and `route()` will not pretend otherwise — see `MODES`.
 Google's Routes API does have transit, which is the one real reason to want
 the `maps_provider` seam below; it needs a billing account, so it stays
 unimplemented until there's a card behind it.
+
+**And زوج/فرد cannot always be avoided, because it is a place and not a
+road.** Ask `/v4/direction` for a route that avoids it into somewhere that
+is *inside* it and Neshan answers "No Route Found!" — correctly, since no
+such route exists. That refusal cost a real answer on 2026-09-08. The
+handling is in `_neshan_route`: ask for the legal route first, and if it is
+refused, relax that one restriction, say so, and use `reverse()` to name the
+end that is in the zone. طرح ترافیک is never relaxed — it is not
+plate-dependent, so there is nothing for Parsa to check.
 """
 
 from __future__ import annotations
@@ -37,6 +70,26 @@ from .config import Settings, settings as default_settings
 
 SEARCH_URL = "https://api.neshan.org/v1/search"
 DIRECTION_URL = "https://api.neshan.org/v4/direction"
+#: Same route, priced without live traffic. The pair is the interesting
+#: number: Divar → Aziz is 15 minutes of road and 24 minutes of Tehran, and
+#: only the difference tells you whether to leave now or after eight.
+DIRECTION_FREE_URL = "https://api.neshan.org/v4/direction/no-traffic"
+#: A point to an address — and, the part that earns its place here, whether
+#: that point is inside طرح ترافیک or زوج/فرد. Nothing else V can reach knows
+#: that, and it is a question with a different answer every morning.
+REVERSE_URL = "https://api.neshan.org/v5/reverse"
+#: An address to a point. Read `geocode`'s docstring before using it for
+#: anything that sounds like a place *name*.
+GEOCODE_URL = "https://api.neshan.org/v6/geocoding"
+#: Raster tiles for a region. Up here with the rest of them rather than down
+#: beside `static_map`, so the endpoints this module talks to are one list.
+STATIC_URL = "https://api.neshan.org/v5/static"
+
+#: Neshan's own code for "this service is not on your key" — an HTTP status
+#: outside the registered range, so `raise_for_status` reports it as a client
+#: error and points at MDN, which has never heard of 485 either. Caught by
+#: name everywhere here so the message can say what to actually do.
+NOT_ON_KEY = 485
 
 # What `/v4/direction` accepts for `type`, and nothing else. Kept as a
 # constant so the tool layer can reject "transit" with a real explanation
@@ -70,6 +123,33 @@ class Route:
     summary: str
     polyline: str
     points: list[tuple[float, float]]
+    #: A restriction Neshan could not route around, so it was dropped —
+    #: "زوج/فرد" or "". Set rather than swallowed because the difference
+    #: between "avoiding the restrictions" and "not" is the difference
+    #: between a route Parsa can drive today and one he cannot, and only he
+    #: knows his plate. Empty means both restrictions were honoured.
+    relaxed: str = ""
+    #: *Why* it had to be relaxed, when that is knowable — "Omlet Sara is
+    #: inside the زوج/فرد zone". A restriction dropped with no reason given
+    #: reads as V being sloppy; the real reason is usually that the
+    #: destination is in the zone, in which case no route could ever have
+    #: avoided it and the retry was not a workaround but the only answer.
+    relaxed_why: str = ""
+    #: The same route priced with no traffic at all, or 0.0 if not asked
+    #: for. The pair is the useful number — 15 minutes of road and 24
+    #: minutes of Tehran — and neither half says that alone.
+    duration_free_s: float = 0.0
+
+    @property
+    def duration_free_min(self) -> int:
+        return round(self.duration_free_s / 60)
+
+    @property
+    def traffic_min(self) -> int:
+        """Minutes that are traffic rather than distance. 0 when unknown."""
+        if not self.duration_free_s:
+            return 0
+        return max(0, round((self.duration_s - self.duration_free_s) / 60))
 
     @property
     def distance_km(self) -> float:
@@ -105,6 +185,7 @@ def search(term: str, lat: float, lng: float, *,
 
 def route(origin: tuple[float, float], destination: tuple[float, float], *,
           origin_label: str = "", dest_label: str = "", mode: str = "car",
+          free_flow: bool = False,
           settings: Settings | None = None) -> Route | None:
     """Directions between two points. `None` when no API key is configured,
     same contract as `search()`. `mode` is one of `MODES` — Neshan has no
@@ -118,8 +199,54 @@ def route(origin: tuple[float, float], destination: tuple[float, float], *,
             f"mode must be one of {', '.join(MODES)} — Neshan has no "
             f"{mode!r} routing at any key tier. Say so rather than "
             "substituting a car route for it.")
-    return _neshan_route(origin, destination, origin_label=origin_label,
+    return _neshan_route(origin, destination, free_flow=free_flow,
+                         origin_label=origin_label,
                          dest_label=dest_label, mode=mode, settings=s)
+
+
+#: Persian names for the services, so a "not enabled" message can say which
+#: box to tick on the سرویس‌ها tab rather than leaving Parsa to guess from an
+#: English path fragment.
+_SERVICE_NAMES = {
+    SEARCH_URL: "جستجو (search)",
+    DIRECTION_URL: "مسیریابی (direction)",
+    DIRECTION_FREE_URL: "مسیریابی بدون ترافیک (direction/no-traffic)",
+    REVERSE_URL: "تبدیل نقطه به آدرس (reverse geocoding)",
+    GEOCODE_URL: "تبدیل آدرس به نقطه (geocoding)",
+    STATIC_URL: "نقشه استاتیک (static)",
+}
+
+
+def _get(url: str, params: dict, *, s: Settings) -> dict:
+    """One Neshan GET, with its two non-obvious failure shapes handled.
+
+    Neshan answers "this service is not on your key" with HTTP **485**, which
+    is outside the registered status range — so `raise_for_status` calls it a
+    client error and prints a link to an MDN page that has never heard of it
+    either. That is what `vault_places_search` returned on 2026-09-08: a
+    stack of URL-encoding and a dead documentation link, for a problem whose
+    entire fix is one checkbox on platform.neshan.org.
+
+    And a *logical* failure comes back as HTTP 200 with `status: ERROR` in
+    the body, so the status line alone never means the call worked. Callers
+    read the body; this only guarantees they get one.
+    """
+    try:
+        r = httpx.get(url, params=params,
+                      headers={"Api-Key": s.neshan_api_key}, timeout=20)
+        if r.status_code == NOT_ON_KEY:
+            name = _SERVICE_NAMES.get(url, url)
+            raise MapSearchError(
+                f"The Neshan key is valid but {name} is not one of the "
+                f"services enabled on it. Tick it on the سرویس‌ها tab at "
+                f"platform.neshan.org — nothing needs changing in V.")
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise MapSearchError(f"Neshan request to {url} failed: {exc}") from exc
+    except ValueError as exc:
+        raise MapSearchError(
+            f"Neshan returned an unreadable response: {exc}") from exc
 
 
 def _neshan_search(term: str, lat: float, lng: float, *,
@@ -127,16 +254,7 @@ def _neshan_search(term: str, lat: float, lng: float, *,
     s = settings
     if not s.neshan_api_key:
         return None
-    try:
-        r = httpx.get(SEARCH_URL, params={"term": term, "lat": lat, "lng": lng},
-                      headers={"Api-Key": s.neshan_api_key}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except httpx.HTTPError as exc:
-        raise MapSearchError(f"Neshan search failed: {exc}") from exc
-    except ValueError as exc:  # bad JSON
-        raise MapSearchError(f"Neshan returned an unreadable response: {exc}") from exc
-
+    data = _get(SEARCH_URL, {"term": term, "lat": lat, "lng": lng}, s=s)
     items = data.get("items") or []
     out = []
     for it in items[:limit]:
@@ -155,6 +273,131 @@ def _neshan_search(term: str, lat: float, lng: float, *,
         ))
     out.sort(key=lambda h: h.distance_km if h.distance_km is not None else 1e9)
     return out
+
+
+@dataclass
+class Address:
+    """A point, as Neshan describes it — and as Tehran regulates it.
+
+    The address half is ordinary reverse geocoding. The two booleans are the
+    reason this is worth a tool: `in_traffic_zone` (طرح ترافیک) and
+    `in_odd_even_zone` (زوج/فرد) are the difference between a drive Parsa can
+    make this morning and a fine, they change by plate and by day, and no
+    other source V can reach knows them. Google's Maps URLs do not, which is
+    stated in `directions_url` and is why this stays Neshan's.
+    """
+
+    lat: float
+    lng: float
+    address: str = ""
+    neighbourhood: str = ""
+    city: str = ""
+    state: str = ""
+    county: str = ""
+    route_name: str = ""
+    in_traffic_zone: bool = False
+    in_odd_even_zone: bool = False
+
+    @property
+    def label(self) -> str:
+        """The shortest thing worth saying out loud about where this is."""
+        parts = [p for p in (self.address or self.route_name,
+                             self.neighbourhood, self.city) if p]
+        seen, out = set(), []
+        for p in parts:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return "، ".join(out[:2]) or f"{self.lat:.4f}, {self.lng:.4f}"
+
+    @property
+    def zones(self) -> str:
+        """What driving here costs, in one phrase."""
+        hit = [n for n, on in (("طرح ترافیک", self.in_traffic_zone),
+                               ("زوج/فرد", self.in_odd_even_zone)) if on]
+        return " and ".join(hit) if hit else ""
+
+
+def reverse(lat: float, lng: float, *,
+            settings: Settings | None = None) -> Address | None:
+    """What is at a point. `None` with no key, same contract as the rest.
+
+    Cheap and exact, and the only place V can learn whether somewhere is
+    inside Tehran's driving restrictions — which is also what makes
+    `_neshan_route`'s retry explainable rather than merely automatic. See
+    there.
+    """
+    s = settings or default_settings
+    if not s.neshan_api_key:
+        return None
+    data = _get(REVERSE_URL, {"lat": lat, "lng": lng}, s=s)
+    if str(data.get("status") or "").upper() not in ("OK", ""):
+        raise MapSearchError(
+            f"Neshan could not describe {lat},{lng}"
+            + (f" — it said: {data['message']}" if data.get("message") else "."))
+    return Address(
+        lat=lat, lng=lng,
+        address=str(data.get("formatted_address") or ""),
+        neighbourhood=str(data.get("neighbourhood") or ""),
+        city=str(data.get("city") or ""),
+        state=str(data.get("state") or ""),
+        county=str(data.get("county") or ""),
+        route_name=str(data.get("route_name") or ""),
+        in_traffic_zone=bool(data.get("in_traffic_zone")),
+        in_odd_even_zone=bool(data.get("in_odd_even_zone")),
+    )
+
+
+def geocode(address: str, *, verify: bool = True,
+            settings: Settings | None = None) -> Address | None:
+    """An address to a point. `None` with no key.
+
+    **This is a street geocoder, not a place finder, and the difference is
+    not subtle.** Checked against the live service on 2026-09-09:
+
+        میدان ونک، تهران        → 35.7573, 51.4103   ✓ correct
+        دانشگاه صنعتی شریف      → 29.5883, 52.5629   ✗ Fars province
+        برج میلاد تهران         → 35.9180, 50.6828   ✗ 70 km off
+
+    Given an *address* — a street, a square, with a city on it — it is right.
+    Given a landmark or business *name* it answers confidently with a point
+    in the wrong province, because it is matching words against a gazetteer
+    rather than looking anything up. The tool that was supposed to answer
+    "where is X" is `/v1/search`, and that is not enabled on this key
+    (2026-09-09), so the temptation to reach for this one instead is exactly
+    the failure mode to design against.
+
+    Hence `verify`: the result is reverse-geocoded and the address Neshan
+    actually landed on comes back with it, so "Sharif University" returning
+    somewhere in استان فارس is *visible* in the answer rather than being a
+    plausible pair of numbers. It costs one extra call and turns a silent
+    wrong answer into an obvious one, which is the whole trade.
+    """
+    s = settings or default_settings
+    if not s.neshan_api_key:
+        return None
+    term = (address or "").strip()
+    if not term:
+        raise MapSearchError("geocode needs an address to look up.")
+    data = _get(GEOCODE_URL, {"address": term}, s=s)
+    loc = data.get("location") or {}
+    if str(data.get("status") or "").upper() not in ("OK", "") or not loc:
+        raise MapSearchError(
+            f"Neshan found no location for {term!r}"
+            + (f" — it said: {data['message']}" if data.get("message") else "."))
+    try:
+        # `x` is longitude and `y` is latitude, the opposite of how every
+        # `location` field in this vault is written. Getting this backwards
+        # puts Tehran in the Indian Ocean, so it is unpacked by name once,
+        # here, and never re-derived at a call site.
+        lng, lat = float(loc["x"]), float(loc["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MapSearchError(
+            f"Neshan returned a location V could not read: {loc!r}") from exc
+    if not verify:
+        return Address(lat=lat, lng=lng)
+    found = reverse(lat, lng, settings=s)
+    return found or Address(lat=lat, lng=lng)
 
 
 def decode_polyline(encoded: str, *, precision: int = 5) -> list[tuple[float, float]]:
@@ -190,12 +433,10 @@ def decode_polyline(encoded: str, *, precision: int = 5) -> list[tuple[float, fl
     return points
 
 
-def _neshan_route(origin: tuple[float, float], destination: tuple[float, float],
-                  *, origin_label: str, dest_label: str, mode: str,
-                  settings: Settings) -> Route | None:
-    s = settings
-    if not s.neshan_api_key:
-        return None
+def _fetch_route(origin, destination, *, mode: str, odd_even: bool,
+                 s: Settings, url: str = DIRECTION_URL) -> dict:
+    """One call to a direction endpoint. Returns the decoded body, error
+    payload and all — a Neshan refusal is HTTP 200, so the caller looks."""
     params = {
         "type": mode,
         "origin": f"{origin[0]},{origin[1]}",
@@ -204,25 +445,80 @@ def _neshan_route(origin: tuple[float, float], destination: tuple[float, float],
         # cannot legally drive is not a route, and this is the one thing no
         # other vendor offers — it is the whole reason Neshan stays primary.
         "avoidTrafficZone": "true",
-        "avoidOddEvenZone": "true",
     }
+    if odd_even:
+        params["avoidOddEvenZone"] = "true"
+    return _get(url, params, s=s)
+
+
+def _explain_odd_even(origin, destination, *, origin_label: str,
+                      dest_label: str, s: Settings) -> str:
+    """Which end of this trip is inside زوج/فرد, if either is.
+
+    Two reverse-geocode calls, spent only when a route has already been
+    refused — so the cost lands exactly where it buys something. It usually
+    buys the whole answer: Omlet Sara is *in* the zone (verified 2026-09-09),
+    which means no route to it could ever have avoided it, and "Neshan had no
+    route that did" was a true but useless thing to tell someone. "Your
+    destination is inside the zone" is the same fact, actionable.
+    """
     try:
-        r = httpx.get(DIRECTION_URL, params=params,
-                      headers={"Api-Key": s.neshan_api_key}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except httpx.HTTPError as exc:
-        raise MapSearchError(f"Neshan routing failed: {exc}") from exc
-    except ValueError as exc:
-        raise MapSearchError(f"Neshan returned an unreadable response: {exc}") from exc
+        for point, label in ((destination, dest_label), (origin, origin_label)):
+            found = reverse(point[0], point[1], settings=s)
+            if found is not None and found.in_odd_even_zone:
+                return (f"{label or found.label} is itself inside the زوج/فرد "
+                        f"zone, so no route could avoid it")
+    except MapSearchError:
+        pass                      # an explanation is never worth an exception
+    return ""
+
+
+def _neshan_route(origin: tuple[float, float], destination: tuple[float, float],
+                  *, origin_label: str, dest_label: str, mode: str,
+                  free_flow: bool = False,
+                  settings: Settings) -> Route | None:
+    """`None` means *not configured*, and nothing else.
+
+    It used to mean three things at once — no key, no `routes` in the body,
+    no legs in the route — and `vault_route` printed the first of them for
+    all three. On 2026-09-08 that had V tell Parsa "routing isn't configured
+    (no NESHAN_API_KEY)" about a 40-character key that was configured and
+    working: Neshan had answered HTTP 200 with `{"status": "ERROR", "message":
+    "No Route Found!"}`, which is a fact about the route and not about the
+    installation. Saying the wrong one sends someone to edit a config file
+    over a problem that is not there. A refusal now raises with Neshan's own
+    words in it.
+
+    **And the refusal was ours.** `avoidOddEvenZone=true` is what Neshan
+    could not satisfy — the same two points route fine without it. Rather
+    than fail, the restriction is relaxed on a retry and the route says so,
+    because the honest order is: a legal route, else a route labelled as
+    possibly not one, and only then nothing at all.
+    """
+    s = settings
+    if not s.neshan_api_key:
+        return None
+
+    relaxed = relaxed_why = ""
+    data = _fetch_route(origin, destination, mode=mode, odd_even=True, s=s)
+    if not (data.get("routes") or []):
+        retry = _fetch_route(origin, destination, mode=mode, odd_even=False, s=s)
+        if retry.get("routes"):
+            data, relaxed = retry, "زوج/فرد"
+            relaxed_why = _explain_odd_even(
+                origin, destination, origin_label=origin_label,
+                dest_label=dest_label, s=s)
 
     routes = data.get("routes") or []
     if not routes:
-        return None
+        raise MapSearchError(
+            "Neshan found no route between those two points"
+            + (f" — it said: {data['message']}" if data.get("message") else "")
+            + ". The API key is fine; this is about the route.")
     first = routes[0]
     legs = first.get("legs") or []
     if not legs:
-        return None
+        raise MapSearchError("Neshan returned a route with no legs in it.")
 
     def _val(leg: dict, key: str) -> float:
         try:
@@ -247,16 +543,32 @@ def _neshan_route(origin: tuple[float, float], destination: tuple[float, float],
     for leg in legs:
         for step in (leg.get("steps") or []):
             detailed.extend(decode_polyline(str(step.get("polyline") or "")))
+
+    # The same road with the traffic taken out. Asked for separately because
+    # it is a second request, and only worth it when a person is going to
+    # read the difference — `duration` alone cannot say whether 24 minutes is
+    # a long way or a bad hour.
+    free_s = 0.0
+    if free_flow:
+        try:
+            quiet = _fetch_route(origin, destination, mode=mode,
+                                 odd_even=not relaxed, s=s,
+                                 url=DIRECTION_FREE_URL)
+            for leg in ((quiet.get("routes") or [{}])[0].get("legs") or []):
+                free_s += _val(leg, "duration")
+        except MapSearchError:
+            free_s = 0.0          # a nice-to-have never costs the route
+
     return Route(
         origin_label=origin_label or f"{origin[0]},{origin[1]}",
         dest_label=dest_label or f"{destination[0]},{destination[1]}",
         mode=mode, distance_m=distance_m, duration_s=duration_s,
         summary=summary, polyline=encoded,
         points=detailed or decode_polyline(encoded),
+        relaxed=relaxed, relaxed_why=relaxed_why, duration_free_s=free_s,
     )
 
 
-STATIC_URL = "https://api.neshan.org/v5/static"
 # Web Mercator, the projection every slippy map uses: the world is a square
 # of 256·2^zoom pixels at the given zoom. Needed because Neshan's static map
 # draws tiles and one marker and nothing else — the route has to be composited

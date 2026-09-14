@@ -21,6 +21,11 @@ os.environ["BRAIN_NO_MODEL"] = "1"
 # …and never pop a desktop notification at whoever is running the suite. The
 # scheduler tests really do fire the morning briefing.
 os.environ["BRAIN_NO_NOTIFY"] = "1"
+# …and never reach the Persian calendar service. `hud.snapshot` asks it for
+# today's holiday flag on every snapshot, so without this the HUD suite would
+# make a real request per test. Conversion is unaffected — it is arithmetic
+# and never left the machine — which is the half these tests actually check.
+os.environ["BRAIN_NO_JALALI"] = "1"
 import sys
 import tempfile
 import traceback
@@ -28,8 +33,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from v.core import (capture, config, embed, gmail, index, llm,
-                            mapsearch, notes, nudges, query, quera, rag,
+from v.core import (bazaar, capture, config, embed, gmail, index, jalali,
+                            llm, mapsearch, notes, nudges, query, quera, rag,
                             reminders, render, router, schema, vaultfs)
 from v.core.engine import Engine
 
@@ -424,6 +429,297 @@ def route_sums_legs_and_avoids_tehrans_restricted_zones():
         eq(r.polyline, "_p~iF~ps|U_ulLnnqC",
            "the encoded string is kept verbatim — OpenLayers decodes it")
         ok(len(r.points) == 2, "and decoded too, for centring the map")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_refused_route_is_not_reported_as_a_missing_key():
+    """`None` used to mean three things — no key, no `routes`, no legs — and
+    `vault_route` printed the first of them for all three. On 2026-09-08 that
+    had V tell Parsa "routing isn't configured (no NESHAN_API_KEY)" about a
+    40-character key that was configured and working: Neshan had answered
+    HTTP 200 with `{"status": "ERROR", "message": "No Route Found!"}`, which
+    is a fact about the route, not the installation. Saying the wrong one
+    sends someone to edit a config file over a problem that is not there."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        resp = mock.Mock()
+        resp.json.return_value = {"status": "ERROR", "code": 200,
+                                  "message": "No Route Found!"}
+        resp.raise_for_status.return_value = None
+        with mock.patch("httpx.get", return_value=resp):
+            try:
+                mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s)
+                raise AssertionError("a refusal must not be reported as None")
+            except mapsearch.MapSearchError as exc:
+                ok("No Route Found!" in str(exc),
+                   "Neshan's own words, not a guess about the key")
+                ok("key is fine" in str(exc),
+                   "and it must say what the problem is not")
+        # A missing key still means exactly that, and still returns None.
+        s.neshan_api_key = ""
+        ok(mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s) is None)
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def odd_even_is_dropped_rather_than_losing_the_route():
+    """Neshan refuses some cross-town Tehran routes outright with both
+    restrictions on — Aziz→Omlet Sara among them, verified against the live
+    API on 2026-09-08; the same two points route fine without زوج/فرد. The
+    honest order is a legal route, else a route *labelled* as possibly not
+    one, and only then nothing at all — so the restriction is relaxed on a
+    retry and the Route carries what it could not honour, because only Parsa
+    knows his plate."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        refused = mock.Mock()
+        refused.json.return_value = {"status": "ERROR", "message": "No Route Found!"}
+        refused.raise_for_status.return_value = None
+        found = mock.Mock()
+        found.json.return_value = {"routes": [{
+            "overview_polyline": {"points": "_p~iF~ps|U_ulLnnqC"},
+            "legs": [{"summary": "مدرس", "distance": {"value": 8700.0},
+                      "duration": {"value": 780.0}}]}]}
+        found.raise_for_status.return_value = None
+        # A relaxed route now also asks *why* — see
+        # `a_relaxed_route_says_which_end_is_in_the_zone`. Neither end is in
+        # the zone here, so both ends get looked at and the reason stays empty.
+        outside = mock.Mock(status_code=200)
+        outside.raise_for_status.return_value = None
+        outside.json.return_value = {"status": "OK", "in_odd_even_zone": False}
+
+        with mock.patch("httpx.get",
+                        side_effect=[refused, found, outside, outside]) as got:
+            r = mapsearch.route((35.8044, 51.4725), (35.7448, 51.3753),
+                                origin_label="Aziz", dest_label="Omlet Sara",
+                                settings=s)
+        eq(r.distance_km, 8.7)
+        eq(r.relaxed, "زوج/فرد", "the route must say what it could not avoid")
+        first, second = got.call_args_list[:2]
+        eq(first.kwargs["params"]["avoidOddEvenZone"], "true",
+           "the legal route is still asked for first")
+        ok("avoidOddEvenZone" not in second.kwargs["params"],
+           "and only that one restriction is dropped on the retry")
+        eq(second.kwargs["params"]["avoidTrafficZone"], "true",
+           "طرح ترافیک is never dropped — it is not plate-dependent")
+
+        # A route that needed no relaxing says nothing about it.
+        with mock.patch("httpx.get", return_value=found):
+            clean = mapsearch.route((35.7, 51.4), (35.8, 51.4), settings=s)
+        eq(clean.relaxed, "")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_service_not_on_the_key_says_which_box_to_tick():
+    """Neshan answers "not on your key" with HTTP **485**, outside the
+    registered range — so `raise_for_status` calls it a client error and
+    prints a link to an MDN page that has never heard of it either. That is
+    what `vault_places_search` returned on 2026-09-08: a stack of
+    URL-encoding and a dead documentation link, for a problem whose entire
+    fix is one checkbox."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        resp = mock.Mock()
+        resp.status_code = 485
+        with mock.patch("httpx.get", return_value=resp):
+            try:
+                mapsearch.search("cafe", 35.7, 51.4, settings=s)
+                raise AssertionError("485 must not pass for a result")
+            except mapsearch.MapSearchError as exc:
+                ok("جستجو" in str(exc), "it must name the service in Persian")
+                ok("platform.neshan.org" in str(exc), "and where to enable it")
+                ok("nothing needs changing in V" in str(exc),
+                   "and say the problem is not in the code")
+                ok("MDN" not in str(exc) and "485" not in str(exc))
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def reverse_geocoding_carries_tehrans_two_driving_restrictions():
+    """The address is ordinary; the two booleans are the reason this exists.
+    طرح ترافیک and زوج/فرد decide whether a drive is legal this morning, and
+    nothing else V can reach models either — `directions_url` says as much
+    about Google. Verified against the live service on 2026-09-09: Omlet Sara
+    reads `in_odd_even_zone: true`, Divar reads false for both."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "status": "OK", "formatted_address": "تهران، استاد حسن بنا شمالی",
+            "neighbourhood": "کاظم آباد", "city": "تهران",
+            "state": "استان تهران", "route_name": "استاد حسن بنا",
+            "in_traffic_zone": False, "in_odd_even_zone": True}
+        with mock.patch("httpx.get", return_value=resp):
+            a = mapsearch.reverse(35.7448, 51.3753, settings=s)
+        eq(a.in_odd_even_zone, True)
+        eq(a.in_traffic_zone, False)
+        eq(a.zones, "زوج/فرد", "the phrase a person is told, not a bool")
+        ok("استاد حسن بنا" in a.label)
+
+        resp.json.return_value = {"status": "OK", "formatted_address": "تهران، نلسون ماندلا",
+                                  "in_traffic_zone": False, "in_odd_even_zone": False}
+        with mock.patch("httpx.get", return_value=resp):
+            clear = mapsearch.reverse(35.6997, 51.3376, settings=s)
+        eq(clear.zones, "", "no restriction is an empty phrase, not 'none'")
+
+        s.neshan_api_key = ""
+        ok(mapsearch.reverse(35.7, 51.4, settings=s) is None, "no key, no guess")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def geocoding_reads_x_as_longitude_and_verifies_where_it_landed():
+    """Two failures in one test, because both are silent.
+
+    Neshan returns `{"x": lng, "y": lat}` — the opposite order from every
+    `location` field in this vault. Swapping them puts Tehran in the Indian
+    Ocean and nothing complains.
+
+    And `/v6/geocoding` is a street geocoder, not a place finder: given a
+    landmark name it answers confidently with the wrong province — checked
+    live on 2026-09-09, 'دانشگاه صنعتی شریف' comes back in استان فارس. So
+    every result is reverse-geocoded back and the address it actually landed
+    on travels with it, which turns a plausible pair of numbers into a
+    visibly wrong answer."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        geo = mock.Mock(status_code=200)
+        geo.raise_for_status.return_value = None
+        geo.json.return_value = {"status": "OK",
+                                 "location": {"x": 52.562857, "y": 29.588277}}
+        rev = mock.Mock(status_code=200)
+        rev.raise_for_status.return_value = None
+        rev.json.return_value = {"status": "OK", "city": "شیراز",
+                                 "state": "استان فارس",
+                                 "formatted_address": "شیراز، بلوار حقیقت"}
+        with mock.patch("httpx.get", side_effect=[geo, rev]):
+            a = mapsearch.geocode("دانشگاه صنعتی شریف", settings=s)
+        eq(a.lat, 29.588277, "y is latitude")
+        eq(a.lng, 52.562857, "x is longitude")
+        eq(a.city, "شیراز",
+           "the wrong answer must arrive wearing the city it is actually in")
+        eq(a.state, "استان فارس")
+
+        # `verify=False` skips the round trip and returns bare coordinates.
+        with mock.patch("httpx.get", return_value=geo):
+            bare = mapsearch.geocode("x", verify=False, settings=s)
+        eq((bare.lat, bare.lng), (29.588277, 52.562857))
+        eq(bare.city, "")
+
+        geo.json.return_value = {"status": "ERROR", "message": "not found"}
+        with mock.patch("httpx.get", return_value=geo):
+            try:
+                mapsearch.geocode("nowhere at all", settings=s)
+                raise AssertionError("a miss must not become coordinates")
+            except mapsearch.MapSearchError as exc:
+                ok("not found" in str(exc), "Neshan's own words")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_route_can_price_itself_with_the_traffic_taken_out():
+    """"33 minutes" cannot say whether that is a long way or a bad hour. The
+    pair can: Divar → Aziz is 15 minutes of road and 18 minutes of Tehran
+    (live, 2026-09-09). Opt-in because it is a second request."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        def body(seconds):
+            m = mock.Mock(status_code=200)
+            m.raise_for_status.return_value = None
+            m.json.return_value = {"routes": [{
+                "overview_polyline": {"points": "_p~iF~ps|U_ulLnnqC"},
+                "legs": [{"distance": {"value": 15500.0},
+                          "duration": {"value": seconds}}]}]}
+            return m
+
+        with mock.patch("httpx.get", side_effect=[body(1980.0), body(900.0)]) as got:
+            r = mapsearch.route((35.6997, 51.3376), (35.8044, 51.4725),
+                                free_flow=True, settings=s)
+        eq(r.duration_min, 33)
+        eq(r.duration_free_min, 15)
+        eq(r.traffic_min, 18, "the delta is the number worth printing")
+        eq(got.call_args_list[1].args[0], mapsearch.DIRECTION_FREE_URL,
+           "the second call is the no-traffic endpoint, not the same one twice")
+
+        # Not asked for, not paid for.
+        with mock.patch("httpx.get", side_effect=[body(1980.0)]) as got:
+            plain = mapsearch.route((35.6997, 51.3376), (35.8044, 51.4725),
+                                    settings=s)
+        eq(got.call_count, 1)
+        eq(plain.duration_free_s, 0.0)
+        eq(plain.traffic_min, 0, "unknown is 0, never a made-up delta")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_relaxed_route_says_which_end_is_in_the_zone():
+    """"Neshan had no route that did" is true and useless. The real reason,
+    on the trip that exposed this, is that the *destination* is inside زوج/فرد
+    (Omlet Sara, verified live 2026-09-09) — so no route to it could ever
+    have avoided it, and the retry was not a workaround but the only answer
+    there was. Two reverse calls, spent only on a route already refused."""
+    import unittest.mock as mock
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    try:
+        refused = mock.Mock(status_code=200)
+        refused.raise_for_status.return_value = None
+        refused.json.return_value = {"status": "ERROR", "message": "No Route Found!"}
+        found = mock.Mock(status_code=200)
+        found.raise_for_status.return_value = None
+        found.json.return_value = {"routes": [{
+            "overview_polyline": {"points": "_p~iF~ps|U"},
+            "legs": [{"distance": {"value": 8700.0},
+                      "duration": {"value": 960.0}}]}]}
+        in_zone = mock.Mock(status_code=200)
+        in_zone.raise_for_status.return_value = None
+        in_zone.json.return_value = {"status": "OK", "in_odd_even_zone": True,
+                                     "formatted_address": "تهران، خاکبازان"}
+
+        with mock.patch("httpx.get", side_effect=[refused, found, in_zone]):
+            r = mapsearch.route((35.8044, 51.4725), (35.7448, 51.3753),
+                                origin_label="Aziz", dest_label="Omlet Sara",
+                                settings=s)
+        eq(r.relaxed, "زوج/فرد")
+        ok("Omlet Sara" in r.relaxed_why, r.relaxed_why)
+        ok("inside" in r.relaxed_why and "no route could avoid" in r.relaxed_why)
+
+        # The destination is checked first: it is the end you cannot choose.
+        with mock.patch("httpx.get", side_effect=[refused, found, in_zone]) as got:
+            mapsearch.route((35.8044, 51.4725), (35.7448, 51.3753),
+                            origin_label="Aziz", dest_label="Omlet Sara",
+                            settings=s)
+        eq(got.call_args_list[2].kwargs["params"]["lat"], 35.7448)
+
+        # And an explanation is never worth an exception.
+        boom = mock.Mock(status_code=485)
+        with mock.patch("httpx.get", side_effect=[refused, found, boom]):
+            quiet = mapsearch.route((35.8, 51.5), (35.7, 51.4), settings=s)
+        eq(quiet.relaxed, "زوج/فرد")
+        eq(quiet.relaxed_why, "", "unknowable, not fabricated")
     finally:
         shutil.rmtree(root)
 
@@ -2275,6 +2571,262 @@ def save_never_opens_a_browser():
             opened.assert_not_called()
     finally:
         shutil.rmtree(root)
+
+
+# ---------------------------------------------------------------------
+# the Persian calendar, and the two marketplaces
+
+
+@test
+def jalali_round_trips_every_day_for_sixty_years():
+    """The conversion is the load-bearing half of `jalali.py` — the HUD
+    draws from it on every poll and the holiday lookup is keyed on it — and
+    it is arithmetic, so it can be proved rather than sampled. 1990-2050 is
+    every day Parsa's vault will ever hold, and it includes the leap edges
+    that a hand-written offset gets wrong: 2025-03-20 is 1403-12-30, a date
+    that exists only in a Jalali leap year."""
+    day, end, checked = dt.date(1990, 1, 1), dt.date(2050, 1, 1), 0
+    while day < end:
+        j = jalali.convert(day)
+        back = jalali.to_gregorian(j.year, j.month, j.day)
+        if back != day:
+            raise AssertionError(f"{day} -> {j.iso} -> {back}")
+        checked += 1
+        day += dt.timedelta(days=1)
+    eq(checked, 21915, "the range under test")
+    # Two fixed points, cross-checked against the live service on 2026-09-09.
+    eq(jalali.convert(dt.date(2026, 9, 9)).iso, "1405-06-18")
+    eq(jalali.convert(dt.date(2025, 3, 20)).iso, "1403-12-30")
+    eq(jalali.to_gregorian(1405, 1, 1), dt.date(2026, 3, 21), "Nowruz 1405")
+
+
+@test
+def jalali_reads_either_calendar_off_the_year():
+    """`parse` takes both calendars and works out which from the year, so no
+    caller has to carry a flag. The two ranges are six centuries apart, so
+    this is a fact about the calendars and not a heuristic that can go wrong
+    for a date either of them will ever see."""
+    eq(jalali.parse("1405-06-18"), dt.date(2026, 9, 9))
+    eq(jalali.parse("2026-09-09"), dt.date(2026, 9, 9))
+    eq(jalali.parse("1405/06/18"), dt.date(2026, 9, 9), "slashes too")
+    eq(jalali.parse("today"), dt.date.today())
+    eq(jalali.parse("tomorrow"), dt.date.today() + dt.timedelta(days=1))
+    for bad in ("", "not-a-date", "1405-13-01"):
+        try:
+            jalali.parse(bad if bad else "x-y-z")
+            raise AssertionError(f"{bad!r} should not parse")
+        except ValueError:
+            pass
+
+
+@test
+def a_friday_is_known_to_be_off_with_no_network():
+    """The honest floor when the calendar service can't be reached. `holiday`
+    stays None — "I don't know" and "it's a working day" are different
+    answers and only one is safe to schedule against — but `off` still says
+    yes for a Friday, because a Friday is a Friday offline too. What is lost
+    without a network is عاشورا, not the weekend."""
+    import unittest.mock as mock
+    with mock.patch.dict(os.environ, {jalali.NO_NETWORK_ENV: "1"}):
+        friday = jalali.lookup(dt.date(2026, 9, 11))
+        eq(friday.holiday, None, "unknown, not False")
+        eq(friday.off, True, "…but a Friday is still a Friday")
+        eq(friday.source, "local")
+        weekday = jalali.lookup(dt.date(2026, 9, 9))
+        eq(weekday.holiday, None)
+        eq(weekday.off, False, "and a Wednesday is not assumed off")
+
+
+@test
+def the_calendar_service_is_never_trusted_to_have_answered_for_the_right_day():
+    """The service reads its input as Jalali whatever it is told — its `base`
+    parameter is documented and ignored, verified against the live endpoint
+    on 2026-09-09 for every spelling of "gregorian" it accepts. A response
+    for the wrong day therefore comes back looking perfectly well-formed, so
+    the Gregorian date it echoes is checked rather than read past. Without
+    this, a conversion bug would attach a holiday flag to a different day and
+    nothing would say so."""
+    import unittest.mock as mock
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "status": True,
+        "result": {"solar": {"day": 18, "month": 6, "year": 1405},
+                   # …answering for the day after the one asked about.
+                   "gregorian": {"day": 10, "month": 9, "year": 2026},
+                   "holiday": True, "event": []},
+    }
+    with mock.patch.dict(os.environ, {jalali.NO_NETWORK_ENV: ""}), \
+            mock.patch("httpx.get", return_value=resp):
+        try:
+            jalali.lookup(dt.date(2026, 9, 9))
+            raise AssertionError("a mismatched echo must not pass")
+        except jalali.CalendarError as exc:
+            ok("2026-09-10" in str(exc), "it must name the day it got back")
+            ok("not trustworthy" in str(exc))
+
+
+@test
+def an_unreachable_calendar_still_gives_the_date():
+    """The two halves are split so this can be true: the date is arithmetic
+    and cannot fail, so a dead service costs the holiday flag and nothing
+    else. `lookup` raising rather than returning a half-answer is deliberate
+    — the caller decides how to say "I don't know" — and every caller here
+    falls back to `convert`."""
+    import unittest.mock as mock
+    import httpx as httpx_mod
+    with mock.patch.dict(os.environ, {jalali.NO_NETWORK_ENV: ""}), \
+            mock.patch("httpx.get",
+                       side_effect=httpx_mod.ConnectError("no route")):
+        try:
+            jalali.lookup(dt.date(2026, 9, 9))
+            raise AssertionError("a dead service must be raised, not hidden")
+        except jalali.CalendarError as exc:
+            ok("still right" in str(exc), "and it must say the date survives")
+    eq(jalali.convert(dt.date(2026, 9, 9)).iso, "1405-06-18")
+
+
+@test
+def digikala_prices_arrive_in_rial_and_leave_in_toman():
+    """CLAUDE.md is unambiguous that the vault is toman throughout and never
+    raw rial. Digikala answers in rial, so the division happens once, here,
+    rather than at each call site — a price out of this module drops into a
+    ledger line without further conversion. Shape taken from a live response
+    on 2026-09-09."""
+    import unittest.mock as mock
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"data": {"products": [
+        {"id": 5432308, "title_fa": "پودر پروتئین وی", "status": "marketable",
+         "url": {"uri": "/product/dkp-5432308/x"},
+         "rating": {"rate": 77.98, "count": 307},
+         "default_variant": {"price": {"selling_price": 105632700,
+                                       "discount_percent": 11},
+                             "seller": {"title": "مکمل تراپی"}}},
+        {"id": 2, "title_fa": "بی موجودی", "status": "out_of_stock",
+         "url": {"uri": "/product/dkp-2/y"}, "default_variant": {}},
+    ]}}
+    with mock.patch("httpx.get", return_value=resp):
+        hits = bazaar.digikala("وی")
+    eq(hits[0].price_toman, 10563270, "105,632,700 rial is 10,563,270 toman")
+    ok(isinstance(hits[0].price_toman, int), "an int — a float prints .0")
+    ok("3.9★" in hits[0].note, "77.98/100 read back out of 5")
+    eq(hits[0].where, "مکمل تراپی")
+    ok(hits[0].url.startswith("https://www.digikala.com/product/"))
+    eq(hits[1].price_toman, None, "no variant is None, never 0")
+    eq(hits[1].in_stock, False)
+
+
+@test
+def divar_prices_are_persian_digits_and_dealers_are_marked():
+    """Divar answers in toman already, but as a Persian-digit string, and it
+    mixes dealers in with private sellers. Both matter to the number: checked
+    live on 2026-09-09, a "مک بوک" search put dealers advertising ۱,۰۰۰,۰۰۰
+    تومان as the headline for an instalment plan directly beside private
+    sellers asking 260 million for a laptop. A range across the two describes
+    nothing, which is why `shop` exists and `price_range` can drop them."""
+    import unittest.mock as mock
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"list_widgets": [
+        {"widget_type": "POST_LIST_SUGGESTION_CARD", "data": {"x": 1}},
+        {"widget_type": "POST_ROW", "data": {
+            "title": "مک بوک ایر", "middle_description_text": "۲۶۰,۰۰۰,۰۰۰ تومان",
+            "bottom_description_text": "۱۱ ساعت پیش در جردن", "red_text": "",
+            "top_description_text": "در حد نو",
+            "action": {"payload": {"token": "QakXIbSr"}}}},
+        {"widget_type": "POST_ROW", "data": {
+            "title": "فروش اقساطی", "middle_description_text": "۱,۰۰۰,۰۰۰ تومان",
+            "bottom_description_text": "در شهرک غرب",
+            "red_text": "پله شده | فروشگاه",
+            "action": {"payload": {"token": "gaJSZiwI"}}}},
+    ]}
+    with mock.patch("httpx.post", return_value=resp):
+        hits = bazaar.divar("مک بوک", city="تهران")
+    eq(len(hits), 2, "the suggestion card is chrome, not a listing")
+    eq(hits[0].price_toman, 260000000, "Persian digits, already toman")
+    eq(hits[0].shop, False)
+    eq(hits[0].url, "https://divar.ir/v/QakXIbSr")
+    eq(hits[1].shop, True, "فروشگاه in red_text is a dealer")
+    eq(bazaar.price_range(hits), (1000000, 260000000))
+    eq(bazaar.price_range(hits, private_only=True), (260000000, 260000000),
+       "dropping the dealer leaves the price that means something")
+
+
+@test
+def a_listing_with_no_single_number_is_none_and_not_zero():
+    """The two that turn up live are توافقی and رهن کامل — text with no
+    figure in it at all. Zero would sort to the top of a cheapest-first list
+    and read as free; `None` says there is nothing to compare. The raw string
+    survives on `price_text` either way, so refusing to parse costs nothing.
+    The pair case is defensive: a field carrying two numbers has no single
+    price in it, and picking either half would be wrong."""
+    eq(bazaar.parse_toman("توافقی"), None)
+    eq(bazaar.parse_toman("رهن کامل"), None, "a deposit-only rental")
+    eq(bazaar.parse_toman("ودیعه ۲۰۰,۰۰۰,۰۰۰ اجاره ۵,۰۰۰,۰۰۰"), None,
+       "two figures is not one price")
+    eq(bazaar.parse_toman(""), None)
+    eq(bazaar.parse_toman("۱۹۹,۰۰۰,۰۰۰ تومان"), 199000000)
+    eq(bazaar.parse_toman("١٢٣٤٥٦ تومان"), 123456, "Arabic-Indic digits too")
+    eq(bazaar.format_toman(250000), "250,000 T", "the ledger's own shape")
+    eq(bazaar.format_toman(None), "—")
+
+
+@test
+def a_rental_search_is_recognised_so_its_range_is_not_read_as_a_price():
+    """The range means something different for rentals, and the difference is
+    an order of magnitude squared. Checked live on 2026-09-09: an
+    "اجاره آپارتمان" search in Tehran returns rents from 100,000 toman
+    against deposits of four billion, because Divar splits ودیعه and اجاره
+    across two fields and only the rent is the headline. Reported without
+    that, V would say Tehran flats go for a hundred thousand toman."""
+    rentals = [
+        bazaar.Listing(title="ازگل", source="divar", url="",
+                       price_toman=100000, price_text="اجاره: ۱۰۰,۰۰۰ تومان",
+                       note="ودیعه: ۴,۲۰۰,۰۰۰,۰۰۰ تومان"),
+        bazaar.Listing(title="بنفشه", source="divar", url="",
+                       price_text="رهن کامل",
+                       note="ودیعه: ۱۲,۰۰۰,۰۰۰,۰۰۰ تومان"),
+    ]
+    ok(bazaar.looks_like_rental(rentals))
+    eq(bazaar.price_range(rentals), (100000, 100000),
+       "رهن کامل carries no rent, so it is not in the range")
+    sales = [
+        bazaar.Listing(title="پراید", source="divar", url="",
+                       price_toman=435000000,
+                       price_text="۴۳۵,۰۰۰,۰۰۰ تومان", note="۲۹۹,۰۰۰ کیلومتر"),
+        bazaar.Listing(title="پراید وانت", source="divar", url="",
+                       price_toman=1110000000,
+                       price_text="۱,۱۱۰,۰۰۰,۰۰۰ تومان", note="۰ کیلومتر"),
+    ]
+    ok(not bazaar.looks_like_rental(sales), "a car search must stay clean")
+    ok(not bazaar.looks_like_rental([]), "and an empty set is not a rental")
+
+
+@test
+def an_unknown_city_is_refused_rather_than_silently_tehran():
+    """Divar knows 1,177 cities and this module ships the seven that cover
+    the question. A miss fetches the rest once; a genuine miss has to fail,
+    because searching Tehran and labelling the answer 'Yazd' is worse than
+    no answer — a used price is a local fact, which is the whole reason the
+    parameter exists."""
+    import unittest.mock as mock
+    eq(bazaar._resolve_city("تهران"), 1, "no request for a known city")
+    eq(bazaar._resolve_city("tehran"), 1, "slug or Persian name")
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"cities": [
+        {"id": 41, "name": "یزد", "slug": "yazd"}]}
+    bazaar._city_cache.clear()
+    with mock.patch("httpx.get", return_value=resp):
+        eq(bazaar._resolve_city("یزد"), 41, "fetched on the first miss")
+        eq(bazaar._resolve_city("yazd"), 41, "and cached by both names")
+        try:
+            bazaar._resolve_city("Atlantis")
+            raise AssertionError("an unknown city must not fall back")
+        except bazaar.BazaarError as exc:
+            ok("Atlantis" in str(exc))
+    bazaar._city_cache.clear()
 
 
 # ---------------------------------------------------------------------
