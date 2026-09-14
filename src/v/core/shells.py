@@ -232,19 +232,25 @@ def tier_settings(tier: str, s: Settings) -> tuple[str, str]:
     }.get(tier, (s.tier_normal_model, s.tier_normal_effort))
 
 
-def timeout_for(tier: str, s: Settings) -> int:
-    """How long this tier is allowed to take before it counts as stuck.
+def idle_for(tier: str, s: Settings) -> int:
+    """How long this tier may go silent before it counts as stuck.
 
-    One flat ceiling made "stuck" mean the same thing for a two-word lookup and
-    a vault-wide audit, which in practice meant a `light` question could hold
-    the prompt for five minutes before admitting it had failed.
+    An idle budget, not a ceiling on the run. The distinction is the whole
+    point: the thing worth killing is a run that has stopped doing anything,
+    and total runtime cannot see that — it kills the long job and the hung one
+    with equal confidence. Under the streaming reader, silence can be measured
+    directly, so it is.
+
+    Tiered anyway, because the longest legitimate gap between events does scale
+    a little with the work: a lookup that says nothing for a minute is stuck,
+    whereas an audit may sit inside one slow tool call for longer than that.
     """
     return {
-        TRIVIAL: s.shell_timeout_trivial,
-        LIGHT: s.shell_timeout_light,
-        NORMAL: s.shell_timeout_normal,
-        HEAVY: s.shell_timeout_heavy,
-    }.get(tier) or s.shell_timeout
+        TRIVIAL: s.shell_idle_trivial,
+        LIGHT: s.shell_idle_light,
+        NORMAL: s.shell_idle_normal,
+        HEAVY: s.shell_idle_heavy,
+    }.get(tier) or s.shell_idle
 
 
 @dataclass
@@ -686,7 +692,7 @@ class ClaudeCodeShell(Shell):
         default_model, default_effort = tier_settings(tier, self.s)
         model = model or default_model
         effort = effort or default_effort
-        limit = timeout or timeout_for(tier, self.s)
+        idle = timeout or idle_for(tier, self.s)
 
         # What is fixed goes in the system prompt; what changes per question
         # goes in the turn. That ordering is the whole point.
@@ -802,7 +808,7 @@ class ClaudeCodeShell(Shell):
         t0 = time.time()
         read = self._stream if streaming else self._blob
         try:
-            data, live, err = read(cmd, env, limit, on_event)
+            data, live, err = read(cmd, env, idle, on_event)
         except OSError as exc:
             return ShellResult("", self.name, ms=(time.time() - t0) * 1000,
                                billing=self.billing, tier=tier, model=model,
@@ -810,10 +816,10 @@ class ClaudeCodeShell(Shell):
         ms = (time.time() - t0) * 1000
 
         if data is None:
-            # No final payload — timed out, crashed, or wrote something that
+            # No final payload — stalled, crashed, or wrote something that
             # was not JSON. `live` is whatever the run had said by then, and
             # keeping it is the difference between a wasted four minutes and a
-            # half-finished answer: the timeouts on record were long, expensive
+            # half-finished answer: the kills on record were long, expensive
             # runs that had already done most of the work.
             return ShellResult(
                 text=(live.text or "").strip()[:8000], provider=self.name,
@@ -821,7 +827,7 @@ class ClaudeCodeShell(Shell):
                 session_id=live.session_id or sid, turns=live.turns,
                 tools_used=live.tools, rate_limit=live.rate_limit,
                 partial=bool(live.text.strip()),
-                error=err or f"timed out after {limit}s")
+                error=err or f"stalled — no output for {idle}s")
 
         usage = data.get("modelUsage") or {}
         if usage:
@@ -864,7 +870,7 @@ class ClaudeCodeShell(Shell):
         )
 
     # ---- reading the run ------------------------------------------------
-    def _blob(self, cmd, env, limit, on_event):
+    def _blob(self, cmd, env, idle, on_event):
         """One JSON object at the end. The old behaviour, kept whole.
 
         Nothing is known until the process exits, so a timeout here really does
@@ -872,15 +878,19 @@ class ClaudeCodeShell(Shell):
         `on_event` and ignores it for the same reason: a surface should not
         have to ask which reader is running to know whether to draw progress;
         it simply gets none here.
+
+        It also cannot tell working from hung — that is what the stream is for
+        — so the idle budget is spent here as a flat ceiling on the whole run.
+        A blob reader that waits forever on a hung child has no way back.
         """
         del on_event
         try:
             proc = subprocess.run(
                 cmd, cwd=self.s.vault, capture_output=True, text=True,
-                timeout=limit, env=env, stdin=subprocess.DEVNULL,
+                timeout=idle, env=env, stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
-            return None, _Live(), f"timed out after {limit}s"
+            return None, _Live(), f"timed out after {idle}s"
         if proc.returncode != 0 and not proc.stdout.strip():
             return None, _Live(), (proc.stderr or
                                    f"claude exited {proc.returncode}").strip()[:500]
@@ -891,15 +901,21 @@ class ClaudeCodeShell(Shell):
             live.text = proc.stdout.strip()[:4000]
             return None, live, "could not parse the CLI's JSON output"
 
-    def _stream(self, cmd, env, limit, on_event):
+    def _stream(self, cmd, env, idle, on_event):
         """Read the run as it happens, and keep what it said if it is cut off.
 
-        The deadline is enforced against the *whole* run rather than per line,
-        because a run that is stuck mid-tool emits nothing at all and one that
-        is writing a long answer emits constantly; only the total is a
-        meaningful budget. A reader thread does the blocking read so the
-        deadline stays enforceable — `readline()` on a hung child is
-        uninterruptible, and a timeout you cannot enforce is a comment.
+        The deadline is against *silence*, not against the length of the run.
+        A run that is stuck mid-tool emits nothing at all and one that is
+        working emits constantly — tool calls, tool results, message deltas —
+        so the gap between events is the signal, and the total is not: it
+        cannot separate a job that legitimately takes eight minutes from a
+        child that died holding the pipe open. Every event pushes the deadline
+        out, which means a run is killed for being stuck and never merely for
+        being long.
+
+        A reader thread does the blocking read so the deadline stays
+        enforceable — `readline()` on a hung child is uninterruptible, and a
+        timeout you cannot enforce is a comment.
         """
         proc = subprocess.Popen(
             cmd, cwd=self.s.vault, stdout=subprocess.PIPE,
@@ -934,13 +950,16 @@ class ClaudeCodeShell(Shell):
         threading.Thread(target=drain, daemon=True).start()
 
         live = _Live()
-        deadline = time.time() + limit
+        # Reset by every line the child produces, parseable or not: a stray log
+        # line is not an answer, but it is proof the process is alive, which is
+        # the only thing this deadline is asking about.
+        last_seen = time.time()
         final, err = None, ""
         while True:
-            left = deadline - time.time()
+            left = (last_seen + idle) - time.time()
             if left <= 0:
                 proc.kill()
-                err = f"timed out after {limit}s"
+                err = f"stalled — no output for {idle}s"
                 break
             try:
                 line = lines.get(timeout=min(left, 1.0))
@@ -948,6 +967,7 @@ class ClaudeCodeShell(Shell):
                 continue
             if line is None:                      # stdout closed: run is over
                 break
+            last_seen = time.time()
             line = line.strip()
             if not line:
                 continue
@@ -1014,7 +1034,7 @@ class HermesShell(Shell):
         try:
             proc = subprocess.run(cmd, cwd=self.s.vault, capture_output=True,
                                   text=True,
-                                  timeout=timeout or self.s.shell_timeout)
+                                  timeout=timeout or self.s.shell_idle)
         except subprocess.TimeoutExpired:
             return ShellResult("", self.name, ms=(time.time() - t0) * 1000,
                                error="timed out")

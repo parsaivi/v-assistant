@@ -1175,11 +1175,8 @@ class Engine:
         1on1, update my goals and create a todo list" matched the noun "goals",
         printed a table of goal note titles in 0ms for $0, and stopped. Free
         and instant is only a virtue when the answer is right.
-
-        The agent gets the current task and calendar state up front so it
-        doesn't spend turns rediscovering what a SELECT already knows.
         """
-        state = self._working_state(now)
+        del now  # the state dump this used to print was its only reader
         # Writes are on for this path only. The router reached COMPOUND because
         # the message carries an action verb — "update", "create", "mark" — so
         # the user has asked for a change, and an agent that can only read
@@ -1190,13 +1187,16 @@ class Engine:
             text, evidence=self.rag.search(text), allow_writes=True, voice=voice)
         if escalated:
             return escalated
-        lines = []
-        if failure:
-            lines += [failure, ""]
-        lines += ["That needs more than a lookup — several things at once — "
-                  "and no model is available to do it. Here's the state it "
-                  "would have worked from:", "", state]
-        return Response("\n".join(lines), route="compound:unserved")
+        # Nothing but the reason. This used to print `_working_state` — the
+        # backlog shape, the top five tasks, the next seven days — on the
+        # theory that state was better than nothing. It is not: the question
+        # was "do the job I told you", and twenty lines of tasks answer a
+        # question nobody asked while burying the one line that matters. It
+        # also read as though the failure had been handled.
+        return Response(
+            failure or "That needs more than a lookup — several things at "
+                       "once — and no model is available to do it.",
+            route="compound:unserved")
 
     def _working_state(self, now: dt.datetime) -> str:
         s = self.q.tasks.backlog_shape(now.date())
@@ -1621,9 +1621,11 @@ def _shell_excuse(error: str) -> str:
     if "authenticate" in low or "oauth" in low or "expired" in low:
         return ("_The Claude Code session has expired — run `claude` once to "
                 "log back in. Falling back to local search._")
-    if "timed out" in low:
-        return ("_The agent timed out, so this is local search instead. A "
-                "narrower question usually gets through._")
+    if "stalled" in low or "timed out" in low:
+        # Not "it took too long" — a run is no longer stopped for being long,
+        # only for going silent, so saying "ask something narrower" would be
+        # advice against the wrong cause.
+        return "_The agent went quiet and was stopped. Nothing was written._"
     return f"_The agent couldn't run ({error.strip()[:120]}), so this is local search._"
 
 

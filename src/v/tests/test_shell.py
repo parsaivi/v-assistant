@@ -795,14 +795,71 @@ def a_broken_progress_callback_cannot_cost_an_answer():
 
 @test
 def each_tier_gets_its_own_patience():
-    """One flat ceiling meant a two-word lookup could hang for five minutes."""
+    """One flat budget meant a two-word lookup could hang for five minutes."""
     root, s = make_vault()
     try:
-        light = shells.timeout_for(shells.LIGHT, s)
-        heavy = shells.timeout_for(shells.HEAVY, s)
+        light = shells.idle_for(shells.LIGHT, s)
+        heavy = shells.idle_for(shells.HEAVY, s)
         ok(light < heavy, f"light {light}s should be under heavy {heavy}s")
-        eq(shells.timeout_for("nonsense-tier", s), s.shell_timeout,
-           "an unknown tier falls back to the flat ceiling")
+        eq(shells.idle_for("nonsense-tier", s), s.shell_idle,
+           "an unknown tier falls back to the flat budget")
+    finally:
+        shutil.rmtree(root)
+
+
+def _emitter(script: str):
+    """A fake `claude` that writes stream-json on a schedule of our choosing."""
+    return [sys.executable, "-u", "-c", script]
+
+
+@test
+def a_run_that_keeps_talking_is_never_killed_for_taking_long():
+    """The bug this replaces: twelve real runs killed mid-work by a total
+    ceiling, every one of them still producing events when it died.
+
+    The run below outlives its budget four times over and must survive, because
+    it never goes quiet for longer than the budget.
+    """
+    root, s = make_vault()
+    try:
+        shell = ClaudeCodeShell(s)
+        # 20 events, 0.2s apart — 4s of run against a 1s idle budget.
+        final, live, err = shell._stream(_emitter(
+            "import json,time,sys\n"
+            "for i in range(20):\n"
+            "    print(json.dumps({'type':'stream_event','event':{"
+            "'type':'content_block_delta','index':0,"
+            "'delta':{'type':'text_delta','text':'x'}}}))\n"
+            "    time.sleep(0.2)\n"
+            "print(json.dumps({'type':'result','result':'done',"
+            "'session_id':'s1'}))\n"
+        ), os.environ.copy(), 1, None)
+        eq(err, "", f"a talking run was killed anyway: {err!r}")
+        ok(final is not None, "the final payload never arrived")
+        eq(final.get("result"), "done")
+        eq(live.text, "x" * 20, "every delta should have landed")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_run_that_goes_quiet_is_killed_and_keeps_what_it_said():
+    """The guard the idle budget still has to provide: a hung child dies, and
+    the half-answer it had already written survives it."""
+    root, s = make_vault()
+    try:
+        shell = ClaudeCodeShell(s)
+        final, live, err = shell._stream(_emitter(
+            "import json,time,sys\n"
+            "print(json.dumps({'type':'stream_event','event':{"
+            "'type':'content_block_delta','index':0,"
+            "'delta':{'type':'text_delta','text':'half an answer'}}}))\n"
+            "time.sleep(300)\n"
+        ), os.environ.copy(), 1, None)
+        ok(final is None, "a killed run has no final payload")
+        ok("stalled" in err, f"the error should name the stall, not a duration: {err!r}")
+        eq(live.text, "half an answer",
+           "what the run had written is worth more than the local fallback")
     finally:
         shutil.rmtree(root)
 
