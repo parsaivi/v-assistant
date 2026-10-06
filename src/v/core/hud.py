@@ -167,6 +167,33 @@ DRIFT_TTL = 30.0
 #: blanks when the calendar service is unreachable.
 JALALI_TTL = 3600.0 * 6
 
+#: The PLACES view's basemap. Neshan has no tile endpoint a service key can
+#: reach — the SDK's tiles are behind the *web* key and a CDN script — so the
+#: map is tiled out of the static endpoint instead: one image per cell of a
+#: fixed pixel grid, centred on the cell. `TILE_PAD` is fetched on every side
+#: and cropped away by the page, because every static image carries Neshan's
+#: logo in its corner and a grid of them is a wall of logos. The attribution
+#: is drawn once, on the map, instead.
+TILE_PX = 512
+TILE_PAD = 128
+#: 10 is the whole of Tehran on one screen; past 17 the static raster has
+#: nothing more to say. Neshan itself accepts 5–19.
+TILE_ZOOMS = (10, 17)
+#: New tiles fetched per rolling hour. A tile is cached on disk for good —
+#: streets move slower than this process restarts — so this only bites the
+#: first time a part of the city is looked at closely. It exists because each
+#: one is a request against the same Neshan quota `N_MAPS` guards, and a
+#: dashboard that can spend a quota by being dragged around is one drag away
+#: from spending all of it.
+TILE_BUDGET = 60
+#: A tile that failed is not asked for again for this long. A pan back over a
+#: dead cell would otherwise be a request every time; the page retries a hole
+#: on its own once this has passed.
+TILE_RETRY = 60.0
+#: The anchor every distance on the map is measured from — the same name
+#: `vault_places_search(near=…)` resolves, so the map and V agree on it.
+PLACE_HOME = "Home"
+
 #: Which arc of the aperture a tool call lights. The design draws four —
 #: VLT · CAL · MSG · MEM — and these are the real MCP tool names behind them.
 _ARCS = (
@@ -1167,6 +1194,86 @@ def _drift(engine, cache: dict) -> list[str]:
     return val
 
 
+def _places(engine) -> dict:
+    """The PLACES view: every place note, with what the map needs to draw it.
+
+    Not `QueryEngine.places()`, though it reads the same rows: that one is a
+    *question* — it filters, ranks, and drops a place with no coordinates from
+    any "near" answer. A map has no question; it is every place there is, and
+    one without a `location` is still listed, as unplotted, because a café the
+    map silently left out reads as a café that does not exist.
+
+    `visits` is the daily notes that link to the place — the same count each
+    place note's own `## Visits` block computes in Dataview, so the HUD and
+    Obsidian cannot disagree about it. SQL over `links`, like the rest.
+    """
+    from . import query as query_mod
+    q = engine.q
+    home = q.resolve_anchor(PLACE_HOME)
+    daily = engine.s.folders.daily + "/"
+    rows = []
+    for r in q.by_type("place"):
+        m = r.meta
+        loc = query_mod._parse_latlng(m.get("location"))
+        stem = r.rel[:-3] if r.rel.endswith(".md") else r.rel
+        days = sorted({
+            Path(src).stem for (src,) in engine.conn.execute(
+                "SELECT src FROM links WHERE dst=? OR dst=?",
+                (stem, stem.rsplit("/", 1)[-1]))
+            if src.startswith(daily) and _is_iso_day(Path(src).stem)})
+        try:
+            rating = float(m.get("rating")) if m.get("rating") not in (None, "") else None
+        except (TypeError, ValueError):
+            rating = None
+        row = {
+            "rel": r.rel,
+            # The note's title, not its `name:` — two branches of one café
+            # share a name and only the filename tells them apart. The name
+            # rides along for the detail card, where it is often the Persian.
+            "title": r.title,
+            "name": str(m.get("name") or ""),
+            "category": str(m.get("category") or "").strip().lower(),
+            "lat": loc[0] if loc else None,
+            "lng": loc[1] if loc else None,
+            "rating": rating,
+            "price": str(m.get("price") or ""),
+            "neighborhood": str(m.get("neighborhood") or ""),
+            "city": str(m.get("city") or ""),
+            "visited": str(m.get("visited") or ""),
+            "good_for": str(m.get("good-for") or ""),
+            "noise": str(m.get("noise") or ""),
+            "wifi": query_mod._tri(m.get("wifi")),
+            "outdoor": query_mod._tri(m.get("outdoor-seating")),
+            "open_late": query_mod._tri(m.get("open-late")),
+            "visits": len(days),
+            "last_visit": days[-1] if days else "",
+            "home_km": None,
+        }
+        if loc and home:
+            row["home_km"] = round(query_mod.haversine_km(home[0], home[1], *loc), 1)
+        rows.append(row)
+    rows.sort(key=lambda p: (-(p["rating"] or 0), p["title"].lower()))
+    return {
+        "places": rows,
+        "home": ({"lat": home[0], "lng": home[1], "title": home[2]}
+                 if home else None),
+        "unplotted": sum(1 for p in rows if p["lat"] is None),
+        "basemap": "neshan" if engine.s.neshan_api_key else "",
+        # For the card's `obsidian://` link, which names the vault by folder.
+        "vault": engine.s.vault.name,
+        "tile": {"px": TILE_PX, "pad": TILE_PAD,
+                 "zmin": TILE_ZOOMS[0], "zmax": TILE_ZOOMS[1]},
+    }
+
+
+def _is_iso_day(stem: str) -> bool:
+    try:
+        dt.date.fromisoformat(stem)
+    except ValueError:
+        return False
+    return True
+
+
 def snapshot(engine, session: Session, caches: dict,
              now: dt.datetime | None = None) -> dict:
     """Every panel, in one call, on the engine thread.
@@ -1475,6 +1582,130 @@ class _Scout:
         self.stop_flag.set()
 
 
+class _Tiles:
+    """The PLACES basemap: Neshan statics on a fixed grid, cached for good.
+
+    Cell `(x, y)` at zoom `z` is the `TILE_PX` square of world pixels starting
+    at `(x·TILE_PX, y·TILE_PX)` — the same Web Mercator `mercator_px` uses, so
+    a pin projected by the page lands on the street it is on. The image is
+    fetched `TILE_PAD` larger on every side and the page crops it; see
+    `TILE_PAD` for why.
+
+    Runs on the HTTP handler's thread, never the engine's: a tile is a network
+    round trip, and an answer must not wait behind someone dragging a map. No
+    engine is needed — the cache is a directory and the fetch is `mapsearch`.
+
+    What it sends Neshan is a grid cell, not a place: the centre of whichever
+    square is on screen. `place_map` already sends the exact coordinates of a
+    café to the same service, so this opens no new class of leak — it is the
+    same one, coarser.
+    """
+
+    def __init__(self, s: Settings):
+        self.s = s
+        self.dir = s.state_dir / "renders" / "tiles"
+        self._lock = threading.Lock()
+        self._spent: list[float] = []      # when each fresh fetch happened
+        self._dead: dict[str, tuple[float, str]] = {}   # cell → when, why
+        self._busy: dict[str, threading.Event] = {}
+
+    def path(self, z: int, x: int, y: int) -> Path:
+        lo, hi = TILE_ZOOMS
+        if not lo <= z <= hi:
+            raise HudError(400, f"zoom {z} is outside {lo}–{hi}")
+        cells = _world_px(z) // TILE_PX
+        if not (0 <= x < cells and 0 <= y < cells):
+            raise HudError(400, "no such tile")
+        return self.dir / str(z) / f"{x}-{y}.png"
+
+    def get(self, z: int, x: int, y: int) -> bytes:
+        dest = self.path(z, x, y)
+        key = f"{z}/{x}/{y}"
+        if dest.is_file():
+            return dest.read_bytes()
+        if not self.s.neshan_api_key:
+            raise HudError(404, "no basemap — neshan_api_key is not set")
+        # One fetch per cell, however many requests ask for it at once: the
+        # page asks for every visible tile together, and a pan can ask twice.
+        with self._lock:
+            now = time.time()
+            when, why = self._dead.get(key, (0.0, ""))
+            if now - when < TILE_RETRY:
+                raise HudError(503, f"failed {now - when:.0f}s ago: {why}")
+            # Again, under the lock: another request may have landed it
+            # between the check above and here.
+            if dest.is_file():
+                return dest.read_bytes()
+            wait = self._busy.get(key)
+            if wait is None:
+                self._spent = [t for t in self._spent if now - t < 3600.0]
+                if len(self._spent) >= TILE_BUDGET:
+                    raise HudError(429, f"tile budget spent — {TILE_BUDGET} "
+                                        "new tiles an hour; cached ones still draw")
+                self._spent.append(now)
+                self._busy[key] = threading.Event()
+        if wait is not None:
+            wait.wait(30)
+            if dest.is_file():
+                return dest.read_bytes()
+            raise HudError(503, "tile fetch failed")
+        try:
+            blob = self._fetch(z, x, y)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(".part")
+            tmp.write_bytes(blob)
+            tmp.replace(dest)
+            return blob
+        except HudError as exc:
+            with self._lock:
+                self._dead[key] = (time.time(), exc.message)
+                # A request that failed is refunded: a dead network must not
+                # spend the hour's budget on tiles it never got.
+                if self._spent:
+                    self._spent.pop()
+            raise
+        except OSError as exc:
+            raise HudError(503, f"tile cache unwritable: {exc}") from exc
+        finally:
+            with self._lock:
+                done = self._busy.pop(key, None)
+            if done is not None:
+                done.set()
+
+    def _fetch(self, z: int, x: int, y: int) -> bytes:
+        from . import mapsearch            # httpx, and only on this path
+        lat, lng = mapsearch.mercator_latlng(
+            (x + 0.5) * TILE_PX, (y + 0.5) * TILE_PX, z)
+        side = TILE_PX + 2 * TILE_PAD
+        # Once more on a failure, after a breath. Seen on the first real run:
+        # one cell of six came back bad and the same request a minute later
+        # was fine — and a hole in the city is worse than half a second.
+        for attempt in (1, 2):
+            try:
+                blob = mapsearch.static_map(lat, lng, z, side, side,
+                                            settings=self.s)
+                break
+            except mapsearch.MapSearchError as exc:
+                if attempt == 2:
+                    raise HudError(503, str(exc)) from exc
+                time.sleep(0.5)
+        if not blob:
+            raise HudError(404, "no basemap — neshan_api_key is not set")
+        return blob
+
+    def cached(self) -> int:
+        try:
+            return sum(1 for _ in self.dir.glob("*/*.png"))
+        except OSError:
+            return 0
+
+
+def _world_px(z: int) -> int:
+    """The world's width in pixels at `z`. `mapsearch.TILE_PX` is 256 and the
+    grid here is 512 — two different tiles, and easy to confuse."""
+    return 256 * (2 ** z)
+
+
 class Hud:
     """The application. Owns the engine thread, the session and the caches."""
 
@@ -1484,6 +1715,7 @@ class Hud:
         self.scout = _Scout(self.s, self.session)
         self.session.watch = self.scout.saw
         self.bridge = _Bridge(self.s, self.session)
+        self.tiles = _Tiles(self.s)
         self.caches: dict = {}
         self._snap: dict | None = None
         self._snap_at = 0.0
@@ -1550,6 +1782,23 @@ class Hud:
             raise HudError(400, f"unknown view {view!r}")
         return self.bridge.call(
             lambda e: _task_view(e, dt.date.today(), view))
+
+    def places(self) -> dict:
+        """The PLACES surface. Free, like the rest: rows and links out of the
+        mirror. The only thing on that view that reaches a network is the
+        basemap, and that is `tile()`, which does not go through here."""
+        out = self.bridge.call(_places)
+        tiles = getattr(self, "tiles", None)
+        out["tiles_cached"] = tiles.cached() if tiles is not None else 0
+        return out
+
+    def tile(self, z: int, x: int, y: int) -> bytes:
+        """One basemap cell, as PNG bytes. Not on the engine thread — see
+        `_Tiles`. A `BareHud` in the tests has none, and says so."""
+        tiles = getattr(self, "tiles", None)
+        if tiles is None:
+            raise HudError(503, "no basemap on this server")
+        return tiles.get(z, x, y)
 
     # ---- writes -------------------------------------------------------
     def chat(self, text: str) -> dict:
@@ -2115,6 +2364,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 from urllib.parse import parse_qs
                 view = (parse_qs(query).get("view") or ["open"])[0]
                 return self._json(self.app.tasks(view))
+            if path == "/api/places":
+                return self._json(self.app.places())
+            if path == "/api/tile":
+                return self._tile(query)
             if path == "/api/search":
                 from urllib.parse import parse_qs, unquote
                 q = (parse_qs(query).get("q") or [""])[0]
@@ -2208,6 +2461,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if ctype.startswith("text/") or ctype.endswith(("javascript", "json")):
             ctype += "; charset=utf-8"
         self._send(200, path.read_bytes(), ctype)
+
+    def _tile(self, query: str) -> None:
+        """A basemap cell. Addressed by grid coordinates, never by a path, so
+        like `/api/media` there is nothing here to traverse with — three
+        integers, range-checked by `_Tiles.path` before the disk is touched.
+
+        Cached by the browser for a week: a cell is immutable once fetched,
+        and a pan back over ground already seen should cost nothing at all.
+        """
+        from urllib.parse import parse_qs
+        args = parse_qs(query)
+        try:
+            z, x, y = (int((args.get(k) or [""])[0]) for k in ("z", "x", "y"))
+        except ValueError:
+            raise HudError(400, "z, x and y must be integers") from None
+        body = self.app.tile(z, x, y)
+        self._send(200, body, "image/png", cache="private, max-age=604800")
 
     def _media(self, fid: str) -> None:
         """One frame's bytes, addressed by handle rather than by path.

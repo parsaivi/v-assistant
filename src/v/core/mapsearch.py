@@ -589,6 +589,17 @@ def mercator_px(lat: float, lng: float, zoom: int) -> tuple[float, float]:
     return x, y
 
 
+def mercator_latlng(x: float, y: float, zoom: int) -> tuple[float, float]:
+    """The inverse of `mercator_px`: world pixels at `zoom` back to (lat, lng).
+    The HUD's place map asks Neshan for a static image *centred on* each cell
+    of a pixel grid, so it has to turn the grid back into coordinates."""
+    import math
+    world = TILE_PX * (2 ** zoom)
+    lng = x / world * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / world))))
+    return lat, lng
+
+
 def static_map(lat: float, lng: float, zoom: int, width: int, height: int, *,
                settings: Settings | None = None) -> bytes | None:
     """The raster tiles for a region, as PNG bytes. `None` with no key, same

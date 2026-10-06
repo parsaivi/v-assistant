@@ -51,6 +51,7 @@ const VIEWS = [
   { id: 'week',    idx: '04', label: 'WEEK',    title: 'WEEK' },
   { id: 'memory',  idx: '05', label: 'MEMORY',  title: 'MEMORY STORE' },
   { id: 'vault',   idx: '06', label: 'VAULT',   title: 'VAULT SEARCH' },
+  { id: 'places',  idx: '07', label: 'PLACES',  title: 'PLACES' },
 ];
 
 /* One colour per block kind, and the vocabulary is closed on the server
@@ -283,6 +284,11 @@ const app = {
   blockEdit: null,      // the block being added or edited, or null
   blockErr: '',         // what the server said no to, shown in the form
   blockBusy: false,     // a write is in flight — don't send it twice
+  places: null,         // the last /api/places
+  placesAt: 0,          // when it landed, so the poll can leave it alone
+  placeCat: '',         // the category chip that is down, or '' for all
+  placeSel: '',         // the selected place, by note path
+  map: null,            // {z, x, y} — the centre, in world pixels at zoom z
   query: '',
   frame: '',           // which frame the viewport is showing, by id
   seenFrames: null,    // ids already on screen — what makes an arrival an arrival
@@ -708,6 +714,14 @@ function paintPaneHead(snap) {
         + (w.now ? `now: ${w.now.title} until ${w.now.until}` : 'nothing on right now');
     },
     memory: () => snap ? `${snap.header.memories} active · decay on read` : '',
+    places: () => {
+      const d = app.places;
+      if (!d || !d.places) return 'place notes, on the city they are in';
+      const visits = d.places.reduce((n, p) => n + (p.visits || 0), 0);
+      return `${d.places.length} places · ${visits} visits logged in daily notes`
+        + (d.unplotted ? ` · ${d.unplotted} with no location` : '')
+        + (d.home ? ` · distances from ${d.home.title}` : '');
+    },
     vault: () => app.hits ? `${app.hits.backend}${app.hits.ms ? ' · ' + app.hits.ms + 'ms' : ''}` : 'semantic when embeddings are built',
   }[app.view];
   $('pane-m').textContent = meta ? meta() : '';
@@ -725,6 +739,12 @@ function paintPaneHead(snap) {
       return 'NOTHING LEFT THIS WEEK';
     },
     memory: () => 'SORTED BY SALIENCE',
+    places: () => {
+      const d = app.places;
+      if (!d || !d.places) return '';
+      return d.basemap ? `BASEMAP NESHAN · ${d.tiles_cached || 0} TILES CACHED`
+                       : 'NO BASEMAP · neshan_api_key UNSET';
+    },
     vault: () => s ? `${s.notes.toLocaleString()} NOTES INDEXED` : '',
   }[app.view];
   $('pane-r').textContent = right ? right() : '';
@@ -764,6 +784,7 @@ function paintPane() {
   if (app.view === 'week') return paintWeek();
   if (app.view === 'memory') return paintMemory();
   if (app.view === 'vault') return paintVault();
+  if (app.view === 'places') return paintPlaces();
 }
 
 let lastTurns = 0;
@@ -1620,6 +1641,582 @@ async function nudgeAction(action, key) {
   await refresh(true);
 }
 
+/* ---- places -------------------------------------------------------------
+ *
+ * The map Obsidian's Map View draws over `05 - Locations`, redrawn in this
+ * room's light. Three decisions, each with the alternative it beat:
+ *
+ * **A basemap, not a scatter.** `render.map_html` draws places on a blank
+ * grid, and that module's own docstring is the verdict on it: dots without a
+ * city under them. The streets are Neshan's — fetched and cached by the
+ * server (`hud._Tiles`), never by this page, so its CSP stays `'self'` and
+ * the key never reaches a browser.
+ *
+ * **Recoloured here, not restyled at the source.** The static endpoint has one
+ * style and it is a daytime one — see `MAP_CURVE` for how it is turned into
+ * this one, and why a plain CSS invert was not enough.
+ *
+ * **The map survives the poll.** The pane is rebuilt whenever its signature
+ * moves. The map node is built once and re-attached, so a tile that has
+ * loaded stays loaded; and pan and zoom live in `app.map`, which is never in
+ * the signature — dragging must not rebuild the list beside it.
+ */
+const PLACES_TTL = 30000;
+
+/* One tone per category. Unlike the week's block kinds this vocabulary is
+ * *open* — it is whatever was typed into `category:` — so the map is a
+ * lookup with a fallback, not an exhaustive table. The fallback is lighter
+ * than `C.dim`, which is invisible on a dark street map. */
+const PLACE_TONES = {
+  cafe: C.amber, breakfast: C.amber, bakery: C.amber,
+  restaurant: '#FF8A5A', bar: C.violet, bookstore: C.violet,
+  park: C.green, house: C.green, company: C.cyan, university: C.cyan,
+  club: '#FF9BC7', mall: '#7BD1C4',
+};
+const PLACE_OTHER = '#8FB4C2';
+const placeTone = (cat) => PLACE_TONES[cat] || PLACE_OTHER;
+
+/* Range rings around Home. A city you live in is measured in how far, not in
+ * degrees, and 2 / 5 / 10 km is walk / short ride / across town. */
+const RINGS_KM = [2, 5, 10];
+/* Labels on every pin from this zoom in; below it they are a pile. */
+const LABEL_Z = 14;
+/* "Fit" means fit the city, not every place there is: one note in Karaj
+ * would otherwise zoom Tehran down to a smudge. Further than this from the
+ * median is still listed, still a pin, and one click from the list. */
+const FIT_KM = 25;
+
+/* The basemap's tone curve: input luminance → output brightness, as control
+ * points, fed to an SVG `feComponentTransfer` and then tinted cyan.
+ *
+ * A CSS `invert()` was the first cut and it was a dark map nobody could read.
+ * Neshan's raster lives in a band fifteen points wide — land is 0.91, white
+ * streets 1.0, the salmon highways 0.85, parks 0.87 — and inverting it turns
+ * the streets *darker* than the land, faint black lines on near-black. A
+ * curve can do what no monotonic filter can: land drops to black, streets
+ * and highways light up, and the dark street names come out brightest of
+ * all, so the Persian labels survive the trip. The numbers were read off the
+ * cached tiles' own histograms; a restyle on Neshan's side will show up here
+ * as a strange-looking map, not a broken one. */
+const MAP_CURVE = [[0, .9], [.55, .9], [.72, .42], [.82, .58], [.855, .66],
+                   [.872, .08], [.9, .04], [.925, .03], [.94, .22], [.97, .32], [1, .44]];
+const MAP_TINT = [.42, .88, 1];      /* --cyan, as a multiplier */
+
+function curveTable(pts, n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const x = i / (n - 1);
+    let k = 0;
+    while (k < pts.length - 2 && x > pts[k + 1][0]) k++;
+    const [x0, y0] = pts[k], [x1, y1] = pts[k + 1];
+    out.push((y0 + (y1 - y0) * Math.max(0, Math.min(1, (x - x0) / (x1 - x0)))).toFixed(3));
+  }
+  return out.join(' ');
+}
+
+const SVGNS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs, text, kids) {
+  const node = document.createElementNS(SVGNS, tag);
+  for (const k in (attrs || {})) node.setAttribute(k, String(attrs[k]));
+  if (text !== undefined) node.textContent = String(text);
+  for (const kid of (kids || [])) node.appendChild(kid);
+  return node;
+}
+
+/* Web Mercator at 256px per tile — `mapsearch.mercator_px`, in the browser.
+ * The two must agree to the pixel or every pin sits one street over. */
+const worldPx = (z) => 256 * Math.pow(2, z);
+function project(lat, lng, z) {
+  const w = worldPx(z), s = Math.sin(lat * Math.PI / 180);
+  return { x: (lng + 180) / 360 * w,
+           y: (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * w };
+}
+function unproject(x, y, z) {
+  const w = worldPx(z);
+  return { lat: Math.atan(Math.sinh(Math.PI * (1 - 2 * y / w))) * 180 / Math.PI,
+           lng: x / w * 360 - 180 };
+}
+/** Metres per screen pixel at this latitude and zoom. */
+const mpp = (lat, z) => 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, z);
+
+const plotted = (p) => p.lat !== null && p.lat !== undefined;
+/* The chip key for a note with no `category:`. Not '' — that is the ALL chip,
+ * and sharing it lit both at once and made UNFILED a second ALL button. */
+const UNFILED = '~';
+const catKey = (p) => p.category || UNFILED;
+const placeShown = (p) => !app.placeCat || catKey(p) === app.placeCat;
+
+/* Same race as the task list, same fix. */
+let placeSeq = 0;
+
+async function loadPlaces() {
+  const seq = ++placeSeq;
+  let next;
+  try {
+    const r = await fetch('/api/places');
+    if (!r.ok) throw new Error('places ' + r.status);
+    next = await r.json();
+  } catch (err) {
+    next = { places: [], error: String(err.message || err) };
+  }
+  if (seq !== placeSeq) return;
+  app.places = next;
+  app.placesAt = Date.now();
+  if (app.view === 'places') { paintPane(); paintPaneHead(app.snap); }
+}
+
+function paintPlaces() {
+  const d = app.places;
+  /* Not `tiles_cached` — it moves every time a tile lands, and a list rebuilt
+   * on every tile is a list that cannot be scrolled while the map loads. */
+  renderPane([d ? JSON.stringify([d.places, d.home, d.basemap, d.error]) : '',
+              app.placeCat, app.placeSel].join('|'),
+             (node) => paintPlacesInto(node, d));
+  drawMap();
+}
+
+function paintPlacesInto(pane, d) {
+  if (!d) { fill(pane, [el('div.empty', { text: 'READING PLACE NOTES…' })]); return; }
+  if (d.error && !(d.places || []).length) {
+    fill(pane, [el('div.empty', { text: 'NO PLACES PANEL — ' + d.error.toUpperCase()
+      + ' · RESTART v hud IF IT PREDATES THIS VIEW' })]);
+    return;
+  }
+  const m = placeMap();
+  paintLegend(m, d);
+  paintPins(m, d);
+  const keep = m.list ? m.list.scrollTop : 0;
+  m.list = placeList(d);
+  fill(pane, [el('div.places', {}, [m.root, m.list])]);
+  m.list.scrollTop = keep;
+  const sel = m.list.querySelector('[aria-current="true"]');
+  if (sel) sel.scrollIntoView({ block: 'nearest' });
+  m.last = '';
+  if (!app.map) fitPlaces();
+}
+
+/* ---- the map node, built once ------------------------------------------ */
+let pmap = null;
+
+/* The filter `.pm-tiles img` points at. In the document rather than in the
+ * stylesheet because `filter: url(#id)` can only name an element. */
+function toneFilter() {
+  const table = curveTable(MAP_CURVE, 201);
+  const lum = '0.2126 0.7152 0.0722 0 0 ';
+  const [r, g, b] = MAP_TINT;
+  return svgEl('svg', { width: 0, height: 0, 'aria-hidden': 'true', class: 'pm-defs' }, undefined, [
+    svgEl('filter', { id: 'pm-tone', 'color-interpolation-filters': 'sRGB' }, undefined, [
+      svgEl('feColorMatrix', { type: 'matrix', values: lum + lum + lum + '0 0 0 1 0' }),
+      svgEl('feComponentTransfer', {}, undefined, ['feFuncR', 'feFuncG', 'feFuncB'].map(
+        (f) => svgEl(f, { type: 'table', tableValues: table }))),
+      svgEl('feColorMatrix', { type: 'matrix', values:
+        `${r} 0 0 0 0.012 0 ${g} 0 0 0.03 0 0 ${b} 0 0.045 0 0 0 1 0` }),
+    ]),
+  ]);
+}
+
+function placeMap() {
+  if (pmap) return pmap;
+  const tiles = el('div.pm-tiles');
+  const svg = svgEl('svg', { class: 'pm-svg' });
+  const sweep = el('div.pm-sweep');
+  const pins = el('div.pm-pins');
+  const legend = el('div.pm-legend');
+  const read = el('div.pm-read');
+  const bar = el('i');
+  const barText = el('span');
+  const note = el('div.pm-note');
+  const btn = (text, title, fn) =>
+    el('button', { type: 'button', title, 'aria-label': title, onclick: fn, text });
+  const root = el('div.pmap', {}, [
+    toneFilter(), tiles, el('div.pm-tint'), sweep, svg, pins, el('div.pm-vig'),
+    el('div.corner.tl'), el('div.corner.tr'), el('div.corner.bl'), el('div.corner.br'),
+    legend,
+    el('div.pm-ctl', {}, [
+      btn('+', 'zoom in', () => zoomMap(1)),
+      btn('−', 'zoom out', () => zoomMap(-1)),
+      btn('FIT', 'fit the city', () => { fitPlaces(); drawMap(); }),
+      btn('⌂', 'centre on Home', () => flyHome()),
+    ]),
+    el('div.pm-scale', {}, [bar, barText]),
+    read, note,
+    el('div.pm-attr', { text: '© NESHAN · © OPENSTREETMAP' }),
+  ]);
+  pmap = { root, tiles, svg, sweep, pins, legend, read, bar, barText, note,
+           list: null, tileEls: new Map(), pinEls: [], last: '', cursor: null };
+
+  /* Drag to pan. Pointer capture rather than document listeners, so a drag
+   * that leaves the map keeps going and a release outside it still ends it. */
+  let drag = null;
+  root.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || e.target.closest('button, a, .pin')) return;
+    drag = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: 0 };
+    root.setPointerCapture(e.pointerId);
+  });
+  root.addEventListener('pointermove', (e) => {
+    const r = root.getBoundingClientRect();
+    pmap.cursor = { x: e.clientX - r.left, y: e.clientY - r.top };
+    if (drag && e.pointerId === drag.id && app.map) {
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      drag.x = e.clientX; drag.y = e.clientY;
+      drag.moved += Math.abs(dx) + Math.abs(dy);
+      if (drag.moved > 3) root.dataset.drag = '1';
+      app.map.x -= dx; app.map.y -= dy;
+      drawMap();
+    } else {
+      paintReadout();
+    }
+  });
+  const end = (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    /* A click on bare map — no drag — lets go of the selection. */
+    if (drag.moved <= 3 && e.type === 'pointerup' && app.placeSel) selectPlace('');
+    drag = null;
+    root.dataset.drag = '0';
+  };
+  root.addEventListener('pointerup', end);
+  root.addEventListener('pointercancel', end);
+  root.addEventListener('pointerleave', () => { pmap.cursor = null; paintReadout(); });
+  /* One zoom step per gesture, not per event: a trackpad sends a burst of
+   * small deltas, and integer zooms are what the tiles exist at. */
+  let wheelAt = 0;
+  root.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (Date.now() - wheelAt < 220 || Math.abs(e.deltaY) < 4) return;
+    wheelAt = Date.now();
+    const r = root.getBoundingClientRect();
+    zoomMap(e.deltaY < 0 ? 1 : -1, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  root.addEventListener('dblclick', (e) => {
+    if (e.target.closest('button, a, .pin')) return;
+    const r = root.getBoundingClientRect();
+    zoomMap(1, e.clientX - r.left, e.clientY - r.top);
+  });
+  /* The pane is a flex child, so its size moves with the window and with
+   * the rails; every one of those is a redraw, and none of them is a poll. */
+  new ResizeObserver(() => { pmap.last = ''; if (!app.map) fitPlaces(); drawMap(); })
+    .observe(root);
+  return pmap;
+}
+
+function tileSpec() {
+  const t = app.places && app.places.tile;
+  return t || { px: 512, pad: 128, zmin: 10, zmax: 17 };
+}
+
+function zoomMap(dz, sx, sy) {
+  if (!app.map || !pmap) return;
+  const { zmin, zmax } = tileSpec();
+  const z = Math.max(zmin, Math.min(zmax, app.map.z + dz));
+  if (z === app.map.z) return;
+  const w = pmap.root.clientWidth, h = pmap.root.clientHeight;
+  sx = sx === undefined ? w / 2 : sx;
+  sy = sy === undefined ? h / 2 : sy;
+  /* Zoom about the cursor: the world point under it stays under it. */
+  const k = Math.pow(2, z - app.map.z);
+  const wx = (app.map.x - w / 2 + sx) * k, wy = (app.map.y - h / 2 + sy) * k;
+  app.map = { z, x: wx - sx + w / 2, y: wy - sy + h / 2 };
+  drawMap();
+}
+
+function centreOn(lat, lng, z) {
+  const p = project(lat, lng, z);
+  app.map = { z, x: p.x, y: p.y };
+}
+
+function fitPlaces() {
+  if (!pmap) return;
+  const w = pmap.root.clientWidth, h = pmap.root.clientHeight;
+  if (!w || !h) return;
+  const all = ((app.places && app.places.places) || []).filter(plotted);
+  const { zmin, zmax } = tileSpec();
+  if (!all.length) { centreOn(35.715, 51.40, 12); return; }
+  const med = (xs) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+  const mlat = med(all.map((p) => p.lat)), mlng = med(all.map((p) => p.lng));
+  const kmPerDeg = 111.32;
+  const near = all.filter((p) => Math.hypot((p.lat - mlat) * kmPerDeg,
+    (p.lng - mlng) * kmPerDeg * Math.cos(mlat * Math.PI / 180)) <= FIT_KM);
+  const pts = near.length ? near : all;
+  const lats = pts.map((p) => p.lat), lngs = pts.map((p) => p.lng);
+  const n = Math.max(...lats), s = Math.min(...lats);
+  const e = Math.max(...lngs), wst = Math.min(...lngs);
+  let z = zmin;
+  for (let zz = zmax; zz >= zmin; zz--) {
+    const a = project(n, wst, zz), b = project(s, e, zz);
+    if (b.x - a.x <= w - 140 && b.y - a.y <= h - 120) { z = zz; break; }
+  }
+  const a = project(n, wst, z), b = project(s, e, z);
+  app.map = { z, x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+}
+
+function flyHome() {
+  const home = app.places && app.places.home;
+  if (!home) return;
+  centreOn(home.lat, home.lng, Math.max(app.map ? app.map.z : 13, 13));
+  drawMap();
+}
+
+function flyTo(p) {
+  if (!plotted(p)) return;
+  centreOn(p.lat, p.lng, Math.max(app.map ? app.map.z : 15, 15));
+}
+
+function selectPlace(rel, fly) {
+  app.placeSel = app.placeSel === rel ? '' : rel;
+  const p = app.placeSel && app.places.places.find((x) => x.rel === app.placeSel);
+  if (p && fly) flyTo(p);
+  paintPane();
+}
+
+/* ---- what goes on it ---------------------------------------------------- */
+function placeRows(p) {
+  const yn = (v) => v === true ? 'yes' : v === false ? 'no' : null;
+  return [
+    ['CATEGORY', p.category || 'not filed'],
+    p.rating !== null ? ['RATING', `${p.rating} / 10`] : ['RATING', 'unrated'],
+    p.price ? ['PRICE', p.price] : null,
+    p.neighborhood || p.city ? ['WHERE', [p.neighborhood, p.city].filter(Boolean).join(', ')] : null,
+    p.home_km !== null && p.home_km !== undefined ? ['FROM HOME', `${p.home_km} km`] : null,
+    ['VISITS', p.visits ? `${p.visits} · last ${p.last_visit}` : 'none linked from a daily note'],
+    p.visited ? ['FIRST', p.visited] : null,
+    p.good_for ? ['GOOD FOR', p.good_for] : null,
+    p.noise ? ['NOISE', p.noise] : null,
+    yn(p.wifi) ? ['WIFI', yn(p.wifi)] : null,
+    yn(p.outdoor) ? ['OUTDOOR', yn(p.outdoor)] : null,
+    yn(p.open_late) ? ['OPEN LATE', yn(p.open_late)] : null,
+  ];
+}
+
+function paintLegend(m, d) {
+  const counts = {};
+  for (const p of d.places) counts[catKey(p)] = (counts[catKey(p)] || 0) + 1;
+  const cats = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.localeCompare(b));
+  /* A chip whose category has gone — renamed in the note — would hold the
+   * filter on an empty map with nothing to click to get out of it. */
+  if (app.placeCat && !counts[app.placeCat]) app.placeCat = '';
+  const chip = (id, label, n, tone) => {
+    const b = el('button', { type: 'button', style: `--t:${tone}`,
+      onclick: () => { app.placeCat = app.placeCat === id ? '' : id; paintPane(); } }, [
+      id ? el('i') : null, el('span', { text: label }), el('span.n', { text: String(n) }),
+    ]);
+    b.setAttribute('aria-pressed', String(app.placeCat === id));
+    return b;
+  };
+  fill(m.legend, [chip('', 'ALL', d.places.length, C.cyan),
+    ...cats.map((c) => chip(c, c === UNFILED ? 'UNFILED' : c.toUpperCase(),
+                            counts[c], placeTone(c)))]);
+}
+
+function paintPins(m, d) {
+  const home = d.home;
+  m.pinEls = d.places.filter((p) => plotted(p) && placeShown(p)).map((p) => {
+    const isHome = home && p.lat === home.lat && p.lng === home.lng;
+    const node = el('div.pin', { style: `--t:${isHome ? C.cyan : placeTone(p.category)}`,
+      onclick: (e) => { e.stopPropagation(); selectPlace(p.rel); } }, [
+      el('i.halo'), el('i.dot'), el('span.lbl', { text: isHome ? 'HOME' : p.title }),
+    ]);
+    node.dataset.sel = app.placeSel === p.rel ? '1' : '0';
+    if (isHome) node.dataset.home = '1';
+    probed(node, 'PLACE', p.title, placeRows(p));
+    return { node, p, at: {} };
+  });
+  /* Selected last, so it draws over whatever it sits on. */
+  m.pinEls.sort((a, b) => (a.node.dataset.sel === '1') - (b.node.dataset.sel === '1'));
+  fill(m.pins, m.pinEls.map((x) => x.node));
+}
+
+function placeList(d) {
+  const rows = d.places.filter(placeShown);
+  const row = (p) => {
+    const tone = placeTone(p.category);
+    const sel = app.placeSel === p.rel;
+    const meta = [p.category || 'unfiled', p.neighborhood,
+      p.home_km !== null && p.home_km !== undefined ? `${p.home_km} km` : null,
+      plotted(p) ? null : 'no location'].filter(Boolean).join(' · ');
+    const r = el('div.prow', { style: `--t:${tone}`, role: 'button', tabindex: '0',
+      onclick: () => selectPlace(p.rel, true),
+      onkeydown: (e) => { if (e.key === 'Enter') selectPlace(p.rel, true); } }, [
+      el('span.dot'),
+      el('div.pmid', {}, [el('div.n', { text: p.title }), el('div.m', { text: meta })]),
+      el('span.r', { text: p.rating !== null ? String(p.rating).replace(/\.0$/, '') : '—' }),
+    ]);
+    r.setAttribute('aria-current', String(sel));
+    return sel ? [r, placeCard(p, tone)] : [r];
+  };
+  return el('div.plist', {}, rows.length ? rows.flatMap(row)
+    : [el('div.empty', { text: 'NO PLACE NOTES IN THIS CATEGORY.' })]);
+}
+
+function placeCard(p, tone) {
+  const kv = placeRows(p).filter(Boolean).flatMap(([k, v]) =>
+    [el('span.k', { text: k }), el('span.v', { text: v })]);
+  const stars = p.rating !== null ? el('div.bar', {},
+    Array.from({ length: 10 }, (_, i) => {
+      const s = el('i'); s.dataset.on = i < Math.round(p.rating) ? '1' : '0'; return s;
+    })) : null;
+  const vault = app.places.vault || '';
+  const href = 'obsidian://open?' + (vault ? 'vault=' + encodeURIComponent(vault) + '&' : '')
+    + 'file=' + encodeURIComponent(p.rel.replace(/\.md$/, ''));
+  return el('div.pcard', { style: `--t:${tone}` }, [
+    p.name && p.name !== p.title ? el('div.nm', { text: p.name }) : null,
+    stars,
+    el('div.kv', {}, kv),
+    el('div.acts', {}, [
+      plotted(p) ? el('button', { type: 'button', text: 'CENTRE',
+        onclick: () => { flyTo(p); drawMap(); } }) : null,
+      el('a', { href, text: 'OPEN NOTE ↗', title: p.rel }),
+    ]),
+  ]);
+}
+
+/* ---- the draw ----------------------------------------------------------
+ * Everything that moves with the map, and nothing that does not. Cheap
+ * enough to run on every pointer event: a dozen tiles repositioned, thirty
+ * pins, three rings and a graticule. */
+function drawMap() {
+  const m = pmap;
+  if (app.view !== 'places' || !m || !m.root.isConnected || !app.map) return;
+  const w = m.root.clientWidth, h = m.root.clientHeight;
+  if (!w || !h) return;
+  const { z } = app.map;
+  const sig = [z, Math.round(app.map.x), Math.round(app.map.y), w, h, m.pinEls.length].join(',');
+  if (m.last === sig) return;
+  m.last = sig;
+  const left = app.map.x - w / 2, top = app.map.y - h / 2;
+  m.root.dataset.labels = z >= LABEL_Z ? '1' : '0';
+
+  /* Tiles: keyed, so one that is already on screen is moved, not reloaded. */
+  const d = app.places || {};
+  const want = new Set();
+  if (d.basemap) {
+    const T = tileSpec().px, cells = worldPx(z) / T;
+    for (let ty = Math.floor(top / T); ty <= Math.floor((top + h) / T); ty++) {
+      for (let tx = Math.floor(left / T); tx <= Math.floor((left + w) / T); tx++) {
+        if (tx < 0 || ty < 0 || tx >= cells || ty >= cells) continue;
+        const key = `${z}/${tx}/${ty}`;
+        want.add(key);
+        let img = m.tileEls.get(key);
+        if (!img) {
+          img = el('img', { src: `/api/tile?z=${z}&x=${tx}&y=${ty}`, alt: '',
+                            draggable: 'false', width: T, height: T });
+          const src = img.src;
+          let tries = 0;
+          img.onload = () => { img.dataset.ok = '1'; delete img.dataset.miss; paintNote(); };
+          /* A hole is asked for again once the server's own retry window
+           * (`hud.TILE_RETRY`) has passed — a few times, not forever. */
+          img.onerror = () => {
+            img.dataset.miss = '1';
+            paintNote();
+            if (++tries > 3) return;
+            setTimeout(() => {
+              if (m.tileEls.get(key) === img) img.src = `${src}&try=${tries}`;
+            }, 65000);
+          };
+          m.tileEls.set(key, img);
+          m.tiles.appendChild(img);
+        }
+        img.style.transform = `translate(${Math.round(tx * T - left)}px,${Math.round(ty * T - top)}px)`;
+      }
+    }
+  }
+  for (const [key, img] of m.tileEls) {
+    if (!want.has(key)) { img.remove(); m.tileEls.delete(key); }
+  }
+
+  for (const pin of m.pinEls) {
+    if (pin.at.z !== z) pin.at = { z, ...project(pin.p.lat, pin.p.lng, z) };
+    pin.node.style.transform = `translate(${Math.round(pin.at.x - left)}px,${Math.round(pin.at.y - top)}px)`;
+  }
+
+  drawOverlay(m, left, top, w, h, z);
+  paintReadout();
+  paintNote();
+}
+
+function drawOverlay(m, left, top, w, h, z) {
+  const kids = [];
+  /* The graticule: lines at a round number of degrees, as far apart as the
+   * zoom allows. The labels are coordinates, which is the one thing on this
+   * map that a tile does not already say. */
+  const centre = unproject(app.map.x, app.map.y, z);
+  const degPx = worldPx(z) / 360;
+  const step = [0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001]
+    .filter((s) => s * degPx >= 110).pop() || 0.1;
+  const tl = unproject(left, top, z), br = unproject(left + w, top + h, z);
+  const dp = step < 0.01 ? 3 : 2;
+  for (let lng = Math.ceil(tl.lng / step) * step; lng <= br.lng; lng += step) {
+    const x = project(centre.lat, lng, z).x - left;
+    kids.push(svgEl('line', { x1: x, y1: 0, x2: x, y2: h, class: 'pm-grat' }));
+    /* Labels only where nothing else is pinned to the edge: the readout and
+     * scale own the bottom-left, the attribution the bottom-right. */
+    if (x > 290 && x < w - 270) {
+      kids.push(svgEl('text', { x: x + 4, y: h - 10, class: 'pm-gl' }, lng.toFixed(dp) + '°E'));
+    }
+  }
+  for (let lat = Math.ceil(br.lat / step) * step; lat <= tl.lat; lat += step) {
+    const y = project(lat, centre.lng, z).y - top;
+    kids.push(svgEl('line', { x1: 0, y1: y, x2: w, y2: y, class: 'pm-grat' }));
+    if (y > 170 && y < h - 40) {
+      kids.push(svgEl('text', { x: w - 8, y: y - 4, class: 'pm-gl', 'text-anchor': 'end' },
+        lat.toFixed(dp) + '°N'));
+    }
+  }
+
+  const home = app.places && app.places.home;
+  m.sweep.hidden = true;
+  if (home) {
+    const c = project(home.lat, home.lng, z);
+    const cx = c.x - left, cy = c.y - top;
+    const per = mpp(home.lat, z);
+    for (const km of RINGS_KM) {
+      const r = km * 1000 / per;
+      kids.push(svgEl('circle', { cx, cy, r, class: 'pm-ring' }));
+      kids.push(svgEl('text', { x: cx + 4, y: cy - r - 4, class: 'pm-rl' }, km + ' KM'));
+    }
+    /* The sweep is decoration, so it gives way first: past a few thousand
+     * pixels it is a rotating layer bigger than the screen for nothing. */
+    const r = RINGS_KM[1] * 1000 / per;
+    if (r < 1600) {
+      m.sweep.hidden = false;
+      m.sweep.style.cssText = `width:${2 * r}px;height:${2 * r}px;`
+        + `transform:translate(${Math.round(cx - r)}px,${Math.round(cy - r)}px)`;
+    }
+  }
+  m.svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  m.svg.replaceChildren(...kids);
+
+  /* A scale bar of a round distance, 70–160px long. */
+  const per = mpp(centre.lat, z);
+  const metres = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
+    .find((d) => d / per >= 70) || 20000;
+  m.bar.style.width = Math.round(metres / per) + 'px';
+  m.barText.textContent = metres >= 1000 ? metres / 1000 + ' KM' : metres + ' M';
+}
+
+function paintReadout() {
+  const m = pmap;
+  if (!m || !app.map) return;
+  const w = m.root.clientWidth, h = m.root.clientHeight;
+  const at = m.cursor || { x: w / 2, y: h / 2 };
+  const ll = unproject(app.map.x - w / 2 + at.x, app.map.y - h / 2 + at.y, app.map.z);
+  m.read.textContent = `${m.cursor ? 'CURSOR' : 'CENTRE'} ${ll.lat.toFixed(4)}°N `
+    + `${ll.lng.toFixed(4)}°E · Z${app.map.z}`;
+}
+
+/* Why the streets are missing, when they are. A dark map with no city on it
+ * is otherwise indistinguishable from one that is still loading. */
+function paintNote() {
+  const m = pmap;
+  if (!m) return;
+  const d = app.places || {};
+  let text = '';
+  if (d.places && !d.basemap) text = 'NO BASEMAP — SET neshan_api_key TO DRAW THE STREETS';
+  else if ([...m.tileEls.values()].some((i) => i.dataset.miss === '1'))
+    text = 'SOME TILES DID NOT LOAD — OFFLINE, OR THE HOURLY TILE BUDGET IS SPENT';
+  m.note.textContent = text;
+  m.note.hidden = !text;
+}
+
 /* ---- actions ------------------------------------------------------------ */
 function go(view) {
   app.view = view;
@@ -1636,6 +2233,7 @@ function go(view) {
    * is 120 rows to render six of them everywhere else on the page, and the
    * card in the right rail already covers the glance. */
   if (view === 'tasks') loadTasks();
+  if (view === 'places') loadPlaces();
   if (app.snap) paintPaneHead(app.snap);
   paintPane();
   $('input').focus();
@@ -1971,6 +2569,9 @@ async function refresh(force) {
      * show up here without a reload; a task list nobody is looking at should
      * not be queried every four seconds. */
     if (app.view === 'tasks' && !app.taskBusy) loadTasks();
+    /* Place notes change by the week, not by the poll — but a café added in
+     * Obsidian should still turn up without a reload. */
+    if (app.view === 'places' && Date.now() - app.placesAt > PLACES_TTL) loadPlaces();
   } catch (err) {
     setOffline(true);
   }

@@ -2428,6 +2428,218 @@ def test_the_holiday_flag_is_cached_but_the_date_is_not():
     eq(first["short"], "۱ فروردین ۱۴۰۵")
 
 
+# ---------------------------------------------------------------------------
+# the place map
+
+
+def placey_hud():
+    """A real engine over a vault with a home, a café visited twice, and a
+    place nobody ever gave a location."""
+    root, s = make_vault()
+    loc = root / "09 - Anti-Library/05 - Locations"
+    (loc / "Home.md").write_text(
+        '---\ntype: place\ncategory: house\nlocation: "35.70,51.40"\n---\n',
+        encoding="utf-8")
+    (loc / "Lamiz - Vanak.md").write_text(
+        '---\ntype: place\nname: Lamiz\ncategory: cafe\n'
+        'location: "35.7592,51.4097"\nrating: 10\nwifi: true\n---\n',
+        encoding="utf-8")
+    (loc / "Somewhere.md").write_text(
+        '---\ntype: place\ncategory: bar\n---\n', encoding="utf-8")
+    day = root / "01 - Daily Notes/2026/07 - July"
+    for d in ("2026-07-10", "2026-07-23"):
+        (day / f"{d}.md").write_text(f"Coffee at [[Lamiz - Vanak]] on {d}.\n",
+                                     encoding="utf-8")
+    # A link from a note that is not a day is not a visit.
+    (root / "02 - Work/Issues/ISSUE-1 test issue.md").write_text(
+        "---\ntype: issue\n---\nMet at [[Lamiz - Vanak]].\n", encoding="utf-8")
+    s.git_enabled = False
+    index.rebuild(s, full=True)
+    from v.core.engine import Engine
+    engine = Engine(s, surface=persona.HUD)
+    app = BareHud()
+    app.s = s
+    app.bridge = DirectBridge(engine)
+    return root, s, engine, app
+
+
+@test
+def test_the_place_view_lists_every_place_and_is_free():
+    """A map is not a question: every place note is on it, including the one
+    with no coordinates, which is listed as unplotted rather than dropped."""
+    root, s, engine, app = placey_hud()
+    try:
+        out = app.places()
+        by = {p["title"]: p for p in out["places"]}
+        ok({"Home", "Lamiz - Vanak", "Somewhere", "Cafe A"} <= set(by),
+           f"got {sorted(by)}")
+        eq(by["Lamiz - Vanak"]["name"], "Lamiz",
+           "the title is the note's, the name rides along")
+        eq(by["Somewhere"]["lat"], None)
+        ok(out["unplotted"] >= 1, "the place with no location must be counted")
+        eq(out["home"]["title"], "Home")
+        eq(by["Home"]["home_km"], 0.0)
+        ok(5 < by["Lamiz - Vanak"]["home_km"] < 7,
+           f"distance from Home: {by['Lamiz - Vanak']['home_km']}")
+        eq(by["Lamiz - Vanak"]["visits"], 2, "two daily notes link to it")
+        eq(by["Lamiz - Vanak"]["last_visit"], "2026-07-23")
+        eq(by["Lamiz - Vanak"]["wifi"], True)
+        eq(by["Lamiz - Vanak"]["category"], "cafe")
+        eq(out["places"][0]["rating"], 10.0, "best-rated first")
+        eq(app.session.live()["session"]["spent"], 0.0,
+           "the place view must not spend anything")
+    finally:
+        engine.close()
+        shutil.rmtree(root)
+
+
+class FakeStatic:
+    """`mapsearch.static_map`, counting. Returns a PNG header and nothing else
+    — the cache does not decode, so that is all it needs to be."""
+
+    def __init__(self, fail=None):
+        self.calls = []
+        self.fail = fail
+
+    def __call__(self, lat, lng, zoom, width, height, *, settings=None):
+        self.calls.append((lat, lng, zoom, width, height))
+        if self.fail:
+            raise self.fail
+        return b"\x89PNG fake tile"
+
+
+def with_static(fake):
+    from v.core import mapsearch
+    real = mapsearch.static_map
+    mapsearch.static_map = fake
+    return lambda: setattr(mapsearch, "static_map", real)
+
+
+@test
+def test_a_tile_is_fetched_once_centred_on_its_cell():
+    """The page projects pins with the same Mercator the server tiles with; a
+    static image centred anywhere but the cell's middle puts every café one
+    street over. And a cell is fetched once — after that it is a file."""
+    from v.core import mapsearch
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    fake = FakeStatic()
+    undo = with_static(fake)
+    try:
+        tiles = hud._Tiles(s)
+        z, x, y = 14, 5266, 3223
+        eq(tiles.get(z, x, y), b"\x89PNG fake tile")
+        eq(tiles.get(z, x, y), b"\x89PNG fake tile")
+        eq(len(fake.calls), 1, "the second read must come off disk")
+        ok(tiles.path(z, x, y).is_file())
+        lat, lng, zoom, w, h = fake.calls[0]
+        px, py = mapsearch.mercator_px(lat, lng, zoom)
+        ok(abs(px - (x + 0.5) * hud.TILE_PX) < 1e-6
+           and abs(py - (y + 0.5) * hud.TILE_PX) < 1e-6,
+           f"centre landed at {px:.3f},{py:.3f}")
+        eq((w, h), (hud.TILE_PX + 2 * hud.TILE_PAD,) * 2,
+           "fetched with the margin the page crops the logo off with")
+        eq(tiles.cached(), 1)
+    finally:
+        undo()
+        shutil.rmtree(root)
+
+
+@test
+def test_tiles_are_budgeted_and_a_failure_is_not_retried_at_once():
+    """Dragging a map must not be able to spend a quota, and a dead network
+    must not be a request per redraw."""
+    from v.core import mapsearch
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    fake = FakeStatic()
+    undo = with_static(fake)
+    try:
+        tiles = hud._Tiles(s)
+        tiles._spent = [time.time()] * hud.TILE_BUDGET
+        try:
+            tiles.get(14, 1, 1)
+            raise AssertionError("fetched past the budget")
+        except hud.HudError as exc:
+            eq(exc.status, 429)
+        eq(fake.calls, [])
+
+        tiles._spent = []
+        fake.fail = mapsearch.MapSearchError("network down")
+        for _ in range(2):
+            try:
+                tiles.get(14, 2, 2)
+                raise AssertionError("a failed tile was served")
+            except hud.HudError as exc:
+                eq(exc.status, 503)
+        eq(len(fake.calls), 2, "one retry inside the fetch, then none until the window passes")
+        eq(tiles._spent, [], "a failed fetch is refunded")
+    finally:
+        undo()
+        shutil.rmtree(root)
+
+
+@test
+def test_no_key_is_no_basemap_not_a_fault():
+    root, s = make_vault()
+    fake = FakeStatic()
+    undo = with_static(fake)
+    try:
+        try:
+            hud._Tiles(s).get(14, 1, 1)
+            raise AssertionError("served a tile with no key")
+        except hud.HudError as exc:
+            eq(exc.status, 404)
+        eq(fake.calls, [], "no key means no request at all")
+    finally:
+        undo()
+        shutil.rmtree(root)
+
+
+@test
+def test_the_tile_route_takes_three_integers_and_nothing_else():
+    """Addressed by grid cell, like `/api/media` by handle: there is no path
+    in the request to traverse with, and the range is checked before the
+    disk is."""
+    root, s = make_vault()
+    s.neshan_api_key = "test-key"
+    fake = FakeStatic()
+    undo = with_static(fake)
+    app = BareHud()
+    app.tiles = hud._Tiles(s)
+    srv, port = stand_up(app)
+    try:
+        for query, want in (("z=3&x=0&y=0", 400),
+                            ("z=14&x=../../etc&y=0", 400),
+                            ("z=14&x=-1&y=0", 400),
+                            ("z=14&x=0", 400)):
+            status, _, _ = request(port, "GET", "/api/tile?" + query)
+            eq(status, want, query)
+        status, body, head = request(port, "GET", "/api/tile?z=14&x=5266&y=3223")
+        eq(status, 200)
+        eq(head.get("Content-Type"), "image/png")
+        ok("max-age" in head.get("Cache-Control", ""), "a cell never changes")
+        eq(body, b"\x89PNG fake tile")
+    finally:
+        srv.shutdown(); srv.server_close()
+        undo()
+        shutil.rmtree(root)
+
+
+@test
+def test_the_page_and_the_server_agree_on_the_tile_grid():
+    """The page's fallback grid is what it draws with when a server predating
+    the `tile` field answers — it must be the server's grid, or every tile
+    lands in the wrong square."""
+    js = (Path(hud.ASSETS) / "hud.js").read_text(encoding="utf-8")
+    import re
+    m = re.search(r"return t \|\| \{ px: (\d+), pad: (\d+), zmin: (\d+), zmax: (\d+) \}", js)
+    ok(m, "could not find the page's fallback tile grid")
+    eq(tuple(int(v) for v in m.groups()),
+       (hud.TILE_PX, hud.TILE_PAD, *hud.TILE_ZOOMS))
+    ok("{ id: 'places'" in js, "the PLACES view is missing from the nav")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items())
              if callable(v) and hasattr(v, "fn")]

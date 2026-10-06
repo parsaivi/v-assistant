@@ -1043,3 +1043,159 @@ input { font-family: inherit; }
 .blk-form .acts .drop { border-color: rgba(255, 106, 90, .4); color: var(--red); }
 .blk-form .acts .drop:hover { background: var(--red); color: var(--void);
   border-color: var(--red); }
+
+/* ---- places -------------------------------------------------------------
+ *
+ * A map and a list, side by side, and the pane gives up its own scroller for
+ * the same reason the week's does: the map pans and the list scrolls, and a
+ * third scroller around both is the one the wheel would find first.
+ *
+ * The tile filter is the whole theme, and it is an SVG filter built by the
+ * page (`MAP_CURVE` in hud.js says why a CSS invert was not enough). */
+.pane[data-pane="places"] { overflow: hidden; padding: 0;
+  display: flex; flex-direction: column; }
+.places { flex: 1 1 0; min-height: 0; display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px; }
+
+.pmap { position: relative; overflow: hidden; background: #030709; cursor: grab;
+  touch-action: none; user-select: none; -webkit-user-select: none; }
+.pmap[data-drag="1"] { cursor: grabbing; }
+.pm-tiles, .pm-pins, .pm-svg, .pm-tint, .pm-vig { position: absolute; inset: 0; }
+.pm-tiles, .pm-svg, .pm-tint, .pm-vig { pointer-events: none; }
+.pm-defs { position: absolute; width: 0; height: 0; }
+.pm-tiles img { position: absolute; left: 0; top: 0; max-width: none;
+  object-fit: none; opacity: 0; transition: opacity .4s; filter: url(#pm-tone); }
+.pm-tiles img[data-ok="1"] { opacity: .9; }
+.pm-tiles img[data-miss="1"] { display: none; }
+/* A wash of the HUD's cyan over the raster and the page's own scanlines, so
+ * the map reads as a screen in this room rather than a picture pasted on it. */
+.pm-tint { background:
+  repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px),
+  linear-gradient(rgba(111,227,255,.035), rgba(111,227,255,.035)); }
+.pm-vig { background: radial-gradient(ellipse at center, transparent 58%, rgba(2,5,8,.78) 100%); }
+
+.pm-svg { overflow: visible; }
+.pm-grat { stroke: rgba(111,227,255,.1); stroke-width: 1; shape-rendering: crispEdges; }
+.pm-gl { fill: var(--label); font-family: var(--mono); font-size: 8.5px; }
+.pm-ring { fill: none; stroke: rgba(111,227,255,.34); stroke-width: 1; stroke-dasharray: 2 5; }
+.pm-rl { fill: var(--cyan); font-family: var(--mono); font-size: 8.5px;
+  letter-spacing: .14em; opacity: .75; }
+/* A radar sweep around Home. It turns the gradient's own angle rather than
+ * rotating the element, because the element's `transform` is the translate
+ * `drawMap` puts it in place with, and an animation would overwrite it. */
+@property --sweep { syntax: '<angle>'; inherits: false; initial-value: 0deg; }
+.pm-sweep { position: absolute; left: 0; top: 0; pointer-events: none; border-radius: 50%;
+  background: conic-gradient(from var(--sweep), transparent 0deg,
+              rgba(111,227,255,0) 290deg, rgba(111,227,255,.17) 360deg);
+  animation: hSweepTurn 7s linear infinite; }
+@keyframes hSweepTurn { to { --sweep: 360deg; } }
+
+/* Pins. Zero-sized and translated to the point, so the dot is centred on the
+ * coordinate whatever the label beside it does. */
+.pin { position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 1; cursor: pointer; }
+.pin .dot { position: absolute; left: -5px; top: -5px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--t);
+  box-shadow: 0 0 0 2px rgba(3,7,9,.9), 0 0 12px var(--t); transition: transform .12s; }
+.pin .halo { position: absolute; left: -12px; top: -12px; width: 24px; height: 24px;
+  border-radius: 50%; border: 1px solid var(--t); opacity: 0; }
+.pin:hover .dot { transform: scale(1.35); }
+.pin:hover .halo { opacity: .5; }
+.pin .lbl { position: absolute; left: 11px; top: -9px; display: none; white-space: nowrap;
+  padding: 2px 7px; border-left: 2px solid var(--t); background: rgba(3,7,9,.82);
+  font-family: var(--sans); font-size: 11px; color: var(--paper); unicode-bidi: plaintext; }
+.pmap[data-labels="1"] .pin .lbl, .pin:hover .lbl, .pin[data-sel="1"] .lbl { display: block; }
+.pin:hover, .pin[data-sel="1"] { z-index: 3; }
+.pin[data-sel="1"] .halo { opacity: 1; animation: hPing 1.6s ease-out infinite; }
+.pin[data-sel="1"] .dot { transform: scale(1.3); }
+/* Home is the anchor every distance is from, so it is drawn as a reticle,
+ * not as one more place. */
+.pin[data-home="1"] .dot { left: -6px; top: -6px; width: 12px; height: 12px;
+  border-radius: 0; background: transparent; border: 2px solid var(--t);
+  transform: rotate(45deg); }
+.pin[data-home="1"] .lbl { font-family: var(--disp); font-weight: 700; letter-spacing: .16em;
+  font-size: 10px; display: block; }
+
+.pmap .corner { position: absolute; width: 12px; height: 12px; z-index: 4;
+  border: 0 solid rgba(111,227,255,.7); pointer-events: none; }
+.pmap .corner.tl { left: 5px; top: 5px; border-left-width: 1px; border-top-width: 1px; }
+.pmap .corner.tr { right: 5px; top: 5px; border-right-width: 1px; border-top-width: 1px; }
+.pmap .corner.bl { left: 5px; bottom: 5px; border-left-width: 1px; border-bottom-width: 1px; }
+.pmap .corner.br { right: 5px; bottom: 5px; border-right-width: 1px; border-bottom-width: 1px; }
+
+/* The legend is the filter: a chip per category, the count beside it. */
+.pm-legend { position: absolute; left: 14px; top: 14px; right: 70px; z-index: 5;
+  display: flex; flex-wrap: wrap; gap: 3px; pointer-events: none; }
+.pm-legend button { pointer-events: auto; display: flex; align-items: center; gap: 6px;
+  padding: 4px 9px; border: 1px solid var(--line-3); background: rgba(3,9,12,.84);
+  color: var(--label); font-family: var(--disp); font-weight: 600; font-size: 10px;
+  letter-spacing: .14em; cursor: pointer; backdrop-filter: blur(4px); }
+.pm-legend button:hover { border-color: rgba(111,227,255,.36); color: var(--body); }
+.pm-legend button[aria-pressed="true"] { border-color: rgba(111,227,255,.55);
+  background: rgba(12,32,42,.92); color: var(--paper); }
+.pm-legend button i { width: 7px; height: 7px; border-radius: 50%;
+  background: var(--t); box-shadow: 0 0 6px var(--t); }
+.pm-legend .n { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0; color: var(--cyan); }
+
+.pm-ctl { position: absolute; right: 14px; top: 14px; z-index: 5;
+  display: flex; flex-direction: column; gap: 3px; }
+.pm-ctl button { min-width: 38px; padding: 5px 8px; border: 1px solid var(--line-2);
+  background: rgba(3,9,12,.84); color: var(--body-2); font-family: var(--disp);
+  font-weight: 600; font-size: 12px; letter-spacing: .1em; cursor: pointer; }
+.pm-ctl button:hover { border-color: var(--cyan); color: var(--cyan); }
+
+.pm-scale { position: absolute; left: 14px; bottom: 40px; z-index: 5; pointer-events: none;
+  display: flex; align-items: flex-end; gap: 7px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: .1em; color: var(--body-2); }
+.pm-scale i { display: block; height: 5px; border: 1px solid var(--cyan); border-top: 0;
+  box-shadow: 0 2px 6px rgba(111,227,255,.25); }
+.pm-read { position: absolute; left: 14px; bottom: 14px; z-index: 5; pointer-events: none;
+  padding: 3px 8px; border-left: 2px solid var(--cyan); background: rgba(3,7,9,.78);
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .05em; color: var(--body-2); }
+.pm-attr { position: absolute; right: 14px; bottom: 12px; z-index: 5; pointer-events: none;
+  font-family: var(--mono); font-size: 8px; letter-spacing: .14em; color: var(--label-2); }
+.pm-note { position: absolute; left: 50%; bottom: 66px; transform: translateX(-50%); z-index: 5;
+  max-width: calc(100% - 40px); padding: 4px 10px; border-left: 2px solid var(--amber);
+  background: rgba(20,14,4,.88); font-size: 9.5px; letter-spacing: .1em; color: var(--amber);
+  text-align: center; }
+
+/* The list. Same row grammar as the task view — a tone on the left edge, a
+ * title over a line of metadata, one number on the right. */
+.plist { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 10px 18px; border-left: 1px solid var(--line); background: rgba(3,8,11,.55); }
+.prow { display: grid; grid-template-columns: 8px minmax(0,1fr) auto; align-items: center;
+  gap: 10px; padding: 8px 10px; border-left: 2px solid transparent;
+  background: rgba(8,20,28,.42); cursor: pointer; }
+.prow:hover { background: var(--wash); }
+.prow:focus-visible { outline: 1px solid var(--cyan); outline-offset: -1px; }
+.prow[aria-current="true"] { border-left-color: var(--t); background: rgba(12,32,42,.75); }
+.prow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--t);
+  box-shadow: 0 0 6px var(--t); }
+.pmid { min-width: 0; }
+.prow .n { font-family: var(--sans); font-size: 13px; color: #CDEAF5; unicode-bidi: plaintext;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prow .m { padding-top: 2px; font-size: 9.5px; letter-spacing: .04em; color: var(--label-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prow .r { font-family: var(--disp); font-weight: 600; font-size: 15px; color: var(--t); }
+
+.pcard { margin: 0 0 6px; padding: 10px 12px 12px; border: 1px solid var(--line-2);
+  border-left: 2px solid var(--t); border-top: 0; background: rgba(8,22,30,.72);
+  display: flex; flex-direction: column; gap: 9px; animation: hRise .2s ease-out both; }
+.pcard .nm { font-family: var(--sans); font-size: 15px; color: var(--paper); unicode-bidi: plaintext; }
+.pcard .bar { display: flex; gap: 2px; }
+.pcard .bar i { flex: 1; height: 4px; background: rgba(111,227,255,.12); }
+.pcard .bar i[data-on="1"] { background: var(--t); box-shadow: 0 0 5px var(--t); }
+.pcard .kv { display: grid; grid-template-columns: 72px minmax(0,1fr); gap: 5px 10px; }
+.pcard .k { padding-top: 2px; font-size: 8.5px; letter-spacing: .16em; color: var(--label-2); }
+.pcard .v { font-family: var(--sans); font-size: 12px; color: var(--body);
+  overflow-wrap: anywhere; unicode-bidi: plaintext; }
+.pcard .acts { display: flex; gap: 6px; }
+.pcard .acts button, .pcard .acts a { padding: 4px 10px; border: 1px solid var(--line-2);
+  background: transparent; color: var(--label); font-family: var(--disp); font-weight: 600;
+  font-size: 10px; letter-spacing: .14em; cursor: pointer; text-decoration: none; }
+.pcard .acts button:hover, .pcard .acts a:hover { border-color: var(--t); color: var(--t); }
+
+/* Below this the list would leave the map a strip; it goes underneath. */
+@media (max-width: 1180px) {
+  .places { grid-template-columns: minmax(0,1fr); grid-template-rows: minmax(0,1fr) 38%; }
+  .plist { border-left: 0; border-top: 1px solid var(--line); }
+}
