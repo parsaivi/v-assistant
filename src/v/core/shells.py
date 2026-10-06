@@ -442,6 +442,12 @@ READ_TOOLS = [
     # guess wearing the authority of a lookup, in a currency that moves
     # every week.
     "mcp__vault__vault_digikala", "mcp__vault__vault_divar",
+    # What the toman is worth — dollar, euro, gold. Read-only, and it reads a
+    # stored board: `core/rates.py` fetches once a day and its own ledger
+    # refuses anything past the quota, so a model reaching for it cannot
+    # spend more than a person clicking ↻ could. Here for `vault_digikala`'s
+    # reason — a remembered rate is a guess in a currency that moves weekly.
+    "mcp__vault__vault_rates",
     "Read", "Grep", "Glob",
 ] + BROWSER_TOOLS
 WRITE_TOOLS = [

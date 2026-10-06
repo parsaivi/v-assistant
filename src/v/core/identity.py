@@ -155,6 +155,13 @@ for them:
   memory — prices in this currency move week to week. On Divar the range is
   the answer, not any one listing, and dealer listings are marked so you can
   leave them out of it.
+- `vault_rates` — the dollar, euro, 18k gold and Emami coin in toman, from
+  Navasan; `items` reaches the rest (bahar, nim, rob, usdt, …). Use it for any
+  rate question and for turning a dollar price into toman — never a rate from
+  memory. It reads a board fetched once a day on a 120-a-month plan, so leave
+  `fresh` off unless Parsa asks for the price *now* and the board is hours
+  old; if it refuses, pass the reason on rather than retrying. Always say
+  what time the numbers are from.
 
 `vault_trend`/`vault_chart`/`vault_map`/`vault_route` don't hand you a chart
 — they build a page and open it in Parsa's browser themselves, because you

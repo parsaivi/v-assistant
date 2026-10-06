@@ -90,7 +90,7 @@ from pathlib import Path
 
 from . import (commands as commands_mod, index, jalali as jalali_mod,
                media as media_mod, notes as notes_mod,
-               persona as persona_mod, weekplan)
+               persona as persona_mod, rates as rates_mod, weekplan)
 from .config import Settings, settings as default_settings
 from .engine import Engine
 
@@ -190,6 +190,15 @@ TILE_BUDGET = 60
 #: dead cell would otherwise be a request every time; the page retries a hole
 #: on its own once this has passed.
 TILE_RETRY = 60.0
+#: The RATES card. The board is read from disk on every snapshot — it is one
+#: small file — but the day's *fetch* is a Navasan request against a quota of
+#: 120 a month, so it never runs on the engine thread and is not started more
+#: than once a minute however often the page polls. See `core/rates.py` for
+#: the budget; the HUD is one of its readers, not its own.
+RATES_KICK = 60.0
+#: Days of history behind each row's sparkline.
+RATES_SPARK = 30
+
 #: The anchor every distance on the map is measured from — the same name
 #: `vault_places_search(near=…)` resolves, so the map and V agree on it.
 PLACE_HOME = "Home"
@@ -1266,6 +1275,42 @@ def _places(engine) -> dict:
     }
 
 
+def _rates(s: Settings, now: dt.datetime) -> dict:
+    """The RATES card: the stored Navasan board, the budget and the reason
+    when there is no board. Reads only — the fetch is `Hud._kick_rates` and
+    `Hud.rates_refresh`, neither of which runs here.
+
+    `state` is what the card draws before any number: "unconfigured" and
+    "empty" are different panels, and a stale board says so on its tag rather
+    than passing yesterday's dollar off as today's.
+    """
+    r = rates_mod.Rates(s)
+    if not r.configured():
+        return {"state": "unconfigured", "items": []}
+    board = r.board()
+    out: dict = {"state": "empty", "items": [],
+                 "budget": r.budget(now).json(), "failed": r.failure()}
+    if board is None:
+        return out
+    hist = r.history(RATES_SPARK, today=now.date())
+    for key, *_ in rates_mod.TRACKED:
+        q = board.get(key)
+        if q is None:
+            continue
+        row = q.json()
+        row["spark"] = [v for _, v in hist.get(key, [])]
+        out["items"].append(row)
+    out.update({
+        "state": "on",
+        "today": board.fetched.date() == now.date(),
+        "fetched": board.fetched.isoformat(timespec="minutes"),
+        "kind": board.kind,
+        "updated": (board.updated.isoformat(timespec="minutes")
+                    if board.updated else ""),
+    })
+    return out
+
+
 def _is_iso_day(stem: str) -> bool:
     try:
         dt.date.fromisoformat(stem)
@@ -1283,8 +1328,9 @@ def snapshot(engine, session: Session, caches: dict,
     single slow answer would arrive as six panels blanking one at a time
     instead of one snapshot arriving late.
 
-    Free by construction. Everything here is SQL, Markdown and one cached
-    Gmail read; nothing reaches a model, and `test_hud` asserts the cost.
+    Free by construction. Everything here is SQL, Markdown, one cached
+    Gmail read and the stored rates board; nothing reaches a model, and
+    `test_hud` asserts the cost.
     """
     now = now or dt.datetime.now()
     day = now.date()
@@ -1366,6 +1412,7 @@ def snapshot(engine, session: Session, caches: dict,
         "nudges": _nudges(engine, day),
         "nudges_off": _nudges_off(engine),
         "mail": _mail(engine, caches.setdefault("mail", {})),
+        "rates": _rates(engine.s, now),
     }
 
 
@@ -1716,6 +1763,9 @@ class Hud:
         self.session.watch = self.scout.saw
         self.bridge = _Bridge(self.s, self.session)
         self.tiles = _Tiles(self.s)
+        self.rates = rates_mod.Rates(self.s)
+        self._rates_kicked = 0.0
+        self._rates_thread: threading.Thread | None = None
         self.caches: dict = {}
         self._snap: dict | None = None
         self._snap_at = 0.0
@@ -1741,7 +1791,42 @@ class Hud:
             return {**self._snap, "stale": True, "live": self.session.live()}
         with self._snap_lock:
             self._snap, self._snap_at = snap, time.time()
+        self._kick_rates()
         return {**snap, "stale": False, "live": self.session.live()}
+
+    def _kick_rates(self) -> None:
+        """Start today's Navasan fetch if nobody has made it yet.
+
+        The HUD opening is usually the first look of the day, which is the
+        moment the day's one request should be spent. On its own thread: it
+        is a network round trip, and the snapshot it rides on is on the
+        engine's. Its result lands in `rates.json` and the next poll draws it.
+        `rates.Rates` holds the cross-process lock, so this and the 10:00 job
+        cannot both spend it.
+        """
+        r = getattr(self, "rates", None)
+        if r is None:
+            return
+        now = time.time()
+        busy = self._rates_thread is not None and self._rates_thread.is_alive()
+        if busy or now - self._rates_kicked < RATES_KICK:
+            return
+        self._rates_kicked = now
+        try:
+            if not r.due():
+                return
+        except Exception:
+            return
+
+        def work():
+            try:
+                r.ensure_today()
+            except Exception:
+                pass                 # the reason is on `failure()`; the card shows it
+
+        self._rates_thread = threading.Thread(target=work, name="hud-rates",
+                                              daemon=True)
+        self._rates_thread.start()
 
     def search(self, text: str) -> dict:
         """The VAULT surface. Semantic when the embeddings are built, keyword
@@ -1791,6 +1876,27 @@ class Hud:
         tiles = getattr(self, "tiles", None)
         out["tiles_cached"] = tiles.cached() if tiles is not None else 0
         return out
+
+    def rates_refresh(self) -> dict:
+        """The ↻ on the RATES card: one Navasan request, if the budget allows.
+
+        On the handler thread, like `tile()` — a network call must not queue
+        behind a turn, and must not make a turn queue behind it. The refusal
+        is a 429 with the reason in it, because "not now, and here is when" is
+        the answer the button exists to give as often as a number.
+        """
+        r = getattr(self, "rates", None)
+        if r is None:
+            raise HudError(503, "no rates on this server")
+        try:
+            r.refresh()
+        except rates_mod.NotConfigured as exc:
+            raise HudError(400, str(exc)) from None
+        except rates_mod.Refused as exc:
+            raise HudError(429, str(exc)) from None
+        except rates_mod.RatesError as exc:
+            raise HudError(502, str(exc)) from None
+        return {"ok": True, "rates": _rates(self.s, dt.datetime.now())}
 
     def tile(self, z: int, x: int, y: int) -> bytes:
         """One basemap cell, as PNG bytes. Not on the engine thread — see
@@ -2439,6 +2545,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(self.app.block(action, body))
             if path == "/api/agent":
                 return self._json(self.app.agent(body.get("key") or "v"))
+            if path == "/api/rates":
+                # One verb, and no default for it: this one spends a request
+                # against a monthly quota, so a body that failed to parse must
+                # not be readable as "go and fetch".
+                if body.get("action") != "refresh":
+                    raise HudError(400, "action must be 'refresh'")
+                return self._json(self.app.rates_refresh())
             if path == "/api/typing":
                 # The one state the browser knows and the server cannot: a
                 # keystroke. It is a timestamp, not a transcript — nothing

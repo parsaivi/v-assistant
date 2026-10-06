@@ -706,6 +706,56 @@ input { font-family: inherit; }
   text-decoration-color: var(--line-3);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ---- rates -------------------------------------------------------------
+ * Four rows that are read, not worked: a name, a month of shape, the number,
+ * and the day's move. The number is the brightest thing on the row because it
+ * is the answer; the Persian name sits under the English one in the dim, the
+ * way the probe's labels do. Gold LED rather than an amber card — amber is
+ * this rail's word for "due", and a price is not a deadline. */
+.rates-card .led { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+/* The value column is fixed, not `auto`: each row is its own grid, so an
+ * auto column sized itself to its own number and the sparklines stepped left
+ * down the card as the numbers grew. 98,500,000 T is the widest one there is. */
+.rate { display: grid; grid-template-columns: minmax(0, 1fr) 52px 108px 50px;
+  align-items: center; gap: 9px; padding: 4px; }
+.rate:hover { background: var(--wash); }
+.rate .n { min-width: 0; }
+.rate .n b { display: block; font-family: var(--disp); font-weight: 600; font-size: 11px;
+  letter-spacing: .14em; color: var(--body-2); text-transform: uppercase;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rate .n i { display: block; padding-top: 1px; font-style: normal; font-family: var(--sans);
+  font-size: 10.5px; color: var(--label); unicode-bidi: plaintext; text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rate .v { font-family: var(--disp); font-weight: 700; font-size: 15px; letter-spacing: .02em;
+  color: var(--paper); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rate .v small { margin-left: 3px; font-size: 8.5px; font-weight: 600; letter-spacing: .12em;
+  color: var(--label); }
+.rate .d { font-size: 10px; text-align: right; white-space: nowrap; color: var(--t);
+  font-variant-numeric: tabular-nums; }
+.rate svg { display: block; width: 52px; height: 16px; overflow: visible; }
+.rate svg polyline { fill: none; stroke: var(--t); stroke-width: 1.2; opacity: .75;
+  stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.rate svg circle { fill: var(--t); }
+.rates-foot { display: flex; align-items: center; gap: 8px; margin-top: 5px; padding: 7px 4px 0;
+  border-top: 1px solid var(--line-3); font-size: 8.5px; letter-spacing: .12em; color: var(--label-2); }
+.rates-foot .fill { flex: 1; }
+.rates-foot .left { color: var(--label); }
+.rates-msg { padding: 6px 4px 0; font-size: 10px; line-height: 1.45; color: var(--label); }
+.rates-msg.err { color: var(--red); }
+.rates-msg.stale { color: var(--amber); }
+
+/* The ↻. Always visible, unlike `.nx`: it is the card's one verb and the only
+ * control on the page that spends something, so whether it is live — and
+ * why not, on hover — has to be readable without going looking. */
+.rx { flex: none; width: 20px; height: 20px; padding: 0; display: flex;
+  align-items: center; justify-content: center; border: 1px solid var(--line-3);
+  background: rgba(6,16,22,.6); color: var(--body-2); font-family: var(--mono);
+  font-size: 12px; cursor: pointer; }
+.rx:hover:not(:disabled) { border-color: rgba(255,192,97,.55); color: var(--amber); }
+.rx:disabled { opacity: .35; cursor: default; }
+.rx[data-busy="1"] { opacity: 1; color: var(--amber); animation: rSpin .9s linear infinite; }
+@keyframes rSpin { to { transform: rotate(360deg); } }
+
 .tiles { display: flex; gap: 8px; }
 .tile { flex: 1; position: relative; padding: 9px 11px; border: 1px solid var(--line-2);
   background: rgba(8,20,28,.5); backdrop-filter: blur(6px);

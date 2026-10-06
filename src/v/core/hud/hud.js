@@ -279,6 +279,8 @@ const app = {
   taskError: '',        // the last failed action, shown until dismissed
   nudgeBusy: '',        // the key of the nudge with a silence/restore in flight
   nudgeError: '',       // the last failed silence/restore
+  ratesBusy: false,     // a Navasan refresh is in flight — never send two
+  ratesError: '',       // what the last ↻ was told, until the next one
   weekZoom: 1,          // index into WEEK_ZOOM — how many pixels a minute gets
   weekKinds: null,      // the block vocabulary, as the server last sent it
   blockEdit: null,      // the block being added or edited, or null
@@ -1622,6 +1624,128 @@ function paintPanels(snap, live) {
   fill($('p-nudges'), rows);
 }
 
+/* ---- rates ---------------------------------------------------------------
+ * The board V stores from Navasan, drawn as it is. Nothing here fetches: the
+ * day's request is made by the server the first time anything looks, and the
+ * only other way a request is spent is the ↻, which the server can refuse —
+ * the free plan is 120 a month and `core/rates.py` keeps the ledger. */
+const RATE_UP = C.green;
+const RATE_DOWN = C.red;
+
+const toman = (n) => Math.round(Number(n) || 0).toLocaleString('en-US');
+const hm = (iso) => (iso || '').slice(11, 16);
+
+function rateValue(r) {
+  return r.unit === 'USD'
+    ? ['$' + (Number(r.value) || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })]
+    : [toman(r.value), el('small', { text: 'T' })];
+}
+
+/* A month of the day's last fetch, scaled to its own range. Days nobody
+ * fetched are gaps in the data and are simply not points — the line joins the
+ * days it has, and the dot is today. One point is not a shape, so it draws
+ * nothing rather than a dot pretending to be a trend. */
+function spark(values, tone) {
+  const box = svgEl('svg', { viewBox: '0 0 52 16', 'aria-hidden': 'true' });
+  box.style.setProperty('--t', tone);
+  if (!values || values.length < 2) return box;
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const span = hi - lo || 1;
+  const pts = values.map((v, i) => [
+    (i / (values.length - 1)) * 50 + 1,
+    hi === lo ? 8 : 14.5 - ((v - lo) / span) * 13,
+  ]);
+  box.appendChild(svgEl('polyline', { points: pts.map((p) => p.map((n) => n.toFixed(1)).join(',')).join(' ') }));
+  const [x, y] = pts[pts.length - 1];
+  box.appendChild(svgEl('circle', { cx: x.toFixed(1), cy: y.toFixed(1), r: 1.6 }));
+  return box;
+}
+
+function paintRates(snap) {
+  const r = snap.rates || { state: 'off', items: [] };
+  if (!changed('rates', JSON.stringify([r, app.ratesBusy, app.ratesError]))) return;
+  const b = r.budget || null;
+  const btn = $('rates-refresh');
+  btn.dataset.busy = app.ratesBusy ? '1' : '0';
+  btn.disabled = app.ratesBusy || r.state === 'unconfigured' || !b || !b.can_refresh;
+  btn.title = app.ratesBusy ? 'asking Navasan…'
+    : r.state === 'unconfigured' ? 'no Navasan key — set navasan_api_key'
+    : !b ? '' : b.can_refresh
+      ? `fetch now from Navasan — spends 1 of ${b.refreshes_left} refreshes left this month`
+      : b.why_not;
+
+  $('tag-rates').textContent = 'M-07 · ' + ({
+    unconfigured: 'NOT SET UP', empty: 'NO DATA', off: 'OFF',
+  }[r.state] || (r.today ? hm(r.fetched) : 'STALE · ' + (r.fetched || '').slice(5, 10)));
+
+  const rows = r.items.map((q) => {
+    const tone = q.change > 0 ? RATE_UP : (q.change < 0 ? RATE_DOWN : C.dim);
+    const move = q.pct === null || q.pct === undefined ? ''
+      : (q.change > 0 ? '▲' : (q.change < 0 ? '▼' : '·')) + Math.abs(q.pct).toFixed(2) + '%';
+    return probed(el('div.rate', { style: `--t:${tone}` }, [
+      el('span.n', {}, [el('b', { text: q.name }), el('i', { text: q.fa })]),
+      spark(q.spark, tone),
+      el('span.v', {}, rateValue(q)),
+      el('span.d', { text: move }),
+    ]), 'RATE · NAVASAN', q.name, [
+      ['VALUE', q.unit === 'USD' ? '$' + q.value : toman(q.value) + ' toman'],
+      q.change !== null && q.change !== undefined
+        ? ['SINCE YESTERDAY', (q.change > 0 ? '+' : '') + toman(q.change) + (q.pct !== null ? ` (${q.pct}%)` : '')]
+        : null,
+      ['NAVASAN MOVED IT', q.jdate || hm(q.updated) || '—'],
+      ['SYMBOL', q.key],
+      ['HISTORY', `${(q.spark || []).length} day(s) in the last 30`],
+    ]);
+  });
+
+  if (r.state === 'unconfigured') {
+    rows.push(el('div.empty', { style: 'padding:6px 2px',
+      text: 'navasan not set up — add navasan_api_key to ~/.local/state/v/config.json' }));
+  } else if (r.state === 'empty') {
+    rows.push(el('div.empty', { style: 'padding:6px 2px',
+      text: r.failed && r.failed.why ? 'no rates yet — ' + r.failed.why : 'fetching today\'s rates…' }));
+  } else if (r.state === 'on' && !r.today) {
+    rows.push(el('div.rates-msg.stale', { text: `from ${(r.fetched || '').slice(0, 10)} — `
+      + (r.failed && r.failed.why ? 'today\'s fetch failed: ' + r.failed.why : 'today\'s is not in yet') }));
+  }
+  if (app.ratesError) rows.push(el('div.rates-msg.err', { text: app.ratesError }));
+
+  if (b) {
+    rows.push(probed(el('div.rates-foot', {}, [
+      el('span', { text: r.updated ? 'NAVASAN · QUOTE ' + hm(r.updated) : 'NAVASAN' }),
+      el('span.fill'),
+      el('span.left', { text: `${b.left}/${b.cap} LEFT` }),
+    ]), 'NAVASAN QUOTA', 'requests this month', [
+      ['USED', `${b.used} of ${b.cap} in the last ${b.window_days} days`],
+      ['PLAN', `${b.quota} a month, free · moves every 2 h`],
+      ['REFRESHES LEFT', `${b.refreshes_left} of ${b.manual_cap}`],
+      ['DAILY', 'one automatic fetch — first look of the day, or 10:00'],
+      ['WHY ' + b.cap, `${b.quota - b.cap} kept spare for requests V cannot see`],
+      r.fetched ? ['LAST FETCH', r.fetched.replace('T', ' ') + (r.kind === 'refresh' ? ' · ↻' : ' · daily')] : null,
+    ]));
+  }
+  fill($('p-rates'), rows);
+}
+
+/** The ↻. One request, if the server's budget allows — and if it does not,
+ *  its reason is the answer, shown on the card rather than swallowed. */
+async function ratesRefresh() {
+  if (app.ratesBusy) return;
+  app.ratesBusy = true;
+  app.ratesError = '';
+  if (app.snap) paintRates(app.snap);
+  try {
+    const out = await post('/api/rates', { action: 'refresh' });
+    if (app.snap && out.rates) app.snap.rates = out.rates;
+  } catch (err) {
+    app.ratesError = String(err.message || err);
+  } finally {
+    app.ratesBusy = false;
+  }
+  if (app.snap) paintRates(app.snap);
+  await refresh(true);
+}
+
 /** Silence or restore one check, then repaint from a forced snapshot. */
 async function nudgeAction(action, key) {
   /* Set before the await, so a double-click is dropped by the guard rather
@@ -2549,6 +2673,7 @@ function applyLive(live) {
     paintGauges(app.snap, live);
     paintFooter(app.snap, live);
     paintPanels(app.snap, live);
+    paintRates(app.snap);
     paintPaneHead(app.snap);
   }
   paintPane();
@@ -2653,6 +2778,7 @@ function boot() {
 
   $('form').addEventListener('submit', (e) => { e.preventDefault(); send(); });
   $('why').addEventListener('click', toggleTrace);
+  $('rates-refresh').addEventListener('click', ratesRefresh);
 
   /* The viewport. Clicking the glass blows the picture up; clicking ✕ says
    * stop showing me these, which is the screen being cleared and not a file

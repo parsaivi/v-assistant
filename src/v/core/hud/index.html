@@ -231,6 +231,17 @@
           <div class="rows" id="p-nudges" style="gap:7px"></div>
         </section>
 
+        <!-- RATES · Navasan, read from the board V stores. The ↻ is the only
+             thing on the page that spends a request on purpose; it lives in
+             the head so it never moves when the rows below it change. -->
+        <section class="card rates-card" id="card-rates">
+          <div class="head"><span class="led"></span><span class="title">RATES</span>
+            <span class="fill"></span><span class="tag" id="tag-rates">M-07</span>
+            <button type="button" class="rx" id="rates-refresh"
+                    aria-label="refresh rates from Navasan">↻</button></div>
+          <div class="rows" id="p-rates"></div>
+        </section>
+
         <div class="tiles">
           <div class="tile"><div class="k">SPEND TODAY</div>
             <div class="v" id="t-spend">$0.00</div><div class="s" id="t-cap">of $2.00 cap</div></div>

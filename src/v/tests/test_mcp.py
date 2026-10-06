@@ -615,7 +615,7 @@ def the_outward_lookups_are_registered_and_say_what_they_are_not():
     though it had checked — in a currency that moves week to week."""
     tools = {t.name: (t.description or "")
              for t in asyncio.run(srv.mcp.list_tools())}
-    for name in ("vault_jalali", "vault_digikala", "vault_divar"):
+    for name in ("vault_jalali", "vault_digikala", "vault_divar", "vault_rates"):
         ok(name in tools, f"{name} is not registered")
     ok("NOT vault_calendar" in tools["vault_jalali"],
        "it has to disown the tool it will otherwise be confused with")
@@ -626,9 +626,71 @@ def the_outward_lookups_are_registered_and_say_what_they_are_not():
     ok("not a documented public API" in tools["vault_digikala"])
     ok("Kenar" in tools["vault_divar"],
        "Divar's supported platform is a different thing and cannot search")
-    for name in ("vault_digikala", "vault_divar"):
+    for name in ("vault_digikala", "vault_divar", "vault_rates"):
         ok("from memory" in tools[name] or "remembered" in tools[name],
            f"{name} must forbid answering from memory on a failure")
+    ok("120" in tools["vault_rates"] and "fresh" in tools["vault_rates"],
+       "the quota, and the one argument that spends it, must be explained")
+
+
+def _rates_settings(key: str = "free-TEST-KEY"):
+    root, s = _tmp_settings()
+    s.navasan_api_key = key
+    s.state_dir.mkdir(parents=True, exist_ok=True)
+    return root, s
+
+
+class _NavasanResp:
+    status_code = 200
+    text = ""
+
+    @staticmethod
+    def json():
+        row = {"change": 500, "timestamp": 1791270000,
+               "date": "1405-07-14 12:00:00"}
+        return {"usd_sell": {**row, "value": "104500"},
+                "eur": {**row, "value": "121300"},
+                "18ayar": {**row, "value": "9150000"},
+                "sekkeh": {**row, "value": "98500000"},
+                "bahar": {**row, "value": "92000000"}}
+
+
+@test
+def rates_without_a_key_say_so_and_send_nothing():
+    import unittest.mock as mock
+    root, s = _rates_settings(key="")
+    try:
+        get = mock.Mock()
+        with mock.patch.object(srv, "S", s), mock.patch("httpx.get", get):
+            out = call("vault_rates")
+        ok(out.startswith("ERROR:") and "navasan_api_key" in out, out[:160])
+        ok("memory" in out, "and forbid the guess")
+        ok(get.call_count == 0, f"{get.call_count} requests with no key")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def rates_are_one_request_a_day_however_often_asked():
+    """The tool is what a model reaches for, possibly five times in one
+    conversation. All five must come off one stored board."""
+    import unittest.mock as mock
+    root, s = _rates_settings()
+    try:
+        get = mock.Mock(return_value=_NavasanResp())
+        with mock.patch.object(srv, "S", s), mock.patch("httpx.get", get):
+            out = call("vault_rates")
+            call("vault_rates", items="bahar")
+            again = call("vault_rates", fresh=True)
+            odd = call("vault_rates", items="usd_sell, doge")
+        ok(get.call_count == 1, f"four calls, {get.call_count} requests")
+        ok("104,500 T" in out and "98,500,000 T" in out, out)
+        ok("Quota: 1 of 110" in out, "the budget is on every answer")
+        ok("104,500 T" in again, "fresh on a young board is the stored board")
+        ok("doge" in odd and "bahar" in odd,
+           "an unknown symbol is answered with the ones that exist")
+    finally:
+        shutil.rmtree(root)
 
 
 @test

@@ -2640,6 +2640,154 @@ def test_the_page_and_the_server_agree_on_the_tile_grid():
     ok("{ id: 'places'" in js, "the PLACES view is missing from the nav")
 
 
+# --- rates ---------------------------------------------------------------
+def _rates_hud(key: str = "free-TEST-KEY"):
+    """A `BareHud` with a real `rates.Rates` on a throwaway state dir."""
+    import tempfile
+    from v.core import config, rates as rates_mod
+    root = Path(tempfile.mkdtemp(prefix="v-hud-rates-"))
+    s = config.Settings(vault=root, state_dir=root / "state")
+    s.navasan_api_key = key
+    s.state_dir.mkdir(parents=True)
+    app = BareHud()
+    app.s = s
+    app.rates = rates_mod.Rates(s)
+    app._rates_kicked = 0.0
+    app._rates_thread = None
+    return root, app
+
+
+class _Navasan:
+    """`httpx.get`, answering with a board and counting the calls."""
+
+    def __init__(self, status=200):
+        self.status, self.calls = status, 0
+
+    def __call__(self, url, params=None, **kw):
+        self.calls += 1
+        row = {"change": 500, "timestamp": 1791270000,
+               "date": "1405-07-14 12:00:00"}
+        body = {k: {**row, "value": v} for k, v in (
+            ("usd_sell", "104500"), ("eur", "121300"),
+            ("18ayar", "9150000"), ("sekkeh", "98500000"))}
+
+        class R:
+            status_code = self.status
+            text = "x"
+
+            @staticmethod
+            def json():
+                return body
+        return R()
+
+
+@test
+def test_rates_card_states_are_distinct():
+    """Not set up, nothing yet, and a board are three panels. A card that
+    draws "no key" and "no data" the same way hides the one that needs a
+    hand from the one that will fix itself."""
+    import unittest.mock as mock
+    root, app = _rates_hud(key="")
+    try:
+        eq(hud._rates(app.s, dt.datetime(2026, 10, 6, 9))["state"],
+           "unconfigured")
+        app.s.navasan_api_key = "free-TEST-KEY"
+        panel = hud._rates(app.s, dt.datetime(2026, 10, 6, 9))
+        eq(panel["state"], "empty")
+        ok(panel["budget"]["can_refresh"], "an empty board can be fetched")
+        fake = _Navasan()
+        with mock.patch("httpx.get", fake):
+            app.rates.ensure_today(dt.datetime(2026, 10, 6, 9))
+        panel = hud._rates(app.s, dt.datetime(2026, 10, 6, 9, 5))
+        eq(panel["state"], "on")
+        ok(panel["today"])
+        eq([i["key"] for i in panel["items"]],
+           ["usd_sell", "eur", "18ayar", "sekkeh"], "the card's order")
+        eq(panel["items"][0]["spark"], [104500.0])
+        ok(not panel["budget"]["can_refresh"], "the cooldown reaches the card")
+        ok("09:30" in panel["budget"]["why_not"], panel["budget"]["why_not"])
+        stale = hud._rates(app.s, dt.datetime(2026, 10, 7, 9))
+        ok(stale["state"] == "on" and not stale["today"],
+           "yesterday's board is drawn as yesterday's")
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def test_rates_endpoint_refuses_with_the_reason():
+    """The ↻ spends a request against a monthly quota, so the endpoint takes
+    one verb with no default, and a budget refusal comes back as a 429 the
+    page can print — "not now, and when" is an answer, not an error."""
+    import unittest.mock as mock
+    root, app = _rates_hud()
+    srv, port = stand_up(app)
+    try:
+        fake = _Navasan()
+        with mock.patch("httpx.get", fake):
+            status, raw, _ = request(port, "POST", "/api/rates", {})
+            eq(status, 400, "no action, no request")
+            status, raw, _ = request(port, "POST", "/api/rates",
+                                     {"action": "refresh"})
+            eq(status, 200, raw)
+            out = json.loads(raw)
+            eq(out["rates"]["state"], "on")
+            status, raw, _ = request(port, "POST", "/api/rates",
+                                     {"action": "refresh"})
+            eq(status, 429, "a second click inside the cooldown")
+            ok("refresh opens at" in json.loads(raw)["error"])
+        eq(fake.calls, 1, "and only the first one reached Navasan")
+        status, raw, _ = request(port, "POST", "/api/rates",
+                                 {"action": "refresh"},
+                                 headers={"Sec-Fetch-Site": "cross-site"})
+        eq(status, 403, "another tab cannot spend the quota")
+    finally:
+        srv.shutdown(); srv.server_close()
+        shutil.rmtree(root)
+    bare = BareHud()
+    srv, port = stand_up(bare)
+    try:
+        status, _, _ = request(port, "POST", "/api/rates", {"action": "refresh"})
+        eq(status, 503, "a server with no rates says so")
+    finally:
+        srv.shutdown(); srv.server_close()
+
+
+@test
+def test_the_days_fetch_is_kicked_off_the_snapshot_thread():
+    """The HUD opening is the first look of the day, so it is what spends the
+    day's request — on its own thread, once, and never again that day
+    however often the page polls."""
+    import unittest.mock as mock
+    root, app = _rates_hud()
+    try:
+        fake = _Navasan()
+        with mock.patch("httpx.get", fake):
+            app._kick_rates()
+            ok(app._rates_thread is not None, "a fetch was started")
+            ok(app._rates_thread is not threading.current_thread())
+            app._rates_thread.join(5)
+            for _ in range(5):
+                app._rates_kicked = 0.0          # as if minutes had passed
+                app._kick_rates()
+                if app._rates_thread:
+                    app._rates_thread.join(5)
+        eq(fake.calls, 1)
+        ok(app.rates.board() is not None)
+    finally:
+        shutil.rmtree(root)
+    BareHud()._kick_rates()            # no `rates` at all: a no-op, not a crash
+
+
+@test
+def test_the_page_carries_the_rates_card():
+    html = (Path(hud.ASSETS) / "index.html").read_text(encoding="utf-8")
+    js = (Path(hud.ASSETS) / "hud.js").read_text(encoding="utf-8")
+    ok('id="p-rates"' in html and 'id="rates-refresh"' in html)
+    ok("post('/api/rates', { action: 'refresh' })" in js,
+       "the button sends the one verb the server takes")
+    ok("paintRates(app.snap)" in js, "and the card is painted on every frame")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items())
              if callable(v) and hasattr(v, "fn")]

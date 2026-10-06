@@ -142,6 +142,12 @@ class Scheduler:
             # `nudges.assignments_due`, which the morning brief already
             # reads. Before the brief, same reasoning as calendar-sync.
             Job("quera-sync", dt.time(6, 45), self._quera_sync),
+            # The day's one Navasan request, so the RATES card and its history
+            # have a point for every day even when nobody opened the HUD. A
+            # no-op when someone already looked today — the first reader of a
+            # day is the one who fetches, whichever process that is. 10:00 so
+            # the morning market has moved; the free plan lags two hours.
+            Job("rates", dt.time(10, 0), self._rates, announce=False),
             # Every five minutes, and cheap when there is nothing to do: it
             # reads one small JSON file and usually finds it empty. The
             # interval is not the retry rate — each parked question carries
@@ -464,6 +470,19 @@ class Scheduler:
             return None
         return (f"quera: {len(created)} new assignment(s), "
                 f"{len(updated)} deadline(s) updated")
+
+    def _rates(self):
+        from . import rates as rates_mod
+
+        r = rates_mod.Rates(self.s)
+        if not r.configured():
+            return None
+        board = r.ensure_today()
+        if board is None or board.fetched.date() != dt.date.today():
+            return f"rates: no board today — {r.failure().get('why', 'not fetched')}"
+        usd = board.get("usd_sell")
+        return (f"rates: {board.kind} board at {board.fetched:%H:%M}"
+                + (f" · dollar {rates_mod.format_value(usd)}" if usd else ""))
 
     def _deferred(self, now: dt.datetime | None = None):
         """Answer what the plan window turned away earlier.

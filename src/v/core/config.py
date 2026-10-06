@@ -409,6 +409,15 @@ class Settings:
     # an edit to every tool that calls it.
     maps_provider: str = "neshan"
 
+    # --- exchange rates ----------------------------------------------------
+    # navasan.tech — dollar, euro, gold and coin in toman, for `core/rates.py`
+    # and the HUD's RATES card. The free plan is 120 requests a month, which
+    # is the whole reason that module keeps a ledger: one fetch a day, the
+    # rest only when a person asks. Empty means the card says "not set up"
+    # and `vault_rates` says so rather than answering from memory.
+    navasan_api_key: str = field(
+        default_factory=lambda: os.environ.get("NAVASAN_API_KEY", ""))
+
     # --- who V is ----------------------------------------------------------
     # The character V wears: how it speaks, and which voice reads the replies
     # out. `core/persona.py` holds them; this is which one. An unknown name

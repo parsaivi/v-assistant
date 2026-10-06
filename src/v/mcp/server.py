@@ -46,7 +46,7 @@ from ..core import memory as memory_mod
 from ..core import persona as persona_mod
 from ..core import traits as traits_mod
 from ..core import (bazaar, contacts, index, jalali, notes,
-                    nudges as nudges_mod, query, rag,
+                    nudges as nudges_mod, query, rag, rates as rates_mod,
                     reminders, render, schema, work)
 from ..core.config import settings as S
 from ..core.vaultfs import Vault, VaultError
@@ -1727,6 +1727,92 @@ def vault_divar(term: str, city: str = bazaar.DEFAULT_CITY,
         bits = [x for x in (h.note, h.where) if x]
         tail = f" — {' · '.join(bits)}" if bits else ""
         lines.append(f"- {tag}{h.price_text} · {h.title}{tail}\n  {h.url}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    description=(
+        "What the TOMAN is worth today: the free-market dollar, the euro, "
+        "18k gold per gram and the Emami coin, from Navasan (navasan.tech), "
+        "all in toman. The vault records what Parsa spent; nothing in it "
+        "knows the rate, so for 'how much is the dollar', 'قیمت طلا', 'what "
+        "is a coin going for', or converting a dollar price into toman, this "
+        "is the source — never a remembered rate, which in this currency is "
+        "wrong by next week and reads exactly as confident as a checked one.\n\n"
+        "`items` is optional: a comma list of Navasan symbols for anything "
+        "beyond the default four — `bahar`, `nim`, `rob`, `gerami`, "
+        "`abshodeh`, `usd_buy`, `dirham_dubai`, `gbp`, `try`, `usdt`, ... "
+        "An unknown one is answered with the symbols that do exist.\n\n"
+        "**The plan is 120 requests a month, so this reads a stored board.** "
+        "One fetch a day covers every symbol, and every call after that is "
+        "free. Leave `fresh` false. Set it true ONLY when Parsa explicitly "
+        "asks for the price right now and the board is from hours ago — even "
+        "then V refuses if the board is under two hours old (the free plan "
+        "does not move faster than that) or the month's refresh budget is "
+        "spent, and says so; report that rather than retrying.\n\n"
+        "Say when the numbers are from — the reply gives the time Navasan "
+        "last moved them, which on the free plan can be two hours behind. "
+        "If it reports a failure, do NOT fall back to a rate from memory."
+    )
+)
+def vault_rates(items: str = "", fresh: bool = False) -> str:
+    r = rates_mod.Rates(S)
+    if not r.configured():
+        return _err("no Navasan key is configured (navasan_api_key in "
+                    "~/.local/state/v/config.json, or NAVASAN_API_KEY). There "
+                    "is no rate to quote — say so; do not give one from memory.")
+    note = ""
+    if fresh:
+        try:
+            board = r.refresh(min_age=rates_mod.FREE_TIER_LAG)
+        except rates_mod.Refused as exc:
+            board, note = r.board(), f"Not refreshed: {exc}."
+        except rates_mod.RatesError as exc:
+            board, note = r.board(), f"Refresh failed: {exc}."
+    else:
+        board = r.ensure_today()
+    if board is None:
+        why = r.failure().get("why") or "nothing has been fetched yet"
+        return _err(f"no rates stored, and fetching failed: {why}. Do not "
+                    f"answer from memory.")
+
+    wanted = [k.strip().lower() for k in items.split(",") if k.strip()]
+    keys = wanted or [k for k, *_ in rates_mod.TRACKED]
+    missing = [k for k in keys if board.get(k) is None]
+
+    now = dt.datetime.now()
+    when = board.fetched
+    head = (f"**Rates · Navasan** — fetched "
+            f"{'today' if when.date() == now.date() else when.date().isoformat()}"
+            f" at {when.strftime('%H:%M')}")
+    if board.updated:
+        head += f"; Navasan last moved them at {board.updated.strftime('%H:%M')}"
+    lines = [head]
+    if when.date() != now.date():
+        fail = r.failure().get("why")
+        lines.append(f"  ⚠ This board is from {when.date().isoformat()}, not "
+                     f"today" + (f" — today's fetch failed: {fail}" if fail
+                                 else "") + ". Say how old it is.")
+    if note:
+        lines.append(f"  {note}")
+    for k in keys:
+        q = board.get(k)
+        if q is None:
+            continue
+        label = f"{q.name} ({q.fa})" if q.fa else q.name
+        change = rates_mod.format_change(q)
+        lines.append(f"- {label} · **{rates_mod.format_value(q)}**"
+                     + (f" · {change}" if change else "")
+                     + f"  `{k}`")
+    if missing:
+        have = sorted(board.quotes)
+        lines.append(f"  Not on Navasan's board: {', '.join(missing)}. "
+                     f"Symbols it does carry: {', '.join(have[:60])}"
+                     + (" …" if len(have) > 60 else ""))
+    b = r.budget(now)
+    lines.append(f"  Quota: {b.used} of {b.cap} requests used in the last "
+                 f"{rates_mod.WINDOW_DAYS} days (plan: {rates_mod.QUOTA}/month)"
+                 f" · {b.refreshes_left} refreshes left")
     return "\n".join(lines)
 
 
