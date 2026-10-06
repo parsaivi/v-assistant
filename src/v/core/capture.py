@@ -116,19 +116,30 @@ class Capture:
         rel = self.daily_path(day)
         if self.vault.exists(rel):
             return rel
-        iso_year, iso_week, _ = day.isocalendar()
+        from .weekplan import week_label
+        # The week runs Sat → Fri and its note is named for its Saturday, so a
+        # Monday belongs to the week that began two days before — not to the
+        # ISO week the Monday sits in, which is next week's note.
         meta = {
             "date": day.isoformat(),
-            "week": f"{iso_year}-W{iso_week:02d}",
+            "week": week_label(day),
             "month": day.strftime("%Y-%m"),
             "quarter": f"{day.year}-Q{(day.month - 1) // 3 + 1}",
             "mood": None, "energy": None,
             "tags": ["daily-note"],
         }
-        # The template keys its dates off the filename, so pass the ISO date as
-        # the title — that is what `tp.file.title` is for a daily note.
+        # The template computes its values in a `<%* … %>` block, which does
+        # not run here, and prints them by bare name — `<% heading %>`,
+        # `<% week %>`. Supply the names, or the note reads `# ` above
+        # `![[#Weekly Focus]]`. `title` is the ISO date, as `tp.file.title` is.
+        context = {
+            "week": meta["week"],
+            "month": meta["month"],
+            "quarter": meta["quarter"],
+            "heading": templates.moment_format(day, "dddd, MMMM D, YYYY"),
+        }
         filled = templates.fill("daily", meta, title=day.isoformat(), when=day,
-                                settings=self.s)
+                                context=context, settings=self.s)
         if filled:
             meta, body = filled
         else:

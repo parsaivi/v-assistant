@@ -37,7 +37,9 @@ Obsidian gets there first, by `ensure_week` if V does. From that instant they
 are *that week's* lines: move one, delete one, add five more, and no other
 week notices. Editing the seed changes future weeks and leaves past ones as
 they were actually lived, which is the only behaviour that lets the archive
-stay honest.
+stay honest. V edits the seed too (`add_rule`, `remove_rule`, `move_rule`), and
+a change it makes there also reaches the week notes already written, from
+today on, so "MLOps moved to 13:00" is true this week and not just next.
 
 **Free time is derived, never written.** You record commitments; the gaps are
 free by definition. `free()` subtracts the week's blocks *and* the calendar's
@@ -56,6 +58,7 @@ reverts.
 from __future__ import annotations
 
 import datetime as dt
+import dataclasses
 import re
 from dataclasses import dataclass
 
@@ -200,27 +203,29 @@ class Rule:
     label: str = ""
     location: str = ""
 
+    @property
+    def time_label(self) -> str:
+        s = self.start.strftime("%H:%M")
+        return f"{s}-{self.end.strftime('%H:%M')}" if self.end else s
+
     def line(self) -> str:
-        codes = ",".join(CODE_FOR[d] for d in sorted(self.days, key=WEEK_ORDER.index))
-        span = self.start.strftime("%H:%M")
-        if self.end:
-            span += f"-{self.end.strftime('%H:%M')}"
-        out = f"- {codes} {span} · {self.kind}"
+        out = f"- {day_codes(self.days)} {self.time_label} · {self.kind}"
         if self.label:
             out += f" · {self.label}"
         if self.location:
             out += f" @{self.location}"
         return out
 
+    def block_on(self, day: dt.date) -> Block:
+        """This rule as the dated line it stamps into `day`'s week."""
+        return Block(day, self.start, self.end, self.kind, self.label,
+                     self.location)
+
     def expand(self, week_start: dt.date) -> list[Block]:
         """The real dated blocks this rule makes in the week starting Saturday."""
-        out = []
-        for offset, weekday in enumerate(WEEK_ORDER):
-            if weekday in self.days:
-                out.append(Block(week_start + dt.timedelta(days=offset),
-                                 self.start, self.end, self.kind,
-                                 self.label, self.location))
-        return out
+        return [self.block_on(week_start + dt.timedelta(days=offset))
+                for offset, weekday in enumerate(WEEK_ORDER)
+                if weekday in self.days]
 
 
 def parse_block(line: str) -> Block | None:
@@ -252,6 +257,30 @@ def parse_rule(line: str) -> Rule | None:
     end = _parse_time(m.group(3)) if m.group(3) else None
     label, location = _split_location(m.group(5) or "")
     return Rule(tuple(days), start, end, m.group(4).lower(), label, location)
+
+
+def day_codes(days) -> str:
+    """`(0, 5)` → `"SA,MO"` — in week order, not weekday-number order."""
+    return ",".join(CODE_FOR[d] for d in sorted(set(days), key=WEEK_ORDER.index))
+
+
+def parse_days(text: str) -> tuple[int, ...] | None:
+    """`"SA,MO"`, `"sat mon"`, `"saturday and monday"` → weekday numbers.
+
+    Any word that is not a day makes the whole thing None rather than being
+    skipped: "MO,WD" is a typo for a day somebody meant, and quietly dropping
+    it would repeat the block on fewer days than were asked for.
+    """
+    out: list[int] = []
+    for word in re.split(r"[\s,/&+]+", (text or "").strip()):
+        if not word or word.lower() == "and":
+            continue
+        wd = DAY_CODES.get(word.upper(), _WEEKDAY_WORDS.get(word.lower()))
+        if wd is None:
+            return None
+        if wd not in out:
+            out.append(wd)
+    return tuple(sorted(out, key=WEEK_ORDER.index)) or None
 
 
 @dataclass
@@ -320,6 +349,15 @@ class WeekPlan:
         A missing seed is not an error — it means nothing repeats yet, which is
         the correct state for a vault the day before a semester starts.
         """
+        return [rule for _, rule in self._seed_lines()]
+
+    def _seed_lines(self) -> list[tuple[str, Rule]]:
+        """Every rule, paired with the exact line it is written as.
+
+        The written line is what an edit has to match, and it is not always
+        `rule.line()`: a hand-written `- MO,SA 9:00-10:30 · class` parses to
+        the same rule as the canonical form but is not the same text.
+        """
         path = self.s.vault / SEED_REL
         if not path.exists():
             return []
@@ -336,7 +374,7 @@ class WeekPlan:
                 continue
             rule = parse_rule(line)
             if rule:
-                out.append(rule)
+                out.append((line, rule))
         return out
 
     def seed_blocks(self, day: dt.date) -> list[Block]:
@@ -639,6 +677,179 @@ class WeekPlan:
                 added += 1
         return added
 
+    # ---- changing what repeats --------------------------------------
+    #
+    # Until these existed the seed was the one part of the schedule V could
+    # read but not correct: the block verbs above stop at the week note, and
+    # their tool descriptions sent Parsa off to edit the template by hand.
+    # These change it on the same terms as the block verbs — a rule is named
+    # by a day and a start time, the kind is checked before anything is
+    # written, and `vault.edit` refuses a line it cannot find exactly once.
+    #
+    # A change to the seed also reaches the week notes that already exist,
+    # from today on. Without that, "MLOps moved to 13:00" would change every
+    # week except the one being lived, which is the one he was talking about.
+    # Days already lived are never touched, and a week line that no longer
+    # matches the rule — moved or renamed there by hand — is left alone and
+    # reported, because that was a decision about that one week.
+
+    def find_rule(self, weekday: int, start: dt.time) -> tuple[str, Rule]:
+        """The one rule repeating on `weekday` at `start`, with its written line."""
+        seed = self._seed_lines()
+        hits = [(raw, r) for raw, r in seed
+                if weekday in r.days and r.start == start]
+        if len(hits) == 1:
+            return hits[0]
+        code = CODE_FOR[weekday]
+        if not hits:
+            listed = ", ".join(f"{r.time_label} {r.label or r.kind}"
+                               for _, r in seed if weekday in r.days)
+            raise ValueError(f"nothing repeats at {start:%H:%M} on {code}. "
+                             f"{code} has: {listed or 'nothing'}.")
+        listed = ", ".join(f"{r.kind} {r.label}".strip() for _, r in hits)
+        raise ValueError(f"{len(hits)} repeating blocks start at {start:%H:%M} "
+                         f"on {code} ({listed}) — can't tell which you mean.")
+
+    def add_rule(self, rule: Rule, *, today: dt.date | None = None) -> str:
+        """Make a block repeat every week, starting with this one."""
+        _check_rule(rule)
+        if any(r.line() == rule.line() for r in self.rules()):
+            return f"already repeats · {rule.line()[2:]}"
+        summary = f"repeat: {rule.line()[2:62]}"
+        if self.vault.exists(SEED_REL):
+            self.vault.append(SEED_REL, rule.line(), summary=summary)
+        else:
+            self.vault.create(SEED_REL, dict(SEED_META),
+                              _seed_body() + rule.line() + "\n", summary=summary)
+        changed = []
+        for d in self._upcoming(rule.days, today):
+            if self._lacks(rule.block_on(d)):
+                self.add(rule.block_on(d), dedupe=False)
+                changed.append(d)
+        return self._finish(f"repeats · {rule.line()[2:]}", changed, [])
+
+    def remove_rule(self, weekday: int, start: dt.time, *,
+                    all_days: bool = False,
+                    today: dt.date | None = None) -> str:
+        """Stop a block repeating — on `weekday` only, or on every day it does."""
+        raw, rule = self.find_rule(weekday, start)
+        gone = rule.days if all_days else (weekday,)
+        rest = tuple(d for d in rule.days if d not in gone)
+        self._rewrite_rule(
+            raw, dataclasses.replace(rule, days=rest).line() if rest else "",
+            summary=f"stop repeating: {day_codes(gone)} {rule.label or rule.kind}"[:70])
+        changed, kept = [], []
+        for d in self._upcoming(gone, today):
+            line = rule.block_on(d).line()
+            if self.find(d, line) is None:
+                kept.append(d)
+                continue
+            self.remove(d, line)
+            changed.append(d)
+        head = (f"no longer repeats on {day_codes(gone)} · "
+                f"{rule.time_label} · {rule.kind}"
+                + (f" · {rule.label}" if rule.label else ""))
+        return self._finish(head, changed, kept)
+
+    def move_rule(self, weekday: int, start: dt.time, *,
+                  all_days: bool = False,
+                  days: tuple[int, ...] | None = None,
+                  to_start: dt.time | None = None, end: dt.time | None = None,
+                  kind: str | None = None, label: str | None = None,
+                  location: str | None = None,
+                  today: dt.date | None = None) -> str:
+        """Change a repeating block. Only what is named changes.
+
+        Without `all_days` only `weekday`'s occurrence moves, and a rule that
+        repeats on other days is split in two: "Monday's MLOps is at 13:00
+        now" must not drag Saturday's along with it.
+        """
+        raw, rule = self.find_rule(weekday, start)
+        moving = rule.days if all_days else (weekday,)
+        rest = tuple(d for d in rule.days if d not in moving)
+        new = Rule(
+            days=tuple(days or moving),
+            start=to_start or rule.start,
+            end=end if end is not None else rule.end,
+            kind=(kind or rule.kind).lower(),
+            label=rule.label if label is None else label,
+            location=rule.location if location is None else location)
+        _check_rule(new)
+        if not rest and new.line() == rule.line():
+            return f"unchanged · {rule.line()[2:]}"
+        # The days left behind keep the line's place and the moved part goes
+        # directly under it, so the seed reads in the order it was written.
+        lines = ([dataclasses.replace(rule, days=rest).line()] if rest else [])
+        lines.append(new.line())
+        self._rewrite_rule(raw, "\n".join(lines),
+                           summary=f"repeat: {new.line()[2:62]}")
+
+        changed, kept = [], []
+        same_days = set(new.days) == set(moving)
+        for d in self._upcoming(moving, today):
+            old = rule.block_on(d).line()
+            if self.find(d, old) is None:
+                kept.append(d)
+                continue
+            if same_days:
+                self.replace(d, old, new.block_on(d))
+            else:
+                self.remove(d, old)
+            changed.append(d)
+        if not same_days:
+            for d in self._upcoming(new.days, today):
+                if self._lacks(new.block_on(d)):
+                    self.add(new.block_on(d), dedupe=False)
+                    changed.append(d)
+        head = "repeats now · " + " · and ".join(l[2:] for l in lines)
+        return self._finish(head, sorted(set(changed)), kept)
+
+    def _upcoming(self, days, today: dt.date | None) -> list[dt.date]:
+        """Dates on `days`, today onward, inside week notes that already exist.
+
+        Weeks with no note need nothing: they are stamped from the updated
+        seed the moment they are made. A year out is the horizon — no
+        timetable is planned further than that, and a week note made that far
+        ahead was made by mistake.
+        """
+        today = today or dt.date.today()
+        sat = week_start_of(today)
+        out = []
+        for w in range(53):
+            first = sat + dt.timedelta(weeks=w)
+            if not self.vault.exists(self.week_rel(first)):
+                continue
+            out.extend(d for d in (first + dt.timedelta(i) for i in range(7))
+                       if d >= today and d.weekday() in days)
+        return out
+
+    def _lacks(self, block: Block) -> bool:
+        return not any(b.key() == block.key() for b in self.on(block.date))
+
+    def _rewrite_rule(self, raw: str, new: str, *, summary: str) -> None:
+        if new:
+            self.vault.edit(SEED_REL, raw, new, summary=summary)
+            return
+        # The newline goes with a deleted line, as in `remove`.
+        try:
+            self.vault.edit(SEED_REL, raw + "\n", "", summary=summary)
+        except Exception:
+            self.vault.edit(SEED_REL, raw, "", summary=summary)
+
+    def _finish(self, head: str, changed: list[dt.date],
+                kept: list[dt.date]) -> str:
+        """Report a seed change, and refresh the daily notes it reached."""
+        for d in changed:
+            self.sync_daily_note(d)
+        out = head
+        if changed:
+            out += ("\nalso changed in the weeks already written: "
+                    + ", ".join(d.isoformat() for d in changed))
+        if kept:
+            out += ("\nleft alone, because that week's line was already "
+                    "changed by hand: " + ", ".join(d.isoformat() for d in kept))
+        return out
+
     # ---- rendering into daily notes ---------------------------------
     def render_day(self, day: dt.date) -> str:
         blocks = self.busy(day)
@@ -822,6 +1033,29 @@ The block above is an example and is **ignored** — fenced code is
 documentation, not schedule. Write your real ones below it.
 
 """
+SEED_META = {"type": "week-schedule", "tags": ["schedule"]}
+
+
+def _seed_body() -> str:
+    """The seed's body with no rules yet — `install`, or V's first `add_rule`."""
+    return SEED_TEMPLATE.split("---\n", 2)[2].format(
+        kinds=" · ".join(f"`{k}`" for k in KINDS))
+
+
+def _check_rule(rule: Rule) -> None:
+    """Refuse a rule before it is written, not after it is stamped into weeks."""
+    if not rule.days:
+        raise ValueError("a repeating block needs at least one day")
+    if rule.kind not in KINDS:
+        raise ValueError(
+            f"{rule.kind!r} is not a kind — use one of: {', '.join(KINDS)}")
+    if rule.end and _minutes(rule.end) <= _minutes(rule.start):
+        raise ValueError(
+            f"{rule.time_label} ends before it starts — a block that crosses "
+            "midnight has to be written as two.")
+    if any("\n" in s for s in (rule.label, rule.location)):
+        raise ValueError("a label or location can't span lines")
+
 
 # Templater's half of "both". It reads the same seed file this module reads
 # and expands it with the same day codes, so a week note made in Obsidian and
@@ -1035,10 +1269,8 @@ def install(settings: Settings | None = None, vault=None) -> list[str]:
     done: list[str] = []
 
     if not v.exists(SEED_REL):
-        body = SEED_TEMPLATE.split("---\n", 2)[2].format(
-            kinds=" · ".join(f"`{k}`" for k in KINDS))
-        v.create(SEED_REL, {"type": "week-schedule", "tags": ["schedule"]},
-                 body, summary="add the week-schedule seed template")
+        v.create(SEED_REL, dict(SEED_META), _seed_body(),
+                 summary="add the week-schedule seed template")
         done.append(f"created {SEED_REL}")
 
     weekly = "05 - Templates/Weekly Note.md"

@@ -524,8 +524,8 @@ def vault_now() -> str:
         "paper · personal · event) anywhere in the text; the rest becomes the "
         "label. Appends to that week's note only — other weeks are untouched, "
         "which is the point of the design. Commits as [bot] and is undoable. "
-        "For something that should repeat every week, tell Parsa to add it to "
-        "'05 - Templates/Week Schedule.md' instead."
+        "For something that should repeat every week, use "
+        "vault_add_repeating_block instead."
     )
 )
 def vault_add_block(text: str) -> str:
@@ -559,8 +559,8 @@ def vault_add_block(text: str) -> str:
         "deletes the wrong hour.\n\n"
         "Writes one line out of that week's note, commits as [bot], and is "
         "undoable with vault_undo. To cancel something only this once, this "
-        "is the right tool; to stop it repeating every week, tell Parsa to "
-        "edit '05 - Templates/Week Schedule.md' instead."
+        "is the right tool; to stop it repeating every week, use "
+        "vault_remove_repeating_block instead."
     )
 )
 def vault_remove_block(day: str, at: str) -> str:
@@ -657,6 +657,185 @@ def _block_at(engine, day: dt.date, at: str):
         return _err(f"{len(on_day)} blocks start at {at} on {day.isoformat()} "
                     f"({listed}) — this tool can't tell which you mean.")
     return on_day[0]
+
+
+# What repeats. The same three verbs as above, one level up: these change
+# '05 - Templates/Week Schedule.md', and through it the week notes already
+# written from today on. They sit with the block verbs and not behind the edit
+# gate for the same reason those do — a rule is named by a day and a time,
+# the kind is checked before anything is written, and the line must be found
+# exactly once — and because "my MLOps class moved to Wednesday" is a thing
+# said from a phone. They used to answer "tell Parsa to edit the template",
+# which made the timetable the one part of his week V could read but not keep.
+_KINDS_TEXT = ("class · work · commute · gym · sleep · study · paper · "
+               "personal · event")
+
+
+@mcp.tool(
+    description=(
+        "What repeats EVERY week — Parsa's standing timetable, from "
+        "'05 - Templates/Week Schedule.md', which each new week note is "
+        "stamped from. Use this rather than reading that file: its fenced "
+        "example lines are documentation and are not part of the schedule.\n\n"
+        "For what one particular week holds, with its cancellations and "
+        "one-offs, use vault_schedule_week."
+    )
+)
+def vault_repeating_schedule() -> str:
+    from ..core import weekplan as wp_mod
+    rules = E().q.weekplan.rules()
+    if not rules:
+        return "nothing repeats yet"
+    rules.sort(key=lambda r: (min(wp_mod.WEEK_ORDER.index(d) for d in r.days),
+                              r.start))
+    return "\n".join(r.line() for r in rules)
+
+
+@mcp.tool(
+    description=(
+        "Make a time block repeat EVERY week — a class on the semester "
+        "timetable, standing work hours, a weekly game. Writes it into the "
+        "repeating schedule and also adds it to the week notes already "
+        "written, from today on; days already lived are left alone.\n\n"
+        "`days`: day codes or names, e.g. 'SA,MO' or 'sunday tuesday' (the "
+        "week runs Sat → Fri). `start`/`end`: HH:MM — leave `end` out for a "
+        "marker that claims no hours; a block cannot cross midnight, so end "
+        f"it at 23:59. `kind`: {_KINDS_TEXT}. `label` and `location` are "
+        "optional.\n\n"
+        "For something that happens once, use vault_add_block. Each note "
+        "touched is its own [bot] commit, undoable with vault_undo."
+    )
+)
+def vault_add_repeating_block(days: str, start: str, kind: str,
+                              end: str | None = None, label: str = "",
+                              location: str = "") -> str:
+    from ..core import weekplan as wp_mod
+    on = wp_mod.parse_days(days)
+    if not on:
+        return _err(f"couldn't read {days!r} as days — use codes like 'SA,MO'")
+    times = _times(start=start, end=end)
+    if isinstance(times, str):
+        return times
+    if "start" not in times:
+        return _err("a repeating block needs a start time — use HH:MM")
+    rule = wp_mod.Rule(on, times["start"], times.get("end"), kind.lower(),
+                       label.strip(), location.strip())
+    try:
+        return E().q.weekplan.add_rule(rule, today=dt.date.today())
+    except Exception as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    description=(
+        "Stop a block repeating every week — a class he dropped, work hours "
+        "that changed, a weekly game that ended. Removes it from the "
+        "repeating schedule and from the week notes already written, from "
+        "today on; days already lived are left alone.\n\n"
+        "`day` (a day code or name) + `at` (HH:MM) name the block — call "
+        "vault_repeating_schedule if unsure. By default only that day stops: "
+        "a block repeating on SA and MO keeps its Saturday. Pass "
+        "`all_days=true` to stop it on every day it repeats.\n\n"
+        "For a one-off cancellation (\"class is off this Monday\"), use "
+        "vault_remove_block instead. Each note touched is its own [bot] "
+        "commit, undoable with vault_undo."
+    )
+)
+def vault_remove_repeating_block(day: str, at: str,
+                                 all_days: bool = False) -> str:
+    found = _rule_day(day, at)
+    if isinstance(found, str):
+        return found
+    try:
+        return E().q.weekplan.remove_rule(*found, all_days=all_days,
+                                          today=dt.date.today())
+    except Exception as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    description=(
+        "Change a block that repeats every week — a class moved to another "
+        "time or day, work hours that now end later, a new room. Rewrites it "
+        "in the repeating schedule and in the week notes already written, "
+        "from today on; days already lived are left alone.\n\n"
+        "`day` (a day code or name) + `at` (HH:MM) name the block as it "
+        "stands now — call vault_repeating_schedule if unsure. Only what you "
+        "pass changes: `to_days` (day codes), `to_start`/`to_end` (HH:MM), "
+        f"`kind` ({_KINDS_TEXT}), `label`, `location`.\n\n"
+        "By default only that day's occurrence changes, so a block repeating "
+        "on SA and MO is split in two. Pass `all_days=true` when the change "
+        "is for every day it repeats (\"MLOps moved to 13:00\" with no day "
+        "named means both).\n\n"
+        "For a change to one week only, use vault_move_block. Each note "
+        "touched is its own [bot] commit, undoable with vault_undo."
+    )
+)
+def vault_move_repeating_block(day: str, at: str, all_days: bool = False,
+                               to_days: str | None = None,
+                               to_start: str | None = None,
+                               to_end: str | None = None,
+                               kind: str | None = None,
+                               label: str | None = None,
+                               location: str | None = None) -> str:
+    from ..core import weekplan as wp_mod
+    found = _rule_day(day, at)
+    if isinstance(found, str):
+        return found
+    changes: dict = {}
+    if to_days:
+        on = wp_mod.parse_days(to_days)
+        if not on:
+            return _err(f"couldn't read {to_days!r} as days — use codes like "
+                        "'SA,MO'")
+        changes["days"] = on
+    times = _times(start=to_start, end=to_end)
+    if isinstance(times, str):
+        return times
+    if "start" in times:
+        changes["to_start"] = times["start"]
+    if "end" in times:
+        changes["end"] = times["end"]
+    if kind:
+        changes["kind"] = kind
+    if label is not None:
+        changes["label"] = label.strip()
+    if location is not None:
+        changes["location"] = location.strip()
+    if not changes:
+        return _err("nothing to change — pass to_days, to_start, to_end, "
+                    "kind, label or location")
+    try:
+        return E().q.weekplan.move_rule(*found, all_days=all_days,
+                                        today=dt.date.today(), **changes)
+    except Exception as exc:
+        return _err(str(exc))
+
+
+def _rule_day(day: str, at: str):
+    """`("MO", "09:00")` → `(weekday, time)`, or an error string."""
+    from ..core import weekplan as wp_mod
+    on = wp_mod.parse_days(day)
+    if not on or len(on) != 1:
+        return _err(f"couldn't read {day!r} as one day — use a code like 'MO'")
+    want = wp_mod._parse_time(at or "")
+    if want is None:
+        return _err(f"couldn't read {at!r} as a time — use HH:MM")
+    return on[0], want
+
+
+def _times(**raw):
+    """Parse whichever of the named HH:MM strings were given."""
+    from ..core import weekplan as wp_mod
+    out = {}
+    for key, value in raw.items():
+        if not value:
+            continue
+        parsed = wp_mod._parse_time(value)
+        if parsed is None:
+            return _err(f"couldn't read {value!r} as a time — use HH:MM")
+        out[key] = parsed
+    return out
 
 
 # ------------------------------------------------------------------ contacts --

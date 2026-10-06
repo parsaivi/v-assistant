@@ -51,6 +51,14 @@ class Job:
     weekdays: tuple[int, ...] | None = None   # 0=Mon .. 6=Sun
     interval_minutes: int | None = None
     catch_up: bool = True       # run late if we were down when it was due
+    # Does this job's return value belong to *Parsa*, or to whoever is
+    # debugging V? A reminder, a new email, the evening close-out are
+    # messages. "calendar: +0 imported, 13 already there" is a log line that
+    # happened to be returned from a function — and pushing it to Telegram is
+    # how a channel that should be worth reading becomes one you swipe away
+    # without looking, taking the reminders with it. Housekeeping jobs set
+    # this False and their output goes to `logs/scheduler.log` instead.
+    announce: bool = True
 
 
 class Scheduler:
@@ -61,6 +69,13 @@ class Scheduler:
         self.state_path = self.s.state_dir / "scheduler.json"
         self.state = self._load_state()
         self.jobs = self._build_jobs()
+        # Looked up by name in `_deliver`, because by then the job object is
+        # gone — `tick` and `catch_up` both hand over a `(name, result)` pair.
+        self.silent = {j.name for j in self.jobs if not j.announce}
+        # Whether anyone is watching stdout. `v scheduler` in a terminal is a
+        # deliberate, foreground run and should show its work; `v.service`
+        # feeding Telegram is not, and its housekeeping goes to the log alone.
+        self.foreground = sink is None
 
     # ---- jobs --------------------------------------------------------
     def _build_jobs(self) -> list[Job]:
@@ -71,7 +86,14 @@ class Scheduler:
             # --install-cron`), so it fires whether or not this process is
             # running; both paths go through `briefing.run`, which records the
             # day it delivered, so the two cannot push the same morning twice.
-            Job("morning-brief", briefing.DEFAULT_TIME, self._morning_brief),
+            # `announce=False` and it is not an oversight: `briefing.run`
+            # *delivers the brief itself*, over notify-send, the daily note and
+            # Telegram. What this job hands back is a one-line receipt saying
+            # whether that happened — "morning brief not pushed — already
+            # delivered at 12:14" is a sentence about V's plumbing, arriving
+            # right underneath the brief it is talking about.
+            Job("morning-brief", briefing.DEFAULT_TIME, self._morning_brief,
+                announce=False),
             Job("evening-closeout", dt.time(21, 0), self.engine.evening),
             # Friday is the last day of this vault's Sat→Fri week.
             Job("weekly-rollup", dt.time(18, 0), self._weekly, weekdays=(4,)),
@@ -83,29 +105,31 @@ class Scheduler:
             # model, and writes nothing on an hour where nothing closed.
             Job("brag-drafts", None, self._brag, interval_minutes=60,
                 catch_up=False),
-            Job("reindex", None, self._reindex, interval_minutes=15, catch_up=False),
+            Job("reindex", None, self._reindex, interval_minutes=15,
+                catch_up=False, announce=False),
             # Embeddings are a separate artefact from the note mirror and cost
             # minutes, not milliseconds, so they can't ride on the 15-minute
             # reindex. Nightly is often enough: the gap only affects semantic
             # search, and `status` says out loud when it has fallen behind.
-            Job("re-embed", dt.time(4, 30), self._reembed),
+            Job("re-embed", dt.time(4, 30), self._reembed, announce=False),
             # V's own notes, kept current. A skills page that describes last
             # week's build is worse than none — it is the page you'd check to
             # find out why V is behaving the way it is.
-            Job("self-docs", dt.time(5, 0), self._self_docs),
+            Job("self-docs", dt.time(5, 0), self._self_docs, announce=False),
             # Before the brief, so "Today" is right when it runs at 07:00.
             # Pulls the remote feed into the vault calendar and renders the
             # coming fortnight into the daily notes, keeping one source of
             # truth instead of a feed, a section, and a reminders table
             # disagreeing with each other.
-            Job("calendar-sync", dt.time(6, 30), self._calendar_sync),
+            Job("calendar-sync", dt.time(6, 30), self._calendar_sync,
+                announce=False),
             # Saturday opens this vault's week, so the week note has to exist
             # and be seeded before the first daily note of it embeds anything.
             # Early, and before `calendar-sync` would render the day: a daily
             # note whose `## ⏱ Schedule` says "not synced yet" all Saturday is
             # the one failure that would make the whole feature feel dead.
             Job("week-scaffold", dt.time(5, 30), self._week_scaffold,
-                weekdays=(5,)),
+                weekdays=(5,), announce=False),
             # Every 10 minutes, not every minute like reminders: an unread
             # email is not as time-critical as a reminder Parsa set for a
             # specific minute, and Gmail's list endpoint is not free to poll
@@ -177,6 +201,13 @@ class Scheduler:
         never seeing it at all, and this is the trade the whole change is
         about.
         """
+        name = (item[0] if isinstance(item, tuple) else source)
+        # `catch_up` labels a late job "<name> (missed)"; the job is the same
+        # job, and a receipt is no more worth pushing for having been late.
+        if str(name).removesuffix(" (missed)") in self.silent:
+            self._log(name, item)
+            return
+
         if self.sink(source, item) is False:
             return          # left due on purpose — the next tick retries it
         _, payload = item if isinstance(item, tuple) else (source, item)
@@ -189,6 +220,39 @@ class Scheduler:
                     self.engine.settle_reminder(rid)
                 except Exception:       # noqa: BLE001 — a retry beats a crash
                     pass
+
+    def _log(self, name, item) -> None:
+        """Where a housekeeping job's output actually goes.
+
+        A file, not a chat and not a swallow: "did the nightly re-embed
+        finish?" has to stay answerable, and `logs/scheduler.log` is where you
+        look — the same place the crontab briefing already writes. Best-effort
+        by construction, because a scheduler that dies on a full disk while
+        trying to record that it did some tidying is worse than one that tidies
+        quietly.
+        """
+        _, payload = item if isinstance(item, tuple) else (name, item)
+        items = payload if isinstance(payload, list) else [payload]
+        lines = []
+        for p in items:
+            if p is None:
+                continue
+            text = getattr(p, "render", lambda: str(p))().strip()
+            if text:
+                lines.append(" ".join(text.split()))
+        if not lines:
+            return          # the job had nothing to say; nothing to record
+        stamp = dt.datetime.now().isoformat(timespec="seconds")
+        entry = "".join(f"{stamp} {name} · {line}\n" for line in lines)
+        if self.foreground:
+            print(entry, end="")
+        try:
+            self.s.log_dir.mkdir(parents=True, exist_ok=True)
+            with (self.s.log_dir / "scheduler.log").open(
+                    "a", encoding="utf-8") as fh:
+                fh.write(entry)
+        except OSError:
+            pass
 
     def tick(self, now: dt.datetime | None = None) -> list[tuple[str, object]]:
         now = now or dt.datetime.now()
@@ -306,11 +370,17 @@ class Scheduler:
         stats = index.rebuild(self.s)
         if not stats.updated and not stats.removed:
             return None      # silence is correct: nothing changed this pass
-        return stats
+        # `IndexStats.__str__` is already the line you'd want in a log, and
+        # this is a log now — no reason to keep a second, thinner copy of it.
+        return f"reindex: {stats}"
 
     def _reembed(self):
         """Rebuild the semantic index so notes written today are searchable."""
-        return self.engine.rag.build()
+        st = self.engine.rag.build() or {}
+        if not isinstance(st, dict):
+            return st
+        return (f"re-embed: {st.get('chunks', 0)} chunks · "
+                f"{st.get('backend', '?')} · {st.get('seconds', 0)}s")
 
     def _self_docs(self):
         from . import identity

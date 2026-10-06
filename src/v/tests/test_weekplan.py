@@ -454,6 +454,173 @@ def moving_a_block_into_another_week_writes_both_notes():
     ok(landed, "and present in the next one")
 
 
+# --- changing what repeats --------------------------------------------
+def _seed(s) -> str:
+    return (s.vault / weekplan.SEED_REL).read_text(encoding="utf-8")
+
+
+@test
+def day_names_and_codes_both_read_as_days():
+    eq(weekplan.parse_days("SA,MO"), (5, 0))
+    eq(weekplan.parse_days("monday and saturday"), (5, 0), "week order, not input")
+    eq(weekplan.parse_days("sun tue"), (6, 1))
+    eq(weekplan.parse_days("MO,WD"), None, "a typo is not silently dropped")
+    eq(weekplan.parse_days(""), None)
+
+
+@test
+def a_new_repeating_block_reaches_this_week_from_today_on():
+    """Added on a Monday: this Monday and every later day get it, the
+    Saturday already lived does not, and the next week is seeded with it."""
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    wp.ensure_week(SAT)
+    rule = weekplan.Rule((5, 0), dt.time(9), dt.time(10, 30), "class", "MLOps")
+    out = wp.add_rule(rule, today=MON)
+
+    ok("repeats" in out)
+    ok("- SA,MO 09:00-10:30 · class · MLOps" in _seed(s))
+    mlops = [b.date for b in wp.week(SAT) if b.label == "MLOps"]
+    eq(mlops, [MON], "the Saturday already lived stays as it was lived")
+    nxt = SAT + dt.timedelta(7)
+    wp.ensure_week(nxt)
+    eq([b.date for b in wp.week(nxt) if b.label == "MLOps"],
+       [nxt, nxt + dt.timedelta(2)], "and every later week is stamped with it")
+
+    eq(wp.add_rule(rule, today=MON).split(" ·")[0], "already repeats")
+
+
+@test
+def a_repeating_block_needs_a_real_kind_and_a_real_span():
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    for bad, why in (
+            (weekplan.Rule((4,), dt.time(22, 30), dt.time(0), "personal"),
+             "ends before it starts"),
+            (weekplan.Rule((4,), dt.time(22, 30), None, "futsal"),
+             "not a kind")):
+        try:
+            wp.add_rule(bad, today=SAT)
+            raise AssertionError(f"{bad} must be refused")
+        except ValueError as exc:
+            ok(why in str(exc), str(exc))
+    eq(_seed(s), SEED, "a refused rule writes nothing")
+
+
+@test
+def stopping_one_day_of_a_repeating_block_keeps_the_others():
+    """`SA,MO,WE` work, Monday dropped: the line becomes `SA,WE`, and this
+    week's Monday and Wednesday lose only the Monday."""
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    wp.ensure_week(SAT)
+    out = wp.remove_rule(0, dt.time(8), today=SUN)
+
+    ok("no longer repeats on MO" in out, out)
+    ok("- SA,WE 08:00-16:00 · work · Divar" in _seed(s))
+    ok("SA,MO,WE 08:00" not in _seed(s).split("```")[-1])
+    work = [b.date for b in wp.week(SAT) if b.kind == "work"]
+    eq(work, [SAT, SAT + dt.timedelta(4)], "Saturday lived, Wednesday kept")
+
+
+@test
+def stopping_a_repeating_block_on_every_day_deletes_its_line():
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    wp.remove_rule(6, dt.time(10, 30), all_days=True, today=SAT)
+    ok("Compiler Design" not in _seed(s))
+    ok("\n\n\n" not in _seed(s), "no hole left behind")
+    eq([r.kind for r in wp.rules()], ["work", "gym", "sleep"])
+
+
+@test
+def moving_a_repeating_block_on_all_days_rewrites_this_week_in_place():
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    wp.ensure_week(SAT)
+    out = wp.move_rule(6, dt.time(10, 30), all_days=True, to_start=dt.time(14),
+                       end=dt.time(15, 30), location="305", today=SAT)
+
+    ok("repeats now · SU,TU 14:00-15:30 · class · Compiler Design @305" in out,
+       out)
+    eq(len([r for r in wp.rules() if r.kind == "class"]), 1, "one line, edited")
+    classes = [(b.date, b.time_label, b.location)
+               for b in wp.week(SAT) if b.kind == "class"]
+    eq(classes, [(SUN, "14:00-15:30", "305"), (TUE, "14:00-15:30", "305")])
+
+
+@test
+def moving_one_day_of_a_repeating_block_splits_the_rule():
+    """"Tuesday's Compiler class is at 14:00 now" leaves Sunday's alone."""
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    wp.ensure_week(SAT)
+    wp.move_rule(1, dt.time(10, 30), to_start=dt.time(14), end=dt.time(15, 30),
+                 today=SAT)
+
+    ok("- SU 10:30-12:00 · class · Compiler Design @204\n"
+       "- TU 14:00-15:30 · class · Compiler Design @204" in _seed(s),
+       "the moved part sits directly under what stayed")
+    classes = [(b.date, b.time_label) for b in wp.week(SAT) if b.kind == "class"]
+    eq(classes, [(SUN, "10:30-12:00"), (TUE, "14:00-15:30")])
+
+
+@test
+def moving_a_repeating_block_to_another_day_moves_it_this_week_too():
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    wp.ensure_week(SAT)
+    wp.move_rule(5, dt.time(19), days=(3,), today=SAT)   # Saturday gym → Thursday
+    gym = [b.date for b in wp.week(SAT) if b.kind == "gym"]
+    eq(gym, [MON, SAT + dt.timedelta(4), SAT + dt.timedelta(5)],
+       "Saturday's gym is gone and Thursday has it")
+    ok("- MO,WE 19:00-20:30 · gym\n- TH 19:00-20:30 · gym" in _seed(s))
+
+
+@test
+def a_week_line_changed_by_hand_is_left_alone():
+    """That week's line is that week's decision; the seed change says so."""
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    wp.ensure_week(SAT)
+    wp.move(TUE, "- 2026-09-22 10:30-12:00 · class · Compiler Design @204",
+            label="Compiler Design (makeup)")
+    out = wp.move_rule(6, dt.time(10, 30), all_days=True, to_start=dt.time(9),
+                       end=dt.time(10, 30), today=SAT)
+
+    ok("left alone" in out and TUE.isoformat() in out, out)
+    tue = [b for b in wp.on(TUE) if b.kind == "class"][0]
+    eq((tue.time_label, tue.label), ("10:30-12:00", "Compiler Design (makeup)"))
+
+
+@test
+def a_repeating_block_that_is_not_there_fails_loudly():
+    _, s = build_vault()
+    wp = WeekPlan(s)
+    try:
+        wp.remove_rule(4, dt.time(22, 30), today=SAT)
+        raise AssertionError("a phantom rule must not be removable")
+    except ValueError as exc:
+        ok("nothing repeats at 22:30 on FR" in str(exc), str(exc))
+    try:
+        wp.remove_rule(3, dt.time(9), today=SAT)
+        raise AssertionError("the fenced example is not a rule")
+    except ValueError:
+        pass
+    eq(_seed(s), SEED)
+
+
+@test
+def the_first_repeating_block_creates_the_seed():
+    root, s = build_vault()
+    (root / weekplan.SEED_REL).unlink()
+    wp = WeekPlan(s)
+    wp.add_rule(weekplan.Rule((4,), dt.time(22, 30), dt.time(23, 59),
+                              "personal", "Futsal"), today=SAT)
+    eq([r.label for r in wp.rules()], ["Futsal"])
+    ok("type: week-schedule" in _seed(s))
+
+
 # --- the point of the module ------------------------------------------
 @test
 def free_time_is_derived_not_written():

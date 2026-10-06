@@ -378,7 +378,7 @@ READ_TOOLS = [
     # The week's shape, and the gaps in it. Read-only and free — and the only
     # tools that can answer "when am I free", which the calendar cannot.
     "mcp__vault__vault_schedule_week", "mcp__vault__vault_free_time",
-    "mcp__vault__vault_now",
+    "mcp__vault__vault_now", "mcp__vault__vault_repeating_schedule",
     "mcp__vault__vault_memory_list", "mcp__vault__vault_voice_list",
     # Emails and phone numbers out of `10 - Personal CRM`, and nothing else
     # from it. On the read list rather than the write one because it changes
@@ -457,6 +457,14 @@ WRITE_TOOLS = [
     # to say to V from a phone, and gating it to the terminal would make the
     # schedule the one thing V can add to but never correct.
     "mcp__vault__vault_remove_block", "mcp__vault__vault_move_block",
+    # The same three verbs for what repeats — the seed, and through it every
+    # week already written from today on. Same narrow contract (a day code
+    # and a start time, a closed kind, a line found exactly once), so the
+    # same reasoning puts them here: "my MLOps class moved" is said from a
+    # phone, and the timetable should not be the one thing V cannot keep.
+    "mcp__vault__vault_add_repeating_block",
+    "mcp__vault__vault_remove_repeating_block",
+    "mcp__vault__vault_move_repeating_block",
     # Creating a Google event is the one write here that leaves the machine:
     # it emails the guests, and `vault_undo` does not reach it. Behind the
     # write flag like everything else, and the tool description says to

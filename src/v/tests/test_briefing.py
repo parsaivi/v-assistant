@@ -89,6 +89,39 @@ _No events scheduled._
 ## End of Day
 """
 
+# The vault's real shape since 2026-09-27: the dates are computed in a
+# Templater execution block, which V cannot run, and printed by bare name.
+DAILY_TEMPLATE_EXEC = """<%*
+let title = tp.file.title;
+const day = moment(title, "YYYY-MM-DD");
+const week = day.clone().subtract((day.day() + 1) % 7, "days").format("GGGG-[W]WW");
+const month = day.format("YYYY-MM");
+const quarter = day.format("YYYY-[Q]Q");
+const heading = day.format("dddd, MMMM D, YYYY");
+-%>
+---
+date: "<% title %>"
+week: "<% week %>"
+month: "<% month %>"
+quarter: "<% quarter %>"
+mood:
+energy:
+tags:
+  - daily-note
+---
+
+# <% heading %>
+
+> [!tip] Weekly Focus
+> ![[<% week %>#Weekly Focus]]
+
+## 📅 Calendar
+<!-- Source of truth: `01 - Daily Notes/Calendar/<% month %>.md` -->
+_No events scheduled._
+
+## Day life
+"""
+
 PERSON_TEMPLATE = """---
 type: person
 tier:
@@ -213,10 +246,35 @@ def a_filled_template_leaves_no_token_behind():
         note = e.vault.read(rel)
         ok("<%" not in note.render() and "{{" not in note.render(),
            "a template token survived into the note")
-        eq(str(note.meta["week"]), "2026-W32")
+        # Wednesday 5 August is in the week that began Saturday 1 August,
+        # whose note is 2026-W31 — not ISO W32, which is next week's.
+        eq(str(note.meta["week"]), "2026-W31")
         issues = [i for i in schema.validate_note(note, settings=s)
                   if i.level == "error"]
         eq(issues, [], "a note V created must be schema-clean")
+        e.close()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def a_template_that_computes_its_dates_in_javascript_still_renders():
+    """The vault's template moved its dates into a `<%* … %>` block so a note
+    made from "New note" could ask for its date. V cannot run that block, and
+    every note it scaffolded for a week read `# ` above `![[#Weekly Focus]]`."""
+    root, s = make_vault()
+    try:
+        write(root, "05 - Templates/Daily Note.md", DAILY_TEMPLATE_EXEC)
+        e = Engine(s)
+        # A Monday: its week began Saturday 1 August, which is ISO week 31.
+        rel = e.capture.ensure_daily(dt.date(2026, 8, 3))
+        note = e.vault.read(rel)
+        ok("# Monday, August 3, 2026\n" in note.body, "heading rendered empty")
+        ok("![[2026-W31#Weekly Focus]]" in note.body,
+           "weekly focus embed rendered empty")
+        ok("Calendar/2026-08.md" in note.body, "calendar pointer rendered empty")
+        eq(str(note.meta["week"]), "2026-W31")
+        eq(str(note.meta["quarter"]), "2026-Q3")
         e.close()
     finally:
         shutil.rmtree(root)

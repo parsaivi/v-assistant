@@ -21,7 +21,7 @@ src/v/
   cli.py        34 subcommands + the REPL; entry point for the `v` console script
   core/         53 modules — see the table in README.md
   core/hud/     the desktop surface's page, stylesheet and script (package data)
-  mcp/          the MCP server (48 tools) + the privacy guard
+  mcp/          the MCP server (58 tools) + the privacy guard
   tests/        641 tests, plain asserts, no pytest
 android/        Kotlin + Compose client for the phone transport, plus two
                 Glance home-screen widgets over `GET /v1/glance`

@@ -1789,7 +1789,8 @@ def daily_note_scaffold_is_valid():
         c = capture.Capture(vaultfs.Vault(s), s)
         rel = c.ensure_daily(dt.date(2026, 7, 31))
         note = vaultfs.Vault(s).read(rel)
-        eq(note.meta["week"], "2026-W31")
+        # Friday 31 July closes the week that opened Saturday 25 July (W30).
+        eq(note.meta["week"], "2026-W30")
         eq(note.meta["month"], "2026-07")
         eq([i for i in schema.validate_note(note) if i.level == "error"], [])
     finally:
@@ -2033,6 +2034,43 @@ def scheduler_catches_up_missed_jobs():
         names = [m[0] for m in missed]
         ok(any("morning-brief" in n for n in names),
            "a 7am brief must be caught up when booting at noon")
+        e.close()
+    finally:
+        shutil.rmtree(root)
+
+
+@test
+def housekeeping_jobs_never_reach_the_sink():
+    """The bug this guards: every job's return value was pushed to Telegram,
+    so a service restart delivered five receipts in a row — "morning brief not
+    pushed — already delivered", a raw embeddings dict, "refreshed
+    19 - Assistant/V/", "calendar: +0 imported" — underneath the brief they
+    were about. A channel that carries reminders cannot also carry plumbing:
+    you learn to swipe it away, and then the reminders go with it."""
+    root, s = make_vault()
+    s.embedding_backend = "tfidf"
+    try:
+        from v.core.scheduler import Scheduler
+        e = Engine(s)
+        seen = []
+        sched = Scheduler(e, s, sink=lambda src, item: seen.append(item))
+
+        for name in ("morning-brief", "calendar-sync", "week-scaffold",
+                     "self-docs", "re-embed", "reindex"):
+            ok(name in sched.silent, f"{name} is plumbing, not a message")
+        for name in ("reminders", "gmail-check", "evening-closeout", "outbox"):
+            ok(name not in sched.silent, f"{name} speaks to Parsa")
+
+        sched._deliver("tick", ("calendar-sync", "calendar: +0 imported"))
+        sched._deliver("catch-up", ("morning-brief (missed)", "not pushed"))
+        ok(seen == [], f"housekeeping reached the sink anyway: {seen}")
+
+        log = (s.log_dir / "scheduler.log").read_text(encoding="utf-8")
+        ok("+0 imported" in log, "…and was not merely swallowed")
+        ok("morning-brief (missed)" in log, "a late job logs like any other")
+
+        sched._deliver("tick", ("gmail-check", "1 new email(s)"))
+        ok(len(seen) == 1, "a job with something to say still gets through")
         e.close()
     finally:
         shutil.rmtree(root)
