@@ -43,10 +43,21 @@ Automatic fetches give up for the day after `AUTO_TRIES` attempts that
 reached the server; a bad key or an exhausted quota stops them at once,
 because retrying either one only spends more of what is already gone.
 
-**Units.** Navasan quotes the Iranian market in **toman** — the vault's unit,
-so these drop into a ledger comparison as they are. The global ones it also
-carries (an ounce of gold, the crypto coins) are dollars; `UNITS` marks the
-ones known to be, and anything else is reported as Navasan gave it.
+**Units — read off the live board on 2026-10-06, not from documentation,**
+because Navasan publishes none and the board does not use one unit:
+
+* Nearly everything is **toman**: the currencies, 18k gold per gram, and
+  more surprisingly the crypto (`btc` 23,063,518,310 — about $85.5k at the
+  day's dollar) and `xau`/`xag`, which are toman *per ounce*.
+* `usd_xau` is the one in **dollars** (4,156.92 an ounce).
+* The coins and melted gold — `sekkeh`, `bahar`, `nim`, `rob`, `gerami`,
+  `abshodeh` — are in **thousands of toman**: `sekkeh` said 274,500 on a day
+  an Emami coin's ~7.3 g of gold was worth about 264,000,000 T on its own.
+
+`parse()` multiplies that last group by a thousand, value and change both, so
+everything that leaves this module is plain toman — the vault's unit — and no
+caller has to know which symbols were odd. That is `bazaar`'s rule: fix a
+source's unit once, here, rather than at every call site.
 
 **The key never leaves this module.** It goes in the query string, which is
 exactly where `httpx` exceptions print it from, so no exception text from the
@@ -116,12 +127,17 @@ NAMES: dict[str, tuple[str, str]] = {
     "usdt": ("Tether", "تتر"),
     "usd_farda_sell": ("Dollar (forward)", "دلار فردایی"),
     "harat_naghdi_sell": ("Herat dollar", "دلار هرات"),
+    "xau": ("Gold · 1 ounce", "انس طلا"),
+    "usd_xau": ("Gold · 1 ounce", "انس طلا"),
+    "xag": ("Silver · 1 ounce", "انس نقره"),
+    "btc": ("Bitcoin", "بیت‌کوین"),
+    "eth": ("Ethereum", "اتریوم"),
 }
 
-#: Quoted in dollars, not toman. Everything else on the board is the Iranian
-#: market and is toman.
-USD_QUOTED = frozenset({"usd_xau", "xau", "xag", "btc", "eth", "ltc", "xrp",
-                        "eos", "dash", "bnb", "ada", "doge", "sol", "trx"})
+#: Quoted in dollars. The only one on the board — see the module docstring.
+USD_QUOTED = frozenset({"usd_xau"})
+#: Quoted in thousands of toman, and rescaled by `parse()`.
+THOUSANDS = frozenset({"sekkeh", "bahar", "nim", "rob", "gerami", "abshodeh"})
 
 _KEY_RE = re.compile(r"^[a-z0-9_]{1,40}$")
 
@@ -269,8 +285,11 @@ def parse(payload) -> dict[str, Quote]:
         value = _number(row.get("value"))
         if value is None or value <= 0:
             continue
-        out[key] = Quote(key=key, value=value,
-                         change=_number(row.get("change")),
+        change = _number(row.get("change"))
+        if key in THOUSANDS:
+            value *= 1000
+            change = change * 1000 if change is not None else None
+        out[key] = Quote(key=key, value=value, change=change,
                          updated=_when(row.get("timestamp")),
                          jdate=str(row.get("date") or ""))
     if not out:

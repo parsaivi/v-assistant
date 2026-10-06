@@ -70,12 +70,15 @@ BODY = {
             "date": "1405-07-14 12:00:00"},
     "18ayar": {"value": "9150000", "change": 0, "timestamp": 1791270000,
                "date": "1405-07-14 12:00:00"},
-    "sekkeh": {"value": "98500000", "change": 1200000,
+    # Coins arrive in thousands of toman — this is the live board's shape.
+    "sekkeh": {"value": "274500", "change": 1500,
                "timestamp": 1791270000, "date": "1405-07-14 12:00:00"},
-    "bahar": {"value": "92000000", "change": None, "timestamp": 1791270000,
+    "bahar": {"value": "262000", "change": None, "timestamp": 1791270000,
               "date": "1405-07-14 12:00:00"},
     "usd_xau": {"value": "2650.5", "change": 4.5, "timestamp": 1791270000,
                 "date": "1405-07-14 12:00:00"},
+    "xau": {"value": "1112856370", "change": 0, "timestamp": 1791270000,
+            "date": "1405-07-14 12:00:00"},
     "broken": {"value": "", "change": 1},
     "not_a_row": 7,
 }
@@ -137,10 +140,28 @@ def a_board_reads_navasan_strings_and_drops_what_it_cannot():
     ok("broken" not in q and "not_a_row" not in q, "unreadable rows dropped")
     eq(q["bahar"].change, None, "a missing change is None, not 0")
     eq(q["usd_sell"].unit, "toman")
-    eq(q["usd_xau"].unit, "USD", "an ounce of gold is quoted in dollars")
+    eq(q["usd_xau"].unit, "USD", "usd_xau is the one symbol in dollars")
+    eq(q["xau"].unit, "toman", "xau is the same ounce, in toman")
     eq(q["usd_sell"].pct, round(100 * 500 / 104000, 2),
        "the percentage is against yesterday's value, not today's")
     eq(q["usd_sell"].jdate, "1405-07-14 12:00:00")
+
+
+@test
+def coins_are_rescaled_out_of_thousands():
+    """Checked on the live board, 2026-10-06: `sekkeh` said 274,500 on a day
+    the coin's gold alone was worth ~264,000,000 T. Read as toman, the HUD
+    put a coin a thousand times under an 18k gram — this is the fix."""
+    q = rates.parse(BODY)
+    eq(q["sekkeh"].value, 274_500_000.0)
+    eq(q["sekkeh"].change, 1_500_000.0, "the change is rescaled with it")
+    eq(q["sekkeh"].pct, rates.parse({"x": {"value": "274500",
+                                            "change": 1500}})["x"].pct,
+       "and the percentage does not move")
+    eq(q["bahar"].value, 262_000_000.0)
+    eq(q["bahar"].change, None, "a missing change stays missing")
+    ok(q["sekkeh"].value > q["18ayar"].value, "a coin outweighs a gram")
+    eq(rates.format_value(q["sekkeh"]), "274,500,000 T")
 
 
 @test

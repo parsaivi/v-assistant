@@ -651,8 +651,8 @@ class _NavasanResp:
         return {"usd_sell": {**row, "value": "104500"},
                 "eur": {**row, "value": "121300"},
                 "18ayar": {**row, "value": "9150000"},
-                "sekkeh": {**row, "value": "98500000"},
-                "bahar": {**row, "value": "92000000"}}
+                "sekkeh": {**row, "value": "274500"},     # thousands of T
+                "bahar": {**row, "value": "262000"}}
 
 
 @test
@@ -684,7 +684,7 @@ def rates_are_one_request_a_day_however_often_asked():
             again = call("vault_rates", fresh=True)
             odd = call("vault_rates", items="usd_sell, doge")
         ok(get.call_count == 1, f"four calls, {get.call_count} requests")
-        ok("104,500 T" in out and "98,500,000 T" in out, out)
+        ok("104,500 T" in out and "274,500,000 T" in out, out)
         ok("Quota: 1 of 110" in out, "the budget is on every answer")
         ok("104,500 T" in again, "fresh on a young board is the stored board")
         ok("doge" in odd and "bahar" in odd,

@@ -2669,7 +2669,7 @@ class _Navasan:
                "date": "1405-07-14 12:00:00"}
         body = {k: {**row, "value": v} for k, v in (
             ("usd_sell", "104500"), ("eur", "121300"),
-            ("18ayar", "9150000"), ("sekkeh", "98500000"))}
+            ("18ayar", "9150000"), ("sekkeh", "274500"))}
 
         class R:
             status_code = self.status
