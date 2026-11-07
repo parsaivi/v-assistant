@@ -142,3 +142,20 @@ normalise them.
 languages; `test_mcp` asserts they agree. If you add a private folder, change
 both. Private notes stay indexed and searchable by the local $0 path — only
 the MCP surface is blind to them.
+
+## Publishing
+
+This repo (`parsaivi/v`) is private and is the only place V is developed.
+`parsaivi/v-assistant` is a mirror of it, built by `publish/publish.sh`: the
+script rewrites a fresh clone of `main` (private values swapped through
+`publish/replacements.txt`, the work email through `publish/mailmap`, and
+`publish/` itself dropped), refuses to push if anything in
+`publish/needles.txt` survived or gitleaks finds something, and pushes only
+as a fast-forward. Run `publish/publish.sh --dry-run` to check without
+pushing.
+
+Never commit to the mirror. When a new private value lands in the code (a
+token, an address, an ID, coordinates), add it to both `replacements.txt` and
+`needles.txt` before the next publish. Replacements are literal and apply to
+every file, so pick values that survive formatting: `51.3380` comes back from
+a float as `51.338` and breaks the test that compares it.
