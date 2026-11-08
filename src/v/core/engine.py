@@ -26,8 +26,9 @@ from pathlib import Path
 from . import (agenda as agenda_mod, brag as brag_mod, calendar as calendar_mod,
                capture, deferred as deferred_mod, hermes as hermes_mod,
                identity, index,
-               journal as journal_mod, llm, memory as memory_mod, notes, nudges,
-               persona, query, rag, reminders, router, schema,
+               journal as journal_mod, llm, mailguard, memory as memory_mod,
+               notes, nudges, persona, provenance, query, rag, reminders,
+               router, schema,
                session as session_mod,
                tasks as tasks_mod, traits as traits_mod, work)
 from .config import Settings, settings as default_settings
@@ -62,6 +63,35 @@ class Response:
         if self.buttons:
             out += "\n\n[" + "] [".join(b.label for b in self.buttons) + "]"
         return out
+
+
+# The intents whose writes are executed by rules from Parsa's own message.
+_RULE_WRITES = frozenset({router.TASK_DONE, router.TASK_ADD, router.SCHEDULE,
+                          router.REFILE, *router.CAPTURE_INTENTS})
+
+# Slots whose values end up written into a note.
+_WRITTEN_SLOTS = ("text", "title", "what", "summary", "label", "category",
+                  "amount_text", "location")
+
+
+def _author_of(route: router.Route, text: str) -> str:
+    """Who wrote the words a rule-executed route is about to write.
+
+    Routed by rules, the words are Parsa's message. Routed by the decider,
+    the code that writes is still deterministic, but the slots it fills may
+    be the model's words — a tidied task, a title it made up, a category it
+    chose. Those are the model's, so the write is `v` unless every written
+    slot appears verbatim in what he said.
+    """
+    if not getattr(route, "by_model", False):
+        return provenance.PARSA
+    said = " ".join(text.split()).lower()
+    for key in _WRITTEN_SLOTS:
+        val = (route.slots or {}).get(key)
+        if isinstance(val, str) and val.strip() and \
+                " ".join(val.split()).lower() not in said:
+            return provenance.V
+    return provenance.PARSA
 
 
 class Engine:
@@ -248,8 +278,12 @@ class Engine:
 
         route = self.router.route(text, message_type=message_type,
                                   has_location=has_location, has_file=has_file)
+        # Wall clock, not `now`: the store stamps rows with the real time, and
+        # most of what a turn writes is written by the MCP server's process.
+        since = provenance._now()
         resp = self._dispatch(route, text, now, extra,
                               voice=message_type == "voice")
+        self._offer_approvals(resp, since)
         resp.intent = route.intent
         # `route` is how the message was *handled* — "structured:places",
         # "rag:tfidf", "capture.idea". The router's own decision goes in
@@ -320,6 +354,61 @@ class Engine:
     # -----------------------------------------------------------------
     def _dispatch(self, route: router.Route, text: str, now: dt.datetime,
                   extra: dict, voice: bool = False) -> Response:
+        """Route, with every vault write labelled by who wrote its words.
+
+        The intents executed by rules — a capture, a task, an event, a tick —
+        write what Parsa said, so they are his unless a model rephrased it
+        (`_author_of`). Everything else is `v`: the escalation paths write
+        through the MCP server, whose writer is floored at `v` anyway, and
+        nothing else here writes his words.
+        """
+        author = (_author_of(route, text) if route.intent in _RULE_WRITES
+                  else provenance.V)
+        # Set for the non-rule intents too, as `v`: a caller's own context
+        # (a CLI command labelled as Parsa's words) must not leak into a turn
+        # that composes text.
+        with provenance.authored_by(author):
+            return self._route(route, text, now, extra, voice)
+
+    def _offer_approvals(self, resp: Response, since: str) -> None:
+        """Put an Approve button under a reply that wrote V's text, and the
+        exact draft plus a Send button under one that drafted an email.
+
+        Read from the stores, not from the turn: the MCP server is another
+        process, and the stores are what it and this process share. The
+        draft shown is rendered from the ledger — the fields that were
+        hashed — never from the model's reply, so pressing Send approves the
+        text on the screen and nothing else.
+        """
+        try:
+            written = [(i, rel) for i, rel in
+                       self.vault.provenance.written_since(since)
+                       if not rel.startswith(journal_mod.HOME + "/")]
+        except Exception:
+            written = []
+        if written:
+            rels = sorted({rel for _, rel in written})
+            names = ", ".join(f"[[{r[:-3] if r.endswith('.md') else r}]]"
+                              for r in rels[:4])
+            more = f" and {len(rels) - 4} more" if len(rels) > 4 else ""
+            resp.text += (f"\n\n_I wrote to {names}{more}. It stays marked "
+                          f"as mine, not yours, until you approve it._")
+            resp.buttons.append(Button(
+                "✓ Approve what I wrote", "approve_blocks",
+                {"ids": [i for i, _ in written]}))
+            resp.data["unapproved_blocks"] = len(written)
+        try:
+            drafts = mailguard.Ledger(self.s).drafted_since(since)
+        except Exception:
+            drafts = []
+        for d in drafts[:3]:
+            resp.text += "\n\n" + d.render()
+            resp.buttons.append(Button(f"✉ Send to {d.to}"[:60], "send_mail",
+                                       {"draft_id": d.draft_id,
+                                        "hash": d.hash}))
+
+    def _route(self, route: router.Route, text: str, now: dt.datetime,
+               extra: dict, voice: bool = False) -> Response:
         if route.intent == router.SUMMON:
             return self._summon(route)
         if route.intent == router.SMALLTALK:
@@ -1345,7 +1434,8 @@ class Engine:
         top = self.q.tasks.priorities(today=today, limit=5)
         if top:
             parts.append("**Today's shortlist**")
-            parts += [f"· {t.render(today=today)}" for t in top]
+            parts += [f"· {t.render(today=today)}{self._v_mark(t)}"
+                      for t in top]
             parts.append("")
 
         pending = [r for r in self.reminders.pending()
@@ -1387,6 +1477,16 @@ class Engine:
                               "tasks": len(top), "reminders": len(pending),
                               "urgent": len(urgent)},
                         route="brief")
+
+    def _v_mark(self, task) -> str:
+        """A task V wrote and Parsa never approved is a suggestion, and the
+        brief is where it would most easily pass for a commitment."""
+        try:
+            lab = self.vault.provenance.line_label(task.rel, task.raw)
+        except Exception:
+            return ""
+        return " _(my suggestion, not approved)_" \
+            if lab == provenance.UNAPPROVED else ""
 
     def nudge_digest(self) -> Response:
         items = self.nudges.all()
@@ -1558,12 +1658,47 @@ class Engine:
         if action == "append_daily":
             day = dt.date.fromisoformat(payload["date"])
             rel = self.capture.ensure_daily(day)
+            # V's draft, so V's text — but he pressed Append under that exact
+            # text, which is an approval of it, recorded as one.
             change = self.vault.append(rel, payload["text"],
                                        heading=self.s.daily_log_heading,
-                                       summary=f"evening draft for {day}")
+                                       summary=f"evening draft for {day}",
+                                       source=provenance.V)
+            try:
+                self.vault.provenance.approve_ids(
+                    change.blocks, by="parsa", via=f"{self.surface}:append")
+            except provenance.Refused:
+                pass
             return Response(f"Appended to [[{rel[:-3]}]].",
                             buttons=[Button("↩ Undo", "undo",
                                             {"commit": change.commit})])
+        # ---- Parsa's approvals. Reached only from a button press — the
+        # transports call `act`, a model turn never does — and refused by the
+        # stores themselves inside any process a model shell started.
+        if action == "approve_blocks":
+            try:
+                n = self.vault.provenance.approve_ids(
+                    list(payload.get("ids") or []), by="parsa",
+                    via=self.surface)
+            except provenance.Refused as exc:
+                return Response(str(exc), route="approve:refused")
+            return Response(
+                (f"Approved. {n} block{'s' if n != 1 else ''} of mine now "
+                 f"count as yours." if n else
+                 "Nothing left to approve there — it was already approved, or "
+                 "the text has changed since."), route="approve:blocks")
+        if action == "approve_note":
+            rel = str(payload.get("rel") or "")
+            try:
+                n = self.vault.provenance.approve_note(rel, by="parsa",
+                                                       via=self.surface)
+            except provenance.Refused as exc:
+                return Response(str(exc), route="approve:refused")
+            return Response(f"Approved {n} block{'s' if n != 1 else ''} in "
+                            f"[[{rel[:-3]}]].", route="approve:note")
+        if action == "send_mail":
+            return self._send_mail(str(payload.get("draft_id") or ""),
+                                   str(payload.get("hash") or ""))
         if action == "complete_task":
             # Emitted by `_task_done`'s disambiguation buttons since they were
             # written, and by the priorities widget on the home screen — and
@@ -1578,14 +1713,41 @@ class Engine:
             if not task.is_open:
                 return Response(f"“{task.text}” is already ticked.",
                                 route="structured:task-done")
-            return self._complete(task, now)
+            # He pressed the box himself: his tick.
+            with provenance.authored_by(provenance.PARSA):
+                return self._complete(task, now)
         if action == "route":
+            # His own words, filed where he chose.
             forced = router.Route(payload["intent"], 1.0, "chosen")
-            return self._capture(forced, payload.get("text", ""), now, {},
-                                 confirmed=True)
+            with provenance.authored_by(provenance.PARSA):
+                return self._capture(forced, payload.get("text", ""), now, {},
+                                     confirmed=True)
         if action == "discard":
             return Response("Dropped it.")
         return Response(f"Unknown action: {action}")
+
+    def _send_mail(self, draft_id: str, digest: str) -> Response:
+        """The Send button: approve the draft as it was shown, then send it.
+
+        The approval binds to the hash in the button — the draft as it stood
+        when the reply was rendered. `Gmail.send` refetches and re-hashes, so
+        if the draft was edited in Gmail between showing and pressing, this
+        approval does not match and nothing is sent.
+        """
+        from . import gmail as gmail_mod
+        try:
+            mailguard.Ledger(self.s).approve(draft_id, digest, by="parsa",
+                                             via=self.surface)
+        except (mailguard.Refusal, provenance.Refused) as exc:
+            return Response(f"Not sent: {exc}", route="mail:refused")
+        try:
+            gmail_mod.Gmail(self.s).send(draft_id)
+        except gmail_mod.NotApproved as exc:
+            return Response(f"Not sent: {exc}", route="mail:refused")
+        except Exception as exc:
+            return Response(f"Not sent — Gmail said: {exc}",
+                            route="mail:error")
+        return Response("Sent.", route="mail:sent")
 
     # ---- housekeeping -------------------------------------------------
     def reindex(self, *, embed: bool = False, full: bool = False) -> Response:
@@ -1659,11 +1821,18 @@ def _evidence_block(res, s: Settings) -> str:
         return ""
     lines = ["Local search already ran for this question. Top matches in the "
              "vault:"]
+    prov = provenance.store(s)
     for h in hits[:5]:
         where = h.rel[:-3] if h.rel.endswith(".md") else h.rel
         if getattr(h, "heading", ""):
             where += f" › {h.heading}"
-        lines.append(f"- [[{where}]] — {h.preview(180)}")
+        # V's text fenced here too: this is the passage most likely to be
+        # quoted back as what Parsa decided.
+        try:
+            preview = prov.mark_fragment(h.rel, h.preview(180))
+        except Exception:
+            preview = h.preview(180)
+        lines.append(f"- [[{where}]] — {preview}")
     lines.append(
         "Read the ones that look relevant before answering, and search further "
         "if none fit. Do not say the vault has no record of something without "

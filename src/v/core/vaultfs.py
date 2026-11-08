@@ -1,11 +1,14 @@
 """Every write to the vault goes through here. Nothing else touches the disk.
 
-Three rules, from the design doc:
+Four rules, from the design doc:
   1. Append-only to existing notes. Structural rewrites need `allow_rewrite=True`,
      which the engine only sets after an explicit confirmation.
   2. Every change is a git commit prefixed `[bot]`, so `git log --grep='\\[bot\\]'`
      is a complete record of what the assistant did.
   3. Every change is undoable for as long as the git history exists.
+  4. Every change says who wrote it — `parsa` or `v` (see `provenance.py`) —
+     and is labelled before the file is touched, so a write whose label cannot
+     be recorded does not happen. A write that does not say is `v`.
 """
 
 from __future__ import annotations
@@ -14,10 +17,10 @@ import datetime as dt
 import re
 import json
 import subprocess
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
-from . import notes
+from . import notes, provenance
 from .config import Settings, settings as default_settings
 
 
@@ -35,16 +38,62 @@ class Change:
     summary: str
     at: str
     bytes_added: int = 0
+    source: str = ""                 # parsa | v — who wrote the text
+    blocks: list = field(default_factory=list)   # provenance block ids
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 class Vault:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, *,
+                 source: str | None = None):
+        """`source` is the default label for this writer's writes. Built with
+        `source="v"`, it is a floor rather than a default: every write is `v`
+        whatever the caller passes. The MCP server's writer is built that way,
+        because every write through it is a model's, and a tool must not be
+        able to claim otherwise."""
         self.s = settings or default_settings
         self.root = self.s.vault
         self._history: list[Change] = []
+        self._source = source
+
+    @property
+    def provenance(self) -> "provenance.Store":
+        return provenance.store(self.s)
+
+    def _label(self, source: str | None) -> str:
+        return provenance.resolve(source, floor=self._source)
+
+    def _write(self, rel: str, p: Path, content: str, *, kind: str,
+               summary: str, source: str | None,
+               nbytes: int | None = None) -> Change:
+        """Label, write, commit, log — in that order.
+
+        The label is recorded before the disk is touched. If the store cannot
+        be written, nothing is: V's text reaching a note unlabelled would read
+        as Parsa's, and that is the one outcome this whole layer exists to
+        prevent.
+        """
+        src = self._label(source)
+        before = ""
+        if p.exists():
+            before = p.read_text(encoding="utf-8", errors="replace")
+        try:
+            ids = self.provenance.stage(rel, before, content, src)
+        except Exception as exc:          # sqlite3.Error, OSError
+            raise VaultError(
+                f"could not record who wrote this, so nothing was written: "
+                f"{exc}") from exc
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        commit = self._commit(rel, summary)
+        self.provenance.stamp(ids, commit)
+        return self._record(Change(
+            kind, rel, commit, summary,
+            dt.datetime.now().isoformat(timespec="seconds"),
+            len(content.encode()) if nbytes is None else nbytes,
+            source=src, blocks=ids))
 
     # ---- reading ----------------------------------------------------
     def path(self, rel: str) -> Path:
@@ -204,51 +253,45 @@ class Vault:
 
     # ---- writing ----------------------------------------------------
     def append(self, rel: str, text: str, *, heading: str | None = None,
-               summary: str | None = None) -> Change:
+               summary: str | None = None, source: str | None = None) -> Change:
         """Append to a note, creating it if absent. The safe default everywhere."""
         self._preserve(rel)
         p = self.path(rel)
-        p.parent.mkdir(parents=True, exist_ok=True)
         text = text.rstrip("\n")
 
         if not p.exists():
             content = (f"## {heading}\n\n{text}\n" if heading else f"{text}\n")
-            p.write_text(content, encoding="utf-8")
             kind = "create"
         else:
-            existing = p.read_text(encoding="utf-8")
+            content = p.read_text(encoding="utf-8")
             if heading:
                 note = notes.parse(p, self.root)
                 if note.section(heading) is not None:
-                    existing = append_under_heading(existing, heading, text)
+                    content = append_under_heading(content, heading, text)
                 else:
-                    existing = existing.rstrip("\n") + f"\n\n## {heading}\n\n{text}\n"
+                    content = content.rstrip("\n") + f"\n\n## {heading}\n\n{text}\n"
             else:
-                existing = existing.rstrip("\n") + f"\n{text}\n"
-            p.write_text(existing, encoding="utf-8")
+                content = content.rstrip("\n") + f"\n{text}\n"
             kind = "append"
 
         summary = summary or f"{kind} {rel}"
-        return self._record(Change(kind, rel, self._commit(rel, summary), summary,
-                                   dt.datetime.now().isoformat(timespec="seconds"),
-                                   len(text.encode())))
+        return self._write(rel, p, content, kind=kind, summary=summary,
+                           source=source, nbytes=len(text.encode()))
 
     def create(self, rel: str, meta: dict, body: str, *, overwrite: bool = False,
-               summary: str | None = None) -> Change:
+               summary: str | None = None, source: str | None = None) -> Change:
         p = self.path(rel)
         if p.exists() and not overwrite:
             raise VaultError(f"refusing to overwrite existing note: {rel}")
         self._preserve(rel)
-        p.parent.mkdir(parents=True, exist_ok=True)
         note = notes.Note(rel=rel, path=p, meta=meta, body=body)
-        p.write_text(note.render(), encoding="utf-8")
         summary = summary or f"create {rel}"
-        return self._record(Change("create", rel, self._commit(rel, summary), summary,
-                                   dt.datetime.now().isoformat(timespec="seconds"),
-                                   p.stat().st_size))
+        return self._write(rel, p, note.render(), kind="create",
+                           summary=summary, source=source)
 
     def save_binary(self, rel: str, data: bytes, *,
-                    summary: str | None = None) -> Change:
+                    summary: str | None = None,
+                    source: str | None = None) -> Change:
         """Write raw bytes — a downloaded Telegram file, an image — under the
         same rules as `create`: refuses to clobber, commits `[bot]`, revertible.
 
@@ -260,25 +303,34 @@ class Vault:
         if p.exists():
             raise VaultError(f"refusing to overwrite existing file: {rel}")
         self._preserve(rel)
+        src = self._label(source)
+        try:
+            ids = self.provenance.stage_binary(rel, data, src)
+        except Exception as exc:
+            raise VaultError(
+                f"could not record who wrote this, so nothing was written: "
+                f"{exc}") from exc
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
         summary = summary or f"save {rel}"
-        return self._record(Change("create", rel, self._commit(rel, summary), summary,
+        commit = self._commit(rel, summary)
+        self.provenance.stamp(ids, commit)
+        return self._record(Change("create", rel, commit, summary,
                                    dt.datetime.now().isoformat(timespec="seconds"),
-                                   len(data)))
+                                   len(data), source=src, blocks=ids))
 
-    def set_meta(self, rel: str, updates: dict, *, summary: str | None = None) -> Change:
+    def set_meta(self, rel: str, updates: dict, *, summary: str | None = None,
+                 source: str | None = None) -> Change:
         """Update frontmatter only. Body untouched — the one safe structural edit."""
         self._preserve(rel)
         note = self.read(rel)
         note.meta.update(updates)
-        self.path(rel).write_text(note.render(), encoding="utf-8")
         summary = summary or f"update frontmatter of {rel} ({', '.join(updates)})"
-        return self._record(Change("rewrite", rel, self._commit(rel, summary), summary,
-                                   dt.datetime.now().isoformat(timespec="seconds")))
+        return self._write(rel, self.path(rel), note.render(), kind="rewrite",
+                           summary=summary, source=source, nbytes=0)
 
     def edit(self, rel: str, old: str, new: str, *,
-             summary: str | None = None) -> Change:
+             summary: str | None = None, source: str | None = None) -> Change:
         """Replace one exact, unique run of text inside an existing note.
 
         The safe shape of "edit", and deliberately not `rewrite`. A model
@@ -318,14 +370,13 @@ class Vault:
             raise VaultError(
                 f"that text appears {hits} times in {rel}; include enough "
                 "surrounding lines to make it unique.")
-        p.write_text(text.replace(old, new, 1), encoding="utf-8")
         summary = summary or f"edit {rel}"
-        return self._record(Change("edit", rel, self._commit(rel, summary),
-                                   summary,
-                                   dt.datetime.now().isoformat(timespec="seconds")))
+        return self._write(rel, p, text.replace(old, new, 1), kind="edit",
+                           summary=summary, source=source, nbytes=0)
 
     def rewrite(self, rel: str, content: str, *, allow_rewrite: bool = False,
-                summary: str | None = None) -> Change:
+                summary: str | None = None,
+                source: str | None = None) -> Change:
         if not allow_rewrite:
             raise VaultError(
                 "rewrite requires explicit confirmation (allow_rewrite=True); "
@@ -333,11 +384,9 @@ class Vault:
             )
         self._preserve(rel)
         p = self.path(rel)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
         summary = summary or f"rewrite {rel}"
-        return self._record(Change("rewrite", rel, self._commit(rel, summary), summary,
-                                   dt.datetime.now().isoformat(timespec="seconds")))
+        return self._write(rel, p, content, kind="rewrite", summary=summary,
+                           source=source, nbytes=0)
 
     # ---- undo -------------------------------------------------------
     def undo(self, commit: str | None = None) -> str:

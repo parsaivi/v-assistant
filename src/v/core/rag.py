@@ -52,6 +52,9 @@ class Retrieval:
     ms: float = 0.0
     cost: float = 0.0
     stale: bool = False   # embeddings no longer line up with the chunk table
+    # Set by `Rag.search`, so `as_context` can find the provenance store
+    # without every caller passing settings through.
+    settings: object = field(default=None, repr=False, compare=False)
 
     def notes(self) -> list[str]:
         seen, out = set(), []
@@ -71,11 +74,23 @@ class Retrieval:
         return out
 
     def as_context(self, max_chars: int = 6000) -> str:
-        """Chunks formatted for a model prompt — used only if a paid tier is added."""
+        """Chunks formatted for a model prompt — used only if a paid tier is added.
+
+        V's unapproved text is fenced, like everywhere else note text reaches
+        a model (`provenance.py`); Parsa's is passed through untouched.
+        """
+        from . import provenance
+        prov = provenance.store(self.settings) if self.settings else None
         parts, total = [], 0
         for h in self.hits:
+            text = h.text.strip()
+            if prov is not None:
+                try:
+                    text = prov.mark_fragment(h.rel, text)
+                except Exception:
+                    pass
             block = f"### {h.rel}" + (f" › {h.heading}" if h.heading else "") + \
-                    f"\n{h.text.strip()}\n"
+                    f"\n{text}\n"
             if total + len(block) > max_chars:
                 break
             parts.append(block)
@@ -211,7 +226,7 @@ class Rag:
                folder: str | None = None) -> Retrieval:
         t0 = time.time()
         k = k or self.s.rag_top_k
-        out = Retrieval(query=query)
+        out = Retrieval(query=query, settings=self.s)
 
         if not self.load():
             out.backend = "unavailable"

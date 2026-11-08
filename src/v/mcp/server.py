@@ -46,8 +46,8 @@ from ..core import memory as memory_mod
 from ..core import persona as persona_mod
 from ..core import traits as traits_mod
 from ..core import (bazaar, contacts, index, jalali, notes,
-                    nudges as nudges_mod, query, rag, rates as rates_mod,
-                    reminders, render, schema, work)
+                    nudges as nudges_mod, provenance, query, rag,
+                    rates as rates_mod, reminders, render, schema, work)
 from ..core.config import settings as S
 from ..core.vaultfs import Vault, VaultError
 from .guard import Blocked, Privacy
@@ -59,7 +59,9 @@ from .guard import Blocked, Privacy
 # are cheap, the vault index is read-mostly, and this keeps concurrent tool
 # calls genuinely concurrent instead of serialising them behind a mutex.
 _local = threading.local()
-_vault = Vault(S)          # no sqlite; safe to share
+# Built with a floor of `v`: every write through this server is a model's,
+# whatever the tool, so no tool can label its text as Parsa's.
+_vault = Vault(S, source="v")          # no sqlite; safe to share
 _work = work.Work(S, _vault)
 _privacy = Privacy(S)
 
@@ -142,7 +144,12 @@ mcp = FastMCP(
         "You cannot write to the vault directly. `vault_append`, "
         "`vault_create`, `vault_add_task`, `vault_task_done` and "
         "`vault_schedule` are the only write paths; all commit to git and are "
-        "undoable via `vault_undo`."
+        "undoable via `vault_undo`.\n\n"
+        "Everything you write is labelled as yours, and stays unapproved until "
+        "Parsa approves it. Note text you read comes back with V's text "
+        "fenced in `[written by V, not approved]` … `[/written by V]`; "
+        "Parsa's own text is never fenced. Read notes with `vault_read`, not "
+        "Read, so you can see the fences."
     ),
 )
 
@@ -158,6 +165,20 @@ def _rows_out(result: query.Result, limit: int) -> str:
         out += "\n\nNotes: " + " ".join(result.citations()[:10])
     out += _privacy.redacted(before, len(result.rows))
     return out
+
+
+def _prov() -> provenance.Store:
+    return provenance.store(S)
+
+
+def _v_task(t) -> str:
+    """A suffix for a task V wrote and Parsa has not approved. A checkbox is
+    a commitment only when he made it."""
+    try:
+        lab = _prov().line_label(t.rel, t.raw)
+    except Exception:
+        return ""
+    return " _(written by V, not approved)_" if lab == provenance.UNAPPROVED else ""
 
 
 def _err(msg: str) -> str:
@@ -268,7 +289,8 @@ def vault_search(query_text: str, k: int = 8) -> str:
     lines = [f"{len(hits)} matches ({res.backend}, {res.ms:.0f}ms):", ""]
     for h in hits:
         where = h.rel[:-3] + (f" › {h.heading}" if h.heading else "")
-        lines.append(f"• **{where}**  _{h.score:.2f}_\n  {h.preview(300)}")
+        lines.append(f"• **{where}**  _{h.score:.2f}_\n  "
+                     f"{_prov().mark_fragment(h.rel, h.preview(300))}")
     return "\n".join(lines) + _privacy.redacted(len(res.hits), len(hits))
 
 
@@ -286,10 +308,18 @@ def vault_read(rel: str) -> str:
         return _err(str(exc))
     try:
         note = _vault.read(rel)
-    except VaultError as exc:
+        raw = _vault.path(rel).read_text(encoding="utf-8", errors="replace")
+    except (VaultError, OSError) as exc:
         return _err(str(exc))
     meta = json.dumps(note.meta, ensure_ascii=False, indent=2) if note.meta else "{}"
-    return f"# {rel}\n\n## frontmatter\n```json\n{meta}\n```\n\n## body\n{note.body}"
+    # V's text fenced, Parsa's untouched — see `provenance.py` and the rule
+    # in `identity._OPERATING` that says what the fences mean.
+    meta_label, body = _prov().mark_note(rel, raw, note.body)
+    head = ""
+    if meta_label:
+        head = f"\n{provenance.OPEN[meta_label]} (some of these fields)"
+    return (f"# {rel}\n\n## frontmatter{head}\n```json\n{meta}\n```\n\n"
+            f"## body\n{body}")
 
 
 @mcp.tool(
@@ -403,7 +433,7 @@ def vault_tasks(view: str = "priorities", text: str | None = None,
             return f"No task matches {text!r}."
         return "\n".join(
             f"- [{t.id}] {t.render(today=when)} — {t.link()} (match {sc:.2f})"
-            for t, sc in hits)
+            f"{_v_task(t)}" for t, sc in hits)
     kinds = {"priorities": lambda: e.q.priorities(when, limit=limit, area=area),
              "open": lambda: e.q.open_tasks(area=area, limit=limit),
              "overdue": lambda: e.q.overdue_tasks(when, limit=limit)}
@@ -416,7 +446,8 @@ def vault_tasks(view: str = "priorities", text: str | None = None,
     lines = [r.answer, ""]
     for row in r.rows:
         t = row.extra["_task"]
-        lines.append(f"- [{t.id}] {t.render(today=when)} — {t.link()}")
+        lines.append(f"- [{t.id}] {t.render(today=when)} — {t.link()}"
+                     f"{_v_task(t)}")
     return "\n".join(lines)
 
 
@@ -1152,11 +1183,11 @@ def gmail_read(message_id: str) -> str:
     description=(
         "Draft a Gmail reply or new message — creates a DRAFT only, sends "
         "nothing. Pass `thread_id` (from gmail_search/gmail_read) to reply "
-        "in-thread, or omit it for a new message. Returns the draft id and "
-        "the exact text: show Parsa that text and wait for him to confirm "
-        "before ever calling gmail_send with this id. Never call gmail_send "
-        "in the same turn as this — a sent email cannot be recalled, unlike "
-        "every write in this vault."
+        "in-thread, or omit it for a new message. V shows Parsa the exact "
+        "draft under your reply, with a Send button; pressing it is his "
+        "approval, and it sends. You do not need to repeat the draft text. "
+        "gmail_send refuses in code unless Parsa approved this exact draft, "
+        "so never call it in the same turn as this."
     )
 )
 def gmail_draft(to: str, subject: str, body: str, thread_id: str | None = None) -> str:
@@ -1166,18 +1197,19 @@ def gmail_draft(to: str, subject: str, body: str, thread_id: str | None = None) 
         return _gmail_err(exc)
     return (f"Draft `{draft_id}` created, NOT sent:\n\n"
             f"To: {to}\nSubject: {subject}\n\n{body}\n\n"
-            f"Show this to Parsa. Only call gmail_send('{draft_id}') after "
-            f"he confirms — do not send it in this same turn.")
+            f"Parsa will see this exact draft under your reply with a Send "
+            f"button. Sending needs his approval of this text; "
+            f"gmail_send('{draft_id}') is refused until he gives it.")
 
 
 @mcp.tool(
     description=(
         "Send a Gmail draft by id. WRITES — actually leaves the account, "
-        "irreversibly, unlike vault writes. Only call this after Parsa has "
-        "seen the exact draft text (from gmail_draft's return value) and "
-        "confirmed it in his own message — never in the same turn that "
-        "created the draft, and never for a draft id you invented or recall "
-        "from an earlier conversation without re-showing it first."
+        "irreversibly, unlike vault writes. Refused in code unless Parsa "
+        "approved this exact draft — the Send button under the reply that "
+        "showed it, or `v mail approve <id>` — and the draft has not been "
+        "edited since: the text is hashed and compared. Each approval sends "
+        "once. If it is refused, tell Parsa why; do not try to work around it."
     )
 )
 def gmail_send(draft_id: str) -> str:

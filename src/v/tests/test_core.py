@@ -1062,17 +1062,30 @@ def gmail_search_and_read_parse_headers_and_body():
 
 @test
 def gmail_draft_never_sends_and_send_needs_a_draft_id():
+    """Draft never sends; send takes an id, and since 2026-11-08 it also
+    needs Parsa's approval of that draft's hash (`core/mailguard.py`, and
+    `test_provenance` for the refusal cases)."""
+    import base64
     import unittest.mock as mock
+    from v.core import mailguard
     root, s = make_vault()
     try:
         g = _gmail_ready(s)
         calls = []
+        stored = {
+            "id": "d1", "message": {"threadId": "t1", "payload": {
+                "mimeType": "text/plain",
+                "body": {"data": base64.urlsafe_b64encode(b"body text").decode()},
+                "headers": [{"name": "To", "value": "a@x.com"},
+                            {"name": "Subject", "value": "subj"}]}}}
 
         def fake_urlopen(req, timeout=None):
             url = req.get_full_url()
             calls.append(url)
             if url.endswith("/drafts"):
                 return _FakeHTTPResponse(json.dumps({"id": "d1"}).encode())
+            if "/drafts/d1" in url:
+                return _FakeHTTPResponse(json.dumps(stored).encode())
             if url.endswith("/drafts/send"):
                 return _FakeHTTPResponse(json.dumps({"id": "sent1"}).encode())
             raise AssertionError(f"unexpected call: {url}")
@@ -1082,7 +1095,15 @@ def gmail_draft_never_sends_and_send_needs_a_draft_id():
             eq(draft_id, "d1")
             ok(not any(c.endswith("/drafts/send") for c in calls),
                "draft() must never reach the send endpoint on its own")
+            try:
+                g.send("d1")
+                raise AssertionError("sent without Parsa's approval")
+            except gmail.NotApproved:
+                pass
+            ok(not any(c.endswith("/drafts/send") for c in calls))
 
+            d = mailguard.Ledger(s).drafted_since("")[0]
+            mailguard.Ledger(s).approve("d1", d.hash, by="parsa", via="test")
             sent_id = g.send("d1")
             eq(sent_id, "sent1")
     finally:

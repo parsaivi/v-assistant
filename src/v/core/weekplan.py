@@ -62,7 +62,7 @@ import dataclasses
 import re
 from dataclasses import dataclass
 
-from . import notes
+from . import notes, provenance
 from .calendar import replace_section
 from .config import Settings, settings as default_settings
 
@@ -557,8 +557,11 @@ class WeekPlan:
         if not _has_heading(body, HEADING):
             body = body.rstrip("\n") + f"\n\n## {HEADING}\n\n"
         updated = replace_section(body, HEADING, self.render_section(sat))
+        # The template is Parsa's; the stamped blocks are copies of the seed,
+        # so they carry the seed's label.
         self.vault.create(rel, meta, updated or body,
-                          summary=f"scaffold weekly note {label}")
+                          summary=f"scaffold weekly note {label}",
+                          source=self.vault.provenance.derived([SEED_REL]))
         return rel
 
     def add(self, block: Block, *, dedupe: bool = True) -> str:
@@ -889,7 +892,9 @@ class WeekPlan:
         if updated is None or updated == content:
             return None
         self.vault.rewrite(rel, updated, allow_rewrite=True,
-                           summary=f"sync schedule into {day.isoformat()}")
+                           summary=f"sync schedule into {day.isoformat()}",
+                           source=self.vault.provenance.derived(
+                               [self.week_rel(day)], day.isoformat()))
         return body
 
 
@@ -1270,7 +1275,8 @@ def install(settings: Settings | None = None, vault=None) -> list[str]:
 
     if not v.exists(SEED_REL):
         v.create(SEED_REL, dict(SEED_META), _seed_body(),
-                 summary="add the week-schedule seed template")
+                 summary="add the week-schedule seed template",
+                 source=provenance.PARSA)
         done.append(f"created {SEED_REL}")
 
     weekly = "05 - Templates/Weekly Note.md"
@@ -1283,7 +1289,8 @@ def install(settings: Settings | None = None, vault=None) -> list[str]:
             updated = (raw.replace(anchor, WEEKLY_SECTION + anchor, 1)
                        if anchor in raw else raw.rstrip("\n") + "\n\n" + WEEKLY_SECTION)
             v.rewrite(weekly, updated, allow_rewrite=True,
-                      summary="add the Schedule section to the weekly template")
+                      summary="add the Schedule section to the weekly template",
+                      source=provenance.PARSA)
             done.append(f"patched {weekly}")
 
     daily = "05 - Templates/Daily Note.md"
@@ -1296,7 +1303,8 @@ def install(settings: Settings | None = None, vault=None) -> list[str]:
             updated = (raw.replace(anchor, DAILY_SECTION + anchor, 1)
                        if anchor in raw else raw.rstrip("\n") + "\n\n" + DAILY_SECTION)
             v.rewrite(daily, updated, allow_rewrite=True,
-                      summary="add the Schedule section to the daily template")
+                      summary="add the Schedule section to the daily template",
+                      source=provenance.PARSA)
             done.append(f"patched {daily}")
 
     # The dashboard is generated, like `19 - Assistant/V/` — it is queries, not
@@ -1306,14 +1314,16 @@ def install(settings: Settings | None = None, vault=None) -> list[str]:
     body = DASHBOARD.split("---\n", 2)[2]
     meta = {"type": "dashboard", "tags": ["schedule"]}
     if not v.exists(dash):
-        v.create(dash, meta, body, summary="add the schedule dashboard")
+        v.create(dash, meta, body, summary="add the schedule dashboard",
+                 source=provenance.PARSA)
         done.append(f"created {dash}")
     else:
         want = notes.Note(rel=dash, path=v.path(dash), meta=meta,
                           body=body).render()
         if (s.vault / dash).read_text(encoding="utf-8") != want:
             v.rewrite(dash, want, allow_rewrite=True,
-                      summary="refresh the schedule dashboard")
+                      summary="refresh the schedule dashboard",
+                      source=provenance.PARSA)
             done.append(f"refreshed {dash}")
 
     return done

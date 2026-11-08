@@ -69,14 +69,16 @@ notes, and that is all.
 | `identity.py` | who V is, its goals, its capability manifest | — |
 | `config.py` | paths, folders, thresholds, tiers, privacy | — |
 | `notes.py` | frontmatter parse/render, wikilinks, sections | $0 |
-| `vaultfs.py` | **the only writer.** append-only, git-committed, undoable | $0 |
+| `vaultfs.py` | **the only writer.** append-only, git-committed, undoable, labelled | $0 |
+| `provenance.py` | **who wrote each block** — Parsa or a model — and whether he approved V's | $0 |
 | `index.py` | SQLite mirror of the vault + FTS5 + chunking + staleness | $0 |
 | `schema.py` | CLAUDE.md frontmatter schemas + validator | $0 |
 | `query.py` | structured queries — the free half of retrieval | $0 |
 | `tasks.py` | **checkbox tasks** — parse, classify, rank, tick | $0 |
 | `calendar.py` | **the vault calendar**, and the only source of truth for it | $0 |
 | `gcal.py` | **live Google Calendar** — his and others', read and write | $0 |
-| `gmail.py` | **live Gmail** — search, read, draft; send only on confirmation | $0 |
+| `gmail.py` | **live Gmail** — search, read, draft; send only what Parsa approved | $0 |
+| `mailguard.py` | **the send check** — approval bound to the draft's sha256, used once | $0 |
 | `embed.py` | local embeddings: bge-m3, or a no-download tf-idf fallback | $0 |
 | `rag.py` | hybrid dense+keyword search, numpy, no vector DB | $0 |
 | `router.py` | rules-based intent routing + learning from corrections | $0 |
@@ -582,17 +584,42 @@ v gmail --reset
 
 Search, read and draft are conversational — ask V, it calls `gmail_search` /
 `gmail_read` / `gmail_draft`. **Sending is not**, and is the one place this
-vault treats a write as more dangerous than an appended note: `gmail_draft`
-only ever creates a Gmail draft, nothing leaves the account, and `gmail_send`
-takes a draft id and nothing else — there is no tool that composes and sends
-in one call, so the model cannot reach one even by accident. `identity.py`'s
-system prompt tells it never to call `gmail_send` in the same turn a draft
-was created — show the exact text, wait for Parsa to confirm in his own next
-message, then send. Every other write in this vault reverts (`vault_undo` is
-a `git revert`; even a bad calendar invite is at worst an awkward follow-up
-email); a sent email reaches a real person immediately and nothing here
-undoes that, so it is gated by convention at the prompt level rather than
-trusted to the same one-shot pattern as `gcal_add_event`.
+vault treats a write as more dangerous than an appended note. `gmail_draft`
+only ever creates a Gmail draft, reads it back, hashes it as Gmail holds it,
+and records it in `mailguard`'s append-only ledger. The reply that drafted it
+shows the draft — rendered by code from the ledger, not paraphrased by the
+model — with a **Send** button. Pressing it records Parsa's approval of that
+hash and sends. `gmail_send` refetches the draft and refuses unless there is
+an approval of exactly that hash, unused, under 24 hours old: an edit made in
+Gmail after the approval changes the hash and the send is refused. This used
+to be a sentence in the system prompt; it is now a check in the code that does
+the sending (the idea is Guarded Commits, arXiv:2610.00037).
+
+```bash
+v mail pending              # drafts V made that have not been sent
+v mail approve <id> [--send]  # read one at your terminal and approve it
+```
+
+## Who wrote it
+
+Every write records who wrote it — `parsa` or `v` — in `state/provenance.db`
+(`core/provenance.py`; the idea is ClawMMU, arXiv:2610.28093). V's text is
+untrusted until Parsa approves it, and everywhere note text reaches the model
+it arrives fenced as `[written by V, not approved]`, so V's old suggestions
+are never mistaken for his plans. An approval binds to the block's hash: if V
+changes the text it is unapproved again, and if Parsa edits it himself it
+becomes his.
+
+```bash
+v unapproved [note]          # what V wrote that you haven't approved
+v approve <note>             # read it, then approve it (your terminal only)
+v provenance show <note>     # the note exactly as the model reads it
+v provenance backfill [--apply]   # label the vault from git blame
+```
+
+On Telegram, a reply that wrote to a note carries a **✓ Approve what I wrote**
+button. Nothing a model can call approves anything; `test_provenance` checks
+that from the source.
 
 ## Quera
 

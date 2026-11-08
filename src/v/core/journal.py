@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 
 from .config import Settings, settings as default_settings
+from . import provenance
 from .vaultfs import Vault
 
 HOME = "19 - Assistant/V"
@@ -189,7 +190,8 @@ class Journal:
                 if item.get("say"):
                     lines.append(f"    - e.g. *\"{item['say']}\"*")
             lines.append("")
-        self._replace(self.skills_path, "\n".join(lines), "V skills")
+        self._replace(self.skills_path, "\n".join(lines), "V skills",
+                      source=provenance.PARSA)
 
     def write_goals(self, goals: list[dict]) -> None:
         lines = [
@@ -209,7 +211,8 @@ class Journal:
             if g.get("measure"):
                 lines.append(f"**How I'd know I'm failing:** {g['measure']}")
                 lines.append("")
-        self._replace(self.goals_path, "\n".join(lines), "V goals")
+        self._replace(self.goals_path, "\n".join(lines), "V goals",
+                      source=provenance.PARSA)
 
     def write_memory(self, markdown: str) -> None:
         self._replace(self.memory_path, markdown, "V memory")
@@ -252,21 +255,28 @@ class Journal:
             "in a state file.",
             "",
         ]
-        self._replace(self.readme_path, "\n".join(lines), "V readme")
+        self._replace(self.readme_path, "\n".join(lines), "V readme",
+                      source=provenance.PARSA)
 
     # ---- housekeeping --------------------------------------------------
-    def _replace(self, rel: str, content: str, summary: str) -> None:
+    def _replace(self, rel: str, content: str, summary: str, *,
+                 source: str = provenance.V) -> None:
         """Regenerated pages are the one place a rewrite is correct — the file
-        is a projection of state V owns, not something Parsa wrote."""
+        is a projection of state V owns, not something Parsa wrote.
+
+        `source` defaults to `v`: the memory page is beliefs a model wrote.
+        Only the pages generated from code — skills, goals, the README — say
+        `parsa`, meaning no model wrote them.
+
+        This used to write a new page straight to disk and then `rewrite` it
+        with the same bytes, which left nothing for the rewrite to commit and,
+        now, nothing for it to label: the first version of every generated
+        page would have read as Parsa's. `rewrite` creates a missing file
+        itself, so the direct write was never needed.
+        """
         try:
-            if self.vault.exists(rel):
-                self.vault.rewrite(rel, content, allow_rewrite=True,
-                                   summary=summary)
-            else:
-                self.vault.path(rel).parent.mkdir(parents=True, exist_ok=True)
-                self.vault.path(rel).write_text(content, encoding="utf-8")
-                self.vault.rewrite(rel, content, allow_rewrite=True,
-                                   summary=summary)
+            self.vault.rewrite(rel, content, allow_rewrite=True,
+                               summary=summary, source=source)
         except Exception:
             pass
 

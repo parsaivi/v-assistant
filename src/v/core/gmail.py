@@ -12,14 +12,15 @@ grant than Calendar's, so it gets its own consent (`cli gmail auth`) and its
 own file (`gmail_token.json`), rather than folding onto a token someone might
 reasonably assume is calendar-only.
 
-**Read, search and draft cost nothing to call — send is gated.** `draft()`
-only ever creates a Gmail draft; nothing leaves the account until `send()` is
-called with that draft's id, and the system prompt in `identity.py` tells the
-model never to call `gmail_send` in the same turn it calls `gmail_draft` — show
-the draft, wait for Parsa's next message, send only on confirmation. Compare
-`vault_places_search`'s "never save without confirmation" rule and
-`gcal.add_event`'s much lower bar (a calendar slot is trivially undoable;
-a sent email is not).
+**Read, search and draft cost nothing to call — send is gated, in code.**
+`draft()` only ever creates a Gmail draft, hashes it as Gmail holds it, and
+records it in `mailguard`'s ledger. `send()` refetches the draft, hashes it
+again, and refuses unless Parsa approved that exact hash — by pressing Send
+under the reply that showed it, or with `v mail approve`. This used to be a
+sentence in the system prompt ("never send in the same turn you draft"); a
+prompt is a request, and a sent email is the one write here nothing undoes.
+See `mailguard.py`. Compare `gcal.add_event`'s much lower bar: a calendar slot
+is trivially undoable, a sent email is not.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from email.mime.text import MIMEText
 
+from . import mailguard
 from .config import Settings, settings as default_settings
 from .gcal import REDIRECT_PORT, REDIRECT_URI, AUTH_URL, TOKEN_URL
 
@@ -59,6 +61,10 @@ class NotConfigured(GmailError):
 
 class NotAuthorised(GmailError):
     """Client is set up but nobody has consented yet, or the grant is gone."""
+
+
+class NotApproved(GmailError):
+    """A send refused because Parsa has not approved this draft as it is now."""
 
 
 # --------------------------------------------------------------------------
@@ -128,6 +134,19 @@ def _walk_parts(payload: dict) -> tuple[str, str]:
         plain = plain or p
         html = html or h
     return plain, html
+
+
+def _decoded(value: str) -> str:
+    """A header as text. Gmail may hand back RFC 2047 encoded-words for a
+    non-ASCII subject; hashing those would make a Persian subject unequal to
+    itself."""
+    if "=?" not in value:
+        return value
+    try:
+        from email.header import decode_header, make_header
+        return str(make_header(decode_header(value)))
+    except (ValueError, LookupError):
+        return value
 
 
 def _strip_html(html: str) -> str:
@@ -435,11 +454,31 @@ class Gmail:
             date=_parse_date(_header(headers, "Date")),
             body=body, labels=m.get("labelIds") or [])
 
-    # ---- writing: draft, then send only on confirmation ------------------
+    # ---- writing: draft, then send only what Parsa approved --------------
+    def fetch_draft(self, draft_id: str) -> mailguard.Draft:
+        """The draft as Gmail holds it now, with its hash. The one thing both
+        sides of the check read, so they cannot disagree about the format."""
+        d = self._api("GET", f"/drafts/{draft_id}", params={"format": "full"})
+        m = d.get("message") or {}
+        payload = m.get("payload") or {}
+        headers = payload.get("headers", [])
+        plain, html = _walk_parts(payload)
+        to = _decoded(_header(headers, "To"))
+        subject = _decoded(_header(headers, "Subject"))
+        body = plain or _strip_html(html) or ""
+        thread = m.get("threadId", "") or ""
+        return mailguard.Draft(
+            d.get("id", draft_id), mailguard.draft_hash(to, subject, body, thread),
+            to, subject, body, thread)
+
     def draft(self, to: str, subject: str, body: str, *,
               thread_id: str | None = None) -> str:
-        """Creates a Gmail draft and returns its id. Nothing is sent — see
-        the module docstring for why `send()` is a separate, gated call."""
+        """Creates a Gmail draft and returns its id. Nothing is sent.
+
+        The draft is read back and hashed as Gmail stored it — Gmail assigns a
+        thread and may refold a header — then recorded in the ledger, which is
+        where the Send button gets the text it shows and the hash it approves.
+        """
         msg = MIMEText(body)
         msg["To"] = to
         msg["Subject"] = subject
@@ -448,11 +487,27 @@ class Gmail:
         if thread_id:
             message["threadId"] = thread_id
         created = self._api("POST", "/drafts", body={"message": message})
-        return created["id"]
+        draft_id = created["id"]
+        mailguard.Ledger(self.s).drafted(self.fetch_draft(draft_id))
+        return draft_id
 
     def send(self, draft_id: str) -> str:
-        """Sends a previously-created draft. Takes a draft id, never raw
-        `to`/`subject`/`body` — compose-and-send in one call does not exist
-        here, so the model cannot reach it even by accident."""
+        """Sends a draft — only if Parsa approved it exactly as it is now.
+
+        Takes a draft id, never raw `to`/`subject`/`body`, so compose-and-send
+        in one call does not exist. Refetches the draft and recomputes its
+        hash rather than trusting the one recorded at draft time: an edit made
+        in Gmail since the approval changes the hash, and the approval no
+        longer covers it. Raises `NotApproved` with a sentence the model can
+        relay; nothing leaves the account in that case.
+        """
+        current = self.fetch_draft(draft_id)
+        ledger = mailguard.Ledger(self.s)
+        try:
+            approval = ledger.consume(draft_id, current.hash)
+        except mailguard.Refusal as exc:
+            raise NotApproved(str(exc)) from exc
         sent = self._api("POST", "/drafts/send", body={"id": draft_id})
-        return sent.get("id", "")
+        message_id = sent.get("id", "")
+        ledger.sent(draft_id, message_id, approval["id"])
+        return message_id

@@ -20,6 +20,9 @@ from pathlib import Path
 
 from . import notes, query, schema, templates
 from .config import Settings, settings as default_settings
+# Notes built by rules from an API: no model wrote them, which is the
+# one thing the `parsa` label asserts (see provenance.py).
+from . import provenance
 from .vaultfs import Vault
 
 # GitLab's API vocabulary is not the vault's. This mapping is exactly the bug
@@ -180,14 +183,16 @@ class Work:
                     if drift:
                         if not dry_run:
                             self.vault.set_meta(rel, drift,
-                                                summary=f"sync {rel} from GitLab")
+                                                summary=f"sync {rel} from GitLab",
+                                            source=provenance.PARSA)
                         report["updated"].append({"rel": rel, "changes": drift})
                     else:
                         report["skipped"] += 1
                 else:
                     if not dry_run:
                         self.vault.create(rel, meta, body,
-                                          summary=f"create {rel} from GitLab")
+                                          summary=f"create {rel} from GitLab",
+                                      source=provenance.PARSA)
                     report["created"].append(rel)
         return report
 
@@ -212,7 +217,8 @@ class Work:
                         if not dry_run:
                             self.vault.set_meta(
                                 row.rel, {"status": mapped},
-                                summary=f"normalise status {raw} → {mapped}")
+                                summary=f"normalise status {raw} → {mapped}",
+                                source=provenance.PARSA)
         q.close()
         return {"fixed": fixed, "count": len(fixed), "dry_run": dry_run}
 

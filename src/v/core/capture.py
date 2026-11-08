@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import notes, router, schema, templates
+from . import notes, provenance, router, schema, templates
 from .config import Settings, settings as default_settings
 from .vaultfs import Vault, Change
 
@@ -151,7 +151,9 @@ class Capture:
                 "## Work Log\n\n### Issues / MRs Touched\n\n"
                 f"## Gym\n\n## {self.s.daily_log_heading}\n\n## End of Day\n"
             )
-        self.vault.create(rel, meta, body, summary=f"scaffold daily note {day}")
+        # Parsa's template, filled by rules: no model wrote a word of it.
+        self.vault.create(rel, meta, body, summary=f"scaffold daily note {day}",
+                          source=provenance.PARSA)
         return rel
 
     # ---- handlers ----------------------------------------------------

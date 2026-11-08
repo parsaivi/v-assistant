@@ -24,14 +24,38 @@
     "",
     "Scoped to the numbered vault folders rather than `**/*.md`, because the",
     "broad pattern also caught developer docs — files that are code, not",
-    "notes, and have no append-only guarantee to protect."
+    "notes, and have no append-only guarantee to protect.",
+    "",
+    "Added 2026-11-08, with source labels (`core/provenance.py`):",
+    "",
+    "Read on notes is denied so the model reads them through `vault_read`,",
+    "which fences V's unapproved text. A raw Read would hand it V's old",
+    "suggestions with nothing to tell them from Parsa's plans. Grep stays",
+    "open; it returns lines, and the system prompt says to `vault_read` a",
+    "note before relying on one.",
+    "",
+    "The approval commands and the files approvals live in are denied too.",
+    "Approval is Parsa's act, and the real fence is that nothing the model is",
+    "granted calls an approval writer. These rules, and the V_MODEL_SHELL",
+    "variable the approval writers refuse under, are a second fence for the",
+    "one tool nothing binds completely: Bash."
   ],
   "permissions": {
     "deny": [
       "Write(./[0-9][0-9] - */**/*.md)",
       "Edit(./[0-9][0-9] - */**/*.md)",
       "Write(./[0-9][0-9] - */*.md)",
-      "Edit(./[0-9][0-9] - */*.md)"
+      "Edit(./[0-9][0-9] - */*.md)",
+      "Read(./[0-9][0-9] - */**/*.md)",
+      "Read(./[0-9][0-9] - */*.md)",
+      "Bash(v approve:*)",
+      "Bash(v mail approve:*)",
+      "Bash(python3 -m v.cli approve:*)",
+      "Bash(python3 -m v.cli mail approve:*)",
+      "Write(~/.local/state/v/provenance.db*)",
+      "Edit(~/.local/state/v/provenance.db*)",
+      "Write(~/.local/state/v/mail_approvals*)",
+      "Edit(~/.local/state/v/mail_approvals*)"
     ]
   }
 }

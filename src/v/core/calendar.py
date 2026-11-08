@@ -31,7 +31,7 @@ import datetime as dt
 import re
 from dataclasses import dataclass
 
-from . import notes
+from . import notes, provenance
 from .config import Settings, settings as default_settings
 
 FOLDER = "01 - Daily Notes/Calendar"
@@ -288,8 +288,13 @@ class Calendar:
         updated = replace_section(content, DAILY_HEADING, f"{marker}\n{body}")
         if updated is None or updated == content:
             return None
+        # A copy of the month note's lines for this day: Parsa's if every
+        # line it came from is, V's if any of them is V's and unapproved.
+        src = self.vault.provenance.derived(
+            [f"{FOLDER}/{day.strftime('%Y-%m')}.md"], day.isoformat())
         self.vault.rewrite(rel, updated, allow_rewrite=True,
-                           summary=f"sync calendar into {day.isoformat()}")
+                           summary=f"sync calendar into {day.isoformat()}",
+                           source=src)
         return body
 
     def _daily_rel(self, day: dt.date) -> str:

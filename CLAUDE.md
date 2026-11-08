@@ -50,7 +50,7 @@ and prints its own summary. The full suite:
 test_core 116 · test_shell 37 · test_mcp 29 · test_tasks 64 · test_memory 31
 test_briefing 15 · test_telegram 31 · test_tts 12 · test_httpapi 51
 test_traits 11 · test_agents 22 · test_graph 95 ·
-test_ui_animation 25 · test_hud 102                          (641 total)
+test_ui_animation 25 · test_hud 102 · test_provenance 25     (666 total)
 ```
 
 Two tests are sensitive to the pinned clock — `config.py` forces
@@ -106,6 +106,29 @@ failure this is built against.
 
 **`vaultfs.py` is the only writer.** Append-only, per-path git commit, `undo`
 is `git revert`. Never write to the vault by another route.
+
+**Every write says who wrote it** (`provenance.py`, added 2026-11-08). Two
+labels: `parsa` (no model involved — his words, or rules over his templates)
+and `v` (a model composed, rephrased, classified or generated it). A write
+that does not say is `v`. Labels live in `state/provenance.db`, keyed by note
+and block hash, and are recorded *before* the file is written. Four things
+that are easy to break:
+
+- `Vault(s, source="v")` is a floor, not a default — the MCP server's writer
+  is built that way. `V_MODEL_SHELL` (set by `shells.py` on everything it
+  launches) makes every write `v`, so the model running `v week --add` through
+  Bash cannot write as Parsa.
+- Rule-executed engine intents run under `authored_by(_author_of(route))`; a
+  decider-filled slot that is not verbatim in his message makes the write `v`.
+  A sync that copies lines between notes uses `Store.derived`, so a copy of
+  V's unapproved text stays V's.
+- Note text reaching a model is fenced with `provenance.OPEN`/`CLOSE`:
+  `vault_read`, `vault_search`, `vault_tasks`, RAG context, the evidence
+  block, the brief. V's shell is denied `Read` on notes so it uses `vault_read`.
+- Only `cli.cmd_approve`/`cmd_mail` and `Engine.act` (a button press) write
+  approvals; `test_provenance` asserts it from the source. `Gmail.send`
+  refetches the draft and refuses unless `mailguard` holds an unused approval
+  of that exact hash, under 24 hours old.
 
 **Known structural debt** (being worked through in order):
 1. A capability is declared in five places — `engine._dispatch`, `mcp/server.py`,

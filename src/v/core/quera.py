@@ -42,6 +42,9 @@ import httpx
 
 from . import schema, templates
 from .config import Settings, settings as default_settings
+# Notes built by rules from an API: no model wrote them, which is the
+# one thing the `parsa` label asserts (see provenance.py).
+from . import provenance
 from .vaultfs import Vault
 
 BASE = "https://quera.org"
@@ -161,7 +164,8 @@ class Quera:
             meta, body = filled
         else:
             body = "\n## Info\n\n## Lectures\n\n## Assignments\n\n## Notes\n"
-        self.vault.create(rel, meta, body, summary=f"create {rel} from Quera")
+        self.vault.create(rel, meta, body, summary=f"create {rel} from Quera",
+                                      source=provenance.PARSA)
         return rel
 
     def _assignment_note(self, a: QueraAssignment) -> tuple[str, dict, str]:
@@ -212,14 +216,16 @@ class Quera:
                 if drift:
                     if not dry_run:
                         self.vault.set_meta(rel, drift,
-                                            summary=f"sync {rel} from Quera")
+                                            summary=f"sync {rel} from Quera",
+                                            source=provenance.PARSA)
                     report["updated"].append({"rel": rel, "changes": drift})
                 else:
                     report["skipped"] += 1
             else:
                 if not dry_run:
                     self.vault.create(rel, meta, body,
-                                      summary=f"create {rel} from Quera")
+                                      summary=f"create {rel} from Quera",
+                                      source=provenance.PARSA)
                 report["created"].append(rel)
         return report
 

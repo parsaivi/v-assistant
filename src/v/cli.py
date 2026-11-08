@@ -38,6 +38,7 @@ from v.core import commands as commands_mod  # noqa: E402
 from v.core import config, index, schema, shells, stt, ui  # noqa: E402
 from v.core import notes as notes_mod  # noqa: E402
 from v.core import persona  # noqa: E402
+from v.core import provenance  # noqa: E402
 from v.core import session as session_mod  # noqa: E402
 from v.core.hermes import Hermes  # noqa: E402
 from v.core.shells import ShellUnavailable  # noqa: E402
@@ -893,6 +894,21 @@ def cmd_query(args, engine: Engine) -> int:
     return 0
 
 
+def _his_words(fn):
+    """For commands that write exactly what Parsa typed, by rules: their
+    vault writes are labelled his. Under a model's shell the label is `v`
+    anyway — `provenance.resolve` checks — so the model running `v week
+    --add` through Bash does not get to write as him."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(args, engine):
+        with provenance.authored_by(provenance.PARSA):
+            return fn(args, engine)
+    return run
+
+
+@_his_words
 def cmd_tasks(args, engine: Engine) -> int:
     """The checkbox layer, from the shell."""
     import datetime as _dt
@@ -989,6 +1005,7 @@ def cmd_tasks(args, engine: Engine) -> int:
     return 0
 
 
+@_his_words
 def cmd_calendar(args, engine: Engine) -> int:
     """The vault calendar — read it, add to it, or push it into daily notes."""
     import datetime as _dt
@@ -1032,6 +1049,7 @@ def cmd_calendar(args, engine: Engine) -> int:
     return 0
 
 
+@_his_words
 def cmd_week(args, engine: Engine) -> int:
     """The week's shape — read it, seed it, add to it, or find the gaps.
 
@@ -1288,6 +1306,182 @@ def cmd_gcal(args, engine: Engine) -> int:
     except gcal_mod.GoogleCalendarError as exc:
         print(ui.error(str(exc)))
         return 1
+
+
+# ---- approvals: Parsa's, at his own terminal -------------------------------
+def _not_here(what: str) -> str | None:
+    """Why an approval cannot be made from this process, or None.
+
+    Two fences. Inside a model's shell — the variable `shells.py` sets on
+    everything it launches — an approval would be the model raising its own
+    text to Parsa's, which is the one thing approvals exist to prevent. And
+    without a terminal on both ends, nobody is reading what is being
+    approved: a script, a pipe or a cron line is not Parsa looking at it.
+    """
+    import os
+    if os.environ.get(provenance.MODEL_SHELL_ENV):
+        return "approvals come from you, never from inside a model's shell"
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return (f"`{what}` needs your terminal — run it yourself, not from a "
+                "script or a pipe")
+    return None
+
+
+def _note_rel(engine: Engine, name: str) -> str | None:
+    """A note from what Parsa typed: a vault path, with or without `.md`, or
+    just its name when exactly one note has it."""
+    name = name.strip().strip("[]")
+    for rel in (name, f"{name}.md"):
+        if engine.vault.exists(rel) and rel.endswith(".md"):
+            return rel
+    stem = Path(name).stem.lower()
+    hits = sorted({r for (r,) in engine.conn.execute("SELECT rel FROM notes")
+                   if Path(r).stem.lower() == stem})
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        print(ui.note(f"{len(hits)} notes are called {name!r} — give the path:"))
+        for r in hits[:8]:
+            print(f"  {r}")
+    else:
+        print(ui.note(f"no note called {name!r}"))
+    return None
+
+
+def cmd_unapproved(args, engine: Engine) -> int:
+    """What V wrote that Parsa has not approved, as it stands in the notes."""
+    prov = engine.vault.provenance
+    rel = None
+    if args.note:
+        rel = _note_rel(engine, " ".join(args.note))
+        if rel is None:
+            return 1
+    pend = prov.pending(rel)
+    if not pend:
+        print(ui.ok("nothing waiting — every block of mine is approved"
+                    + (f" in {rel}" if rel else "")))
+        return 0
+    by_note: dict[str, list] = {}
+    for p in pend:
+        by_note.setdefault(p.rel, []).append(p)
+    for r, items in sorted(by_note.items()):
+        print(f"\n{r}  ·  {len(items)} block{'s' if len(items) != 1 else ''}")
+        for p in items[: (None if rel else 5)]:
+            print(f"  L{p.line + 1}: {p.preview()}")
+        if not rel and len(items) > 5:
+            print(f"  … {len(items) - 5} more — `v unapproved {r}`")
+    total = len(pend)
+    print(ui.hint(f"\n{total} block{'s' if total != 1 else ''} in "
+                  f"{len(by_note)} note{'s' if len(by_note) != 1 else ''}. "
+                  "`v approve <note>` once you've read one."))
+    return 0
+
+
+def cmd_approve(args, engine: Engine) -> int:
+    """Approve V's text in a note, after reading it. Owner only."""
+    why = _not_here("v approve")
+    if why:
+        print(ui.error(why))
+        return 2
+    prov = engine.vault.provenance
+    rel = _note_rel(engine, " ".join(args.note))
+    if rel is None:
+        return 1
+    pend = prov.pending(rel)
+    if not pend:
+        print(ui.ok(f"nothing of mine waiting in {rel}"))
+        return 0
+    print(f"{rel} — {len(pend)} block{'s' if len(pend) != 1 else ''} I wrote:\n")
+    for p in pend:
+        print(ui.hint(f"── L{p.line + 1}"))
+        print(p.text + "\n")
+    try:
+        answer = input("Approve all of this as yours? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        print(ui.hint("left unapproved"))
+        return 1
+    n = prov.approve_note(rel, by="parsa", via="cli")
+    print(ui.ok(f"approved {n} block{'s' if n != 1 else ''} — they count as "
+                "yours now; if I change them, they stop counting"))
+    return 0
+
+
+def cmd_provenance(args, engine: Engine) -> int:
+    """`backfill` labels the vault from git blame; `show` prints a note the
+    way the model reads it, fences and all."""
+    prov = engine.vault.provenance
+    if args.action == "show":
+        if not args.note:
+            print(ui.error("`v provenance show <note>`"))
+            return 1
+        rel = _note_rel(engine, " ".join(args.note))
+        if rel is None:
+            return 1
+        print(prov.mark(rel, (engine.s.vault / rel).read_text(encoding="utf-8")))
+        return 0
+    dry = not args.apply
+    with ui.Spinner("reading git blame"):
+        st = prov.backfill(dry_run=dry)
+    print(f"{'dry run — nothing written' if dry else 'written to ' + str(prov.path)}")
+    print(f"  notes in the vault        {st['notes']}")
+    print(f"  touched by [bot] commits  {st['bot_touched']}")
+    print(f"  V's text      {st['v_blocks']:>6} blocks in {st['v_notes']} notes"
+          f"  ({st['v_unapproved']} unapproved)")
+    print(f"  Parsa's text  {st['parsa_blocks']:>6} blocks in "
+          f"{st['parsa_notes']} notes")
+    if dry:
+        print(ui.hint("`v provenance backfill --apply` to record it"))
+    return 0
+
+
+def cmd_mail(args, engine: Engine) -> int:
+    """Drafts V made, and the terminal fallback for approving one."""
+    from v.core import gmail as gmail_mod, mailguard
+    ledger = mailguard.Ledger(engine.s)
+    if args.action == "pending":
+        drafts = ledger.pending()
+        if not drafts:
+            print(ui.ok("no unsent drafts of mine"))
+            return 0
+        for d in drafts:
+            print(f"`{d.draft_id}`  {d.at[:16]}  to {d.to} — {d.subject}")
+        print(ui.hint("`v mail approve <id>` to read one and approve it"))
+        return 0
+    why = _not_here("v mail approve")
+    if why:
+        print(ui.error(why))
+        return 2
+    if not args.draft_id:
+        print(ui.error("`v mail approve <draft_id>`"))
+        return 1
+    g = gmail_mod.Gmail(engine.s)
+    try:
+        d = g.fetch_draft(args.draft_id)
+    except Exception as exc:
+        print(ui.error(f"couldn't fetch that draft: {exc}"))
+        return 1
+    print(d.render() + "\n")
+    try:
+        answer = input("Approve this exact draft? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        print(ui.hint("not approved"))
+        return 1
+    ledger.approve(d.draft_id, d.hash, by="parsa", via="cli")
+    if not args.send:
+        print(ui.ok("approved — V's next gmail_send of it goes through, once, "
+                    "for 24 hours, and only if the draft is not edited"))
+        return 0
+    try:
+        g.send(d.draft_id)
+    except gmail_mod.GmailError as exc:
+        print(ui.error(f"not sent: {exc}"))
+        return 1
+    print(ui.ok("sent"))
+    return 0
 
 
 def cmd_gmail(args, engine: Engine) -> int:
@@ -2265,6 +2459,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--reset", action="store_true",
                    help="disconnect, to re-authorise onto a different account")
     s.set_defaults(fn=cmd_gmail)
+
+    s = sub.add_parser("mail", help="V's email drafts: list them, or read and "
+                                    "approve one (your terminal only)")
+    s.add_argument("action", choices=["pending", "approve"])
+    s.add_argument("draft_id", nargs="?")
+    s.add_argument("--send", action="store_true",
+                   help="send it right after approving")
+    s.set_defaults(fn=cmd_mail)
+
+    s = sub.add_parser("unapproved", help="what V wrote that you haven't "
+                                          "approved yet")
+    s.add_argument("note", nargs="*", help="one note (default: all of them)")
+    s.set_defaults(fn=cmd_unapproved)
+
+    s = sub.add_parser("approve", help="read V's text in a note and approve "
+                                       "it as yours (your terminal only)")
+    s.add_argument("note", nargs="+")
+    s.set_defaults(fn=cmd_approve)
+
+    s = sub.add_parser("provenance", help="who wrote what: backfill labels "
+                                          "from git, or show a note as the "
+                                          "model sees it")
+    s.add_argument("action", choices=["backfill", "show"])
+    s.add_argument("note", nargs="*")
+    s.add_argument("--apply", action="store_true",
+                   help="backfill: write the labels (default is a dry run)")
+    s.set_defaults(fn=cmd_provenance)
 
     s = sub.add_parser("index")
     s.add_argument("--embed", action="store_true", help="also rebuild embeddings")

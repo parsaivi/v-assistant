@@ -478,10 +478,10 @@ WRITE_TOOLS = [
     "mcp__vault__gcal_add_event",
     # Sending a Gmail draft is the most irreversible write in this list —
     # unlike a vault note or even a calendar event, there is no undo at all.
-    # The gate that matters is the one in gmail_draft's/gmail_send's tool
-    # descriptions and identity.py's system prompt: never call this in the
-    # same turn a draft was created. Being on WRITE_TOOLS is a second,
-    # structural gate underneath that — it's simply absent on a read-only run.
+    # The gate that matters is in code: `Gmail.send` refuses unless Parsa
+    # approved the draft's exact hash (`core/mailguard.py`), and no tool in
+    # any of these lists can write an approval. Being on WRITE_TOOLS is a
+    # second gate underneath — it's simply absent on a read-only run.
     "mcp__vault__gmail_send",
     # Memory is a write path like any other: append-and-supersede, with the
     # old belief kept. Reading it (`vault_memory_list`) is on every run, since
@@ -873,8 +873,13 @@ class ClaudeCodeShell(Shell):
         # process, and since V now edits on some surfaces and not others, that
         # check needs the surface or it degrades to "is this V?" — which is
         # true on Telegram too.
+        # …and that this whole process tree is a model's. Inherited by the
+        # MCP server and by every Bash command the model runs: anything they
+        # write to the vault is labelled `v`, and the approval writers refuse
+        # to run at all (`provenance.MODEL_SHELL_ENV`).
         env = dict(os.environ, CLAUDE_CONFIG_DIR=self.s.claude_config_dir,
-                   V_AGENT=agent or "v", V_SURFACE=surface or "")
+                   V_AGENT=agent or "v", V_SURFACE=surface or "",
+                   V_MODEL_SHELL="1")
 
         streaming = self.s.shell_stream
         if streaming:

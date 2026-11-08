@@ -40,6 +40,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
+from . import provenance
 from .config import Settings, settings as default_settings
 
 # When the standing briefing runs. Signed off at 10:00 daily, weekends
@@ -201,7 +202,10 @@ def _daily_note(engine, brief: Briefing, when: dt.datetime) -> str | None:
                        for line in brief.text.splitlines())
     block = (f"> [!info]- Morning brief · {when.strftime('%H:%M')}\n{quoted}")
     engine.vault.append(rel, block, heading=engine.s.daily_log_heading,
-                        summary=f"morning brief {brief.day}")
+                        summary=f"morning brief {brief.day}",
+                        # Assembled by rules, but it is V's reading of the
+                        # vault — priorities it ranked, not ones he set.
+                        source=provenance.V)
     return rel
 
 

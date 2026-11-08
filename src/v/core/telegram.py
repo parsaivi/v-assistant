@@ -64,6 +64,7 @@ import httpx
 from .briefing import _plain
 from .config import Settings, settings as default_settings
 from . import persona as persona_mod
+from . import provenance
 from .engine import Engine
 
 # `httpx/_client.py` logs `'HTTP Request: %s %s "%s %d %s"'` at INFO for
@@ -671,7 +672,9 @@ class TelegramBot:
         while engine.vault.exists(rel):
             rel = f"attachments/telegram/{stamp}-{safe}-{n}{ext}"
             n += 1
-        engine.vault.save_binary(rel, data, summary="telegram attachment")
+        # The file Parsa sent, byte for byte.
+        engine.vault.save_binary(rel, data, summary="telegram attachment",
+                                 source=provenance.PARSA)
         return rel
 
     @staticmethod
@@ -834,9 +837,11 @@ class TelegramBot:
                     "chat-id": chat["id"], "created": when.date().isoformat(),
                     "tags": ["telegram-archive"]}
             engine.vault.create(rel, meta, f"\n{line}\n",
-                                summary=f"telegram archive: {title}")
+                                summary=f"telegram archive: {title}",
+                                source=provenance.PARSA)
         else:
-            engine.vault.append(rel, line, summary=f"telegram archive: {title}")
+            engine.vault.append(rel, line, summary=f"telegram archive: {title}",
+                                source=provenance.PARSA)
 
         # A receipt, not a reply — the group has no one to read a reply, and a
         # message back into it would be V talking to itself. Best-effort:

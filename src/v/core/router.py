@@ -93,6 +93,10 @@ class Route:
     slots: dict = field(default_factory=dict)
     alternatives: list[tuple[str, float]] = field(default_factory=list)
     cost: float = 0.0
+    # Whether a model (the decider) chose this route and filled its slots.
+    # Provenance needs it: a slot the model rephrased is the model's words,
+    # even when the code that writes it is deterministic.
+    by_model: bool = False
 
     @property
     def certain(self) -> bool:
@@ -475,7 +479,7 @@ class Router:
         # rather than trusting it to guess our schema.
         slots.setdefault("when", _when_of(raw.lower()))
         return Route(d.intent, round(d.confidence, 2), d.reason,
-                     slots=slots, cost=d.list_cost_usd)
+                     slots=slots, cost=d.list_cost_usd, by_model=True)
 
     # -----------------------------------------------------------------
     def route(self, text: str, *, message_type: str = "text",

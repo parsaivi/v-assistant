@@ -22,6 +22,7 @@ import json
 import re
 from pathlib import Path
 
+from . import provenance
 from .config import Settings, settings as default_settings
 
 # Where a phone's attachments land. Beside `attachments/telegram/` rather than
@@ -87,7 +88,8 @@ def save_attachment(engine, data: bytes, name: str) -> dict:
     while engine.vault.exists(rel):
         rel = f"{ATTACH_DIR}/{stamp}-{stem}-{n}{ext}"
         n += 1
-    engine.vault.save_binary(rel, data, summary=f"phone attachment: {stem}{ext}")
+    engine.vault.save_binary(rel, data, summary=f"phone attachment: {stem}{ext}",
+                             source=provenance.PARSA)
     return file_meta(engine.s, rel)
 
 
