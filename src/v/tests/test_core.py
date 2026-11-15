@@ -1804,6 +1804,25 @@ def low_confidence_files_to_the_daily_note_and_never_asks():
 
 
 @test
+def a_visit_finds_a_place_filed_in_a_subfolder():
+    """A second visit to a café kept in `Locations/Cafes/` is logged on that
+    note — not written as a twin at the top of Locations."""
+    root, s = make_vault()
+    try:
+        loc = root / "09 - Anti-Library/05 - Locations"
+        (loc / "Cafes").mkdir()
+        (loc / "Cafe A.md").rename(loc / "Cafes/Cafe A.md")
+        c = capture.Capture(vaultfs.Vault(s), s)
+        res = c.capture("back at Cafe A", router.Route(router.CAPTURE_PLACE,
+                        0.99, "test"), extra={"name": "Cafe A"})
+        eq(res.target, "09 - Anti-Library/05 - Locations/Cafes/Cafe A.md")
+        ok(not (loc / "Cafe A.md").exists(), "no twin at the top")
+        ok("Logged another visit" in res.message, res.message)
+    finally:
+        shutil.rmtree(root)
+
+
+@test
 def daily_note_scaffold_is_valid():
     root, s = make_vault()
     try:
@@ -2077,7 +2096,7 @@ def housekeeping_jobs_never_reach_the_sink():
         sched = Scheduler(e, s, sink=lambda src, item: seen.append(item))
 
         for name in ("morning-brief", "calendar-sync", "week-scaffold",
-                     "self-docs", "re-embed", "reindex"):
+                     "day-sync", "self-docs", "re-embed", "reindex"):
             ok(name in sched.silent, f"{name} is plumbing, not a message")
         for name in ("reminders", "gmail-check", "evening-closeout", "outbox"):
             ok(name not in sched.silent, f"{name} speaks to Parsa")

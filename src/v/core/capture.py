@@ -11,6 +11,7 @@ Design rules, all inherited from the design doc:
 
 from __future__ import annotations
 
+import glob
 import datetime as dt
 import re
 from dataclasses import dataclass, field
@@ -125,7 +126,6 @@ class Capture:
             "week": week_label(day),
             "month": day.strftime("%Y-%m"),
             "quarter": f"{day.year}-Q{(day.month - 1) // 3 + 1}",
-            "mood": None, "energy": None,
             "tags": ["daily-note"],
         }
         # The template computes its values in a `<%* … %>` block, which does
@@ -149,7 +149,7 @@ class Capture:
                 f"> ![[{meta['week']}#Weekly Focus]]\n\n"
                 f"## {self.s.daily_task_heading}\n\n"
                 "## Work Log\n\n### Issues / MRs Touched\n\n"
-                f"## Gym\n\n## {self.s.daily_log_heading}\n\n## End of Day\n"
+                f"## {self.s.daily_log_heading}\n"
             )
         # Parsa's template, filled by rules: no model wrote a word of it.
         self.vault.create(rel, meta, body, summary=f"scaffold daily note {day}",
@@ -204,9 +204,25 @@ class Capture:
         return CaptureResult(route.intent, rel, change,
                              f"Added as a task in today's note: {cleaned}")
 
+    def _existing_place(self, name: str) -> str | None:
+        """The note already kept for `name`, wherever it sits under Locations.
+
+        Places are filed into subfolders (`Cafes/`, `People/`, …) since
+        2026-11-14. Checking only `Locations/<name>.md` would miss a café that
+        moved to `Locations/Cafes/` and write a second note for it at the top,
+        splitting its visit history in two.
+        """
+        base = self.vault.path(self.s.folders.locations)
+        if not base.is_dir():
+            return None
+        for p in sorted(base.rglob(glob.escape(name) + ".md")):
+            return p.relative_to(self.vault.root).as_posix()
+        return None
+
     def _place(self, text, route, when, extra) -> CaptureResult:
         name = extra.get("name") or _title_from(text)
-        rel = f"{self.s.folders.locations}/{name}.md"
+        rel = (self._existing_place(name)
+               or f"{self.s.folders.locations}/{name}.md")
         meta = schema.template_for("place")
         meta.update({
             "type": "place", "name": name,

@@ -130,6 +130,15 @@ class Scheduler:
             # the one failure that would make the whole feature feel dead.
             Job("week-scaffold", dt.time(5, 30), self._week_scaffold,
                 weekdays=(5,), announce=False),
+            # The two jobs above render only into notes that already exist,
+            # and today's note usually doesn't at 05:30/06:30: it is made by
+            # the brief at 10:00 or by Obsidian whenever Parsa opens it. So
+            # `## ⏱ Schedule` sat at "_Not synced yet._" on 39 of 45 days.
+            # This catches the note within 15 minutes of it appearing, and
+            # picks up blocks moved in the HUD or the week note since. Cheap:
+            # a sync that would change nothing writes nothing.
+            Job("day-sync", None, self._day_sync, interval_minutes=15,
+                catch_up=False, announce=False),
             # Every 10 minutes, not every minute like reminders: an unread
             # email is not as time-critical as a reminder Parsa set for a
             # specific minute, and Gmail's list endpoint is not free to poll
@@ -414,6 +423,22 @@ class Scheduler:
         return (f"week note {rel}"
                 + (f" · +{added} repeating block(s)" if added else "")
                 + (f" · {synced} daily note(s) synced" if synced else ""))
+
+    def _day_sync(self):
+        """Render the schedule and calendar into today's and tomorrow's notes.
+
+        Render only — no feed import (that is `calendar-sync`'s, once a day).
+        Silent when nothing changed, which is nearly every run.
+        """
+        wp, cal = self.engine.q.weekplan, self.engine.q.calendar
+        today = dt.date.today()
+        synced = []
+        for day in (today, today + dt.timedelta(days=1)):
+            if wp.sync_daily_note(day) is not None:
+                synced.append(f"schedule {day}")
+            if cal.sync_daily_note(day) is not None:
+                synced.append(f"calendar {day}")
+        return f"day-sync: {', '.join(synced)}" if synced else None
 
     def _calendar_sync(self):
         cal = self.engine.q.calendar
